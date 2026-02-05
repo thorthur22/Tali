@@ -48,7 +48,11 @@ class OllamaClient:
 
     def generate(self, prompt: str) -> LLMResponse:
         url = f"{self.base_url.rstrip('/')}/api/chat"
-        payload = {"model": self.model, "messages": [{"role": "user", "content": prompt}]}
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+        }
         with httpx.Client(timeout=self.timeout_s) as client:
             response = client.post(url, json=payload)
             response.raise_for_status()

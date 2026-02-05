@@ -101,6 +101,23 @@ CREATE TABLE IF NOT EXISTS staged_items (
   last_error TEXT
 );
 
+CREATE TABLE IF NOT EXISTS tool_calls (
+  id TEXT PRIMARY KEY,
+  episode_id TEXT NOT NULL,
+  tool_name TEXT NOT NULL,
+  args_json TEXT NOT NULL,
+  status TEXT NOT NULL,
+  result_json TEXT,
+  result_hash TEXT,
+  result_path TEXT,
+  started_at DATETIME,
+  ended_at DATETIME,
+  risk_level TEXT,
+  approval_mode TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_tool_calls_episode ON tool_calls (episode_id);
+
 CREATE INDEX IF NOT EXISTS idx_staged_status_nextcheck ON staged_items (status, next_check_at);
 CREATE INDEX IF NOT EXISTS idx_staged_kind ON staged_items (kind);
 
@@ -153,6 +170,47 @@ class Database:
             connection.execute(
                 "INSERT INTO episodes_fts (id, user_input, agent_output) VALUES (?, ?, ?)",
                 (episode_id, user_input, agent_output),
+            )
+
+    def insert_tool_call(
+        self,
+        tool_call_id: str,
+        episode_id: str,
+        tool_name: str,
+        args: dict[str, Any],
+        status: str,
+        result_json: str | None,
+        result_hash: str | None,
+        result_path: str | None,
+        started_at: str | None,
+        ended_at: str | None,
+        risk_level: str | None,
+        approval_mode: str | None,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO tool_calls (
+                    id, episode_id, tool_name, args_json, status,
+                    result_json, result_hash, result_path, started_at,
+                    ended_at, risk_level, approval_mode
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    tool_call_id,
+                    episode_id,
+                    tool_name,
+                    json.dumps(args),
+                    status,
+                    result_json,
+                    result_hash,
+                    result_path,
+                    started_at,
+                    ended_at,
+                    risk_level,
+                    approval_mode,
+                ),
             )
 
     def list_commitments(self) -> list[sqlite3.Row]:
@@ -240,6 +298,9 @@ class Database:
             )
 
     def search_facts(self, query: str, limit: int) -> list[sqlite3.Row]:
+        safe_query = "".join(ch if ch.isalnum() else " " for ch in query).strip()
+        if not safe_query:
+            return []
         with self.connect() as connection:
             cursor = connection.execute(
                 """
@@ -249,7 +310,7 @@ class Database:
                 ORDER BY rank
                 LIMIT ?
                 """,
-                (query, limit),
+                (safe_query, limit),
             )
             return cursor.fetchall()
 

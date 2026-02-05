@@ -5,13 +5,16 @@ import os
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
+import httpx
+
 from tali.consolidation import SleepPolicy, _is_contradiction, apply_sleep_changes, can_promote_fact
 from tali.db import Database
+from tali.llm import OllamaClient, OpenAIClient
 from tali.models import ProvenanceType
 from tali.snapshots import create_snapshot, rollback_snapshot
 if TYPE_CHECKING:
@@ -19,6 +22,7 @@ if TYPE_CHECKING:
 
 
 LOCK_FILENAME = "sleep.lock"
+SLEEP_LLM_TIMEOUT_S = 300.0
 
 
 @dataclass(frozen=True)
@@ -115,7 +119,8 @@ def run_auto_sleep(data_dir: Path, db: Database, llm: Any, vector_index: "Vector
     audit: dict[str, Any] = {"timestamp": datetime.utcnow().isoformat()}
     try:
         output_dir = data_dir / "sleep"
-        output_path = run_sleep(db, output_dir, llm=llm)
+        sleep_llm = _with_sleep_timeout(llm)
+        output_path = run_sleep(db, output_dir, llm=sleep_llm)
         snapshot = create_snapshot(data_dir)
         payload = load_sleep_output(output_path)
         result = apply_sleep_changes(db, payload, SleepPolicy())
@@ -133,13 +138,26 @@ def run_auto_sleep(data_dir: Path, db: Database, llm: Any, vector_index: "Vector
             }
         )
     except Exception as exc:  # noqa: BLE001
-        audit["error"] = str(exc)
+        error = _format_sleep_error(exc)
+        audit["error"] = error
         if snapshot:
             rollback_snapshot(data_dir, snapshot)
-        _stage_sleep_error(db, str(exc))
+        _stage_sleep_error(db, error)
     finally:
         log_path.write_text(json.dumps(audit, indent=2))
         lock.release()
+
+
+def _with_sleep_timeout(llm: Any) -> Any:
+    if isinstance(llm, (OpenAIClient, OllamaClient)):
+        return replace(llm, timeout_s=SLEEP_LLM_TIMEOUT_S)
+    return llm
+
+
+def _format_sleep_error(exc: Exception) -> str:
+    if isinstance(exc, (httpx.TimeoutException, TimeoutError)):
+        return "timed out"
+    return str(exc)
 
 
 def resolve_staged_items(db: Database, user_input: str) -> ResolutionOutcome | None:
