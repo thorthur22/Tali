@@ -23,7 +23,11 @@ Supported providers: OpenAI-compatible APIs (`openai`) and Ollama (`ollama`).
 
 ## Sleep consolidation
 
-Run offline consolidation to produce a JSON payload, then apply vetted facts:
+Sleep runs automatically in chat when thresholds are met (episode count, idle
+time, or periodic timer). It snapshots before applying safe updates, stages
+uncertain items, and resolves them opportunistically.
+
+You can still inspect status or apply a JSON file manually:
 
 ```bash
 agent sleep

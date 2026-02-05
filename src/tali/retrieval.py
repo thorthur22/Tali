@@ -73,12 +73,20 @@ class Retriever:
             rows = self.db.search_facts(user_input, self.config.max_facts)
         if not rows:
             rows = self.db.list_facts()
-        rows = [
-            row
-            for row in rows
-            if not row["contested"]
-            and not (row["provenance_type"] == "INFERRED" and row["confidence"] < 0.5)
-        ]
+        direct_ids = {hit.item_id for hit in vector_hits if hit.item_type == "fact"}
+        filtered_rows = []
+        for row in rows:
+            is_direct = row["id"] in direct_ids
+            if row["contested"] and not is_direct:
+                continue
+            if (
+                row["provenance_type"] == ProvenanceType.INFERRED.value
+                and row["confidence"] < 0.5
+                and not is_direct
+            ):
+                continue
+            filtered_rows.append(row)
+        rows = filtered_rows
         ranked = sorted(
             rows,
             key=lambda row: (

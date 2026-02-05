@@ -87,6 +87,23 @@ CREATE TABLE IF NOT EXISTS sleep_runs (
   last_episode_timestamp DATETIME
 );
 
+CREATE TABLE IF NOT EXISTS staged_items (
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  status TEXT NOT NULL,
+  created_at DATETIME NOT NULL,
+  source_ref TEXT NOT NULL,
+  provenance_type TEXT NOT NULL,
+  priority INTEGER DEFAULT 3,
+  next_check_at DATETIME,
+  attempts INTEGER DEFAULT 0,
+  last_error TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_staged_status_nextcheck ON staged_items (status, next_check_at);
+CREATE INDEX IF NOT EXISTS idx_staged_kind ON staged_items (kind);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS episodes_fts USING fts5(
   id,
   user_input,
@@ -157,6 +174,29 @@ class Database:
                 """
             )
             return cursor.fetchall()
+
+    def dedupe_facts(self) -> int:
+        """Remove duplicate facts with identical statement/provenance/source_ref."""
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                SELECT id FROM facts
+                WHERE id NOT IN (
+                    SELECT MIN(id) FROM facts
+                    GROUP BY statement, provenance_type, source_ref
+                )
+                """
+            )
+            duplicate_ids = [row["id"] for row in cursor.fetchall()]
+            if not duplicate_ids:
+                return 0
+            placeholders = ", ".join("?" for _ in duplicate_ids)
+            connection.execute(f"DELETE FROM facts WHERE id IN ({placeholders})", duplicate_ids)
+            connection.execute(
+                f"DELETE FROM facts_fts WHERE id IN ({placeholders})",
+                duplicate_ids,
+            )
+            return len(duplicate_ids)
 
     def insert_fact(
         self,
@@ -336,10 +376,223 @@ class Database:
                 """
                 UPDATE facts
                 SET confidence = MAX(0.0, confidence - decay_rate)
-                WHERE last_confirmed < ?
+                WHERE COALESCE(last_confirmed, created_at) < ?
                 """,
                 (cutoff_date,),
             )
+
+    def apply_fact_decay(self, cutoff_timestamp: str) -> int:
+        """Apply confidence decay to facts not confirmed since cutoff_timestamp."""
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE facts
+                SET confidence = MAX(0.0, confidence - decay_rate)
+                WHERE COALESCE(last_confirmed, created_at) < ?
+                """,
+                (cutoff_timestamp,),
+            )
+            return cursor.rowcount
+
+    def insert_commitment(
+        self,
+        commitment_id: str,
+        description: str,
+        status: str,
+        priority: int,
+        due_date: str | None,
+        created_at: str,
+        last_touched: str,
+        source_ref: str | None,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO commitments
+                (id, description, status, priority, due_date, created_at, last_touched, source_ref)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    commitment_id,
+                    description,
+                    status,
+                    priority,
+                    due_date,
+                    created_at,
+                    last_touched,
+                    source_ref,
+                ),
+            )
+
+    def update_commitment(
+        self,
+        commitment_id: str,
+        description: str,
+        status: str,
+        priority: int,
+        due_date: str | None,
+        last_touched: str,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE commitments
+                SET description = ?, status = ?, priority = ?, due_date = ?, last_touched = ?
+                WHERE id = ?
+                """,
+                (description, status, priority, due_date, last_touched, commitment_id),
+            )
+
+    def fetch_commitment(self, commitment_id: str) -> sqlite3.Row | None:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "SELECT * FROM commitments WHERE id = ?",
+                (commitment_id,),
+            )
+            return cursor.fetchone()
+
+    def insert_skill(
+        self,
+        skill_id: str,
+        name: str,
+        trigger: str,
+        steps: str,
+        created_at: str,
+        source_ref: str | None,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO skills (id, name, trigger, steps, created_at, source_ref)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (skill_id, name, trigger, steps, created_at, source_ref),
+            )
+
+    def fetch_skill_by_name(self, name: str) -> sqlite3.Row | None:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "SELECT * FROM skills WHERE name = ?",
+                (name,),
+            )
+            return cursor.fetchone()
+
+    def insert_staged_item(
+        self,
+        item_id: str,
+        kind: str,
+        payload: str,
+        status: str,
+        created_at: str,
+        source_ref: str,
+        provenance_type: str,
+        priority: int = 3,
+        next_check_at: str | None = None,
+        attempts: int = 0,
+        last_error: str | None = None,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO staged_items
+                (id, kind, payload, status, created_at, source_ref, provenance_type, priority, next_check_at, attempts, last_error)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    item_id,
+                    kind,
+                    payload,
+                    status,
+                    created_at,
+                    source_ref,
+                    provenance_type,
+                    priority,
+                    next_check_at,
+                    attempts,
+                    last_error,
+                ),
+            )
+
+    def update_staged_item(
+        self,
+        item_id: str,
+        status: str,
+        next_check_at: str | None,
+        attempts: int,
+        last_error: str | None,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE staged_items
+                SET status = ?, next_check_at = ?, attempts = ?, last_error = ?
+                WHERE id = ?
+                """,
+                (status, next_check_at, attempts, last_error, item_id),
+            )
+
+    def update_staged_item_payload(self, item_id: str, payload: str) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE staged_items SET payload = ? WHERE id = ?",
+                (payload, item_id),
+            )
+
+    def fetch_next_staged_item(self, now_timestamp: str) -> sqlite3.Row | None:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                SELECT * FROM staged_items
+                WHERE status IN ('pending', 'verifying')
+                  AND (next_check_at IS NULL OR next_check_at <= ?)
+                ORDER BY priority DESC, created_at ASC
+                LIMIT 1
+                """,
+                (now_timestamp,),
+            )
+            return cursor.fetchone()
+
+    def fetch_staged_item(self, item_id: str) -> sqlite3.Row | None:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "SELECT * FROM staged_items WHERE id = ?",
+                (item_id,),
+            )
+            return cursor.fetchone()
+
+    def count_staged_items(self) -> int:
+        with self.connect() as connection:
+            cursor = connection.execute("SELECT COUNT(*) as count FROM staged_items")
+            row = cursor.fetchone()
+            return int(row["count"]) if row else 0
+
+    def oldest_pending_staged_item(self) -> sqlite3.Row | None:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                SELECT * FROM staged_items
+                WHERE status IN ('pending', 'verifying')
+                ORDER BY created_at ASC
+                LIMIT 1
+                """
+            )
+            return cursor.fetchone()
+
+    def count_episodes_since_last_sleep(self) -> int:
+        last_run = self.last_sleep_run()
+        last_timestamp = last_run["last_episode_timestamp"] if last_run else None
+        with self.connect() as connection:
+            if last_timestamp:
+                cursor = connection.execute(
+                    "SELECT COUNT(*) as count FROM episodes WHERE timestamp > ? AND quarantine = 0",
+                    (last_timestamp,),
+                )
+            else:
+                cursor = connection.execute(
+                    "SELECT COUNT(*) as count FROM episodes WHERE quarantine = 0"
+                )
+            row = cursor.fetchone()
+            return int(row["count"]) if row else 0
 
     def last_sleep_run(self) -> sqlite3.Row | None:
         with self.connect() as connection:
@@ -356,4 +609,22 @@ class Database:
                 VALUES (?, ?, ?)
                 """,
                 (run_id, timestamp, last_episode_timestamp),
+            )
+
+    def insert_hypothesis(
+        self,
+        hypothesis_id: str,
+        statement: str,
+        origin_episode_id: str,
+        confidence: float,
+        status: str,
+        created_at: str,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO hypotheses (id, statement, origin_episode_id, confidence, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (hypothesis_id, statement, origin_episode_id, confidence, status, created_at),
             )

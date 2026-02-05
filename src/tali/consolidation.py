@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import re
 import uuid
+import json
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from tali.db import Database
 from tali.models import FORBIDDEN_FACT_TYPES, ProvenanceType
@@ -23,27 +24,61 @@ class ConsolidationResult:
     inserted_fact_ids: list[str]
     skipped_candidates: list[str]
     contested_fact_ids: list[str]
+    staged_item_ids: list[str]
+    applied_commitment_ids: list[str]
+    applied_skill_ids: list[str]
+    notes: list[str]
 
 
-def apply_sleep_output(db: Database, payload: dict[str, object]) -> ConsolidationResult:
+@dataclass(frozen=True)
+class SleepPolicy:
+    allow_fact_provenance: tuple[str, ...] = (
+        ProvenanceType.TOOL_VERIFIED.value,
+        ProvenanceType.SYSTEM_OBSERVED.value,
+    )
+    confidence_threshold: float = 0.8
+    decay_days: int = 30
+
+
+def apply_sleep_changes(
+    db: Database,
+    payload: dict[str, object],
+    policy: SleepPolicy | None = None,
+) -> ConsolidationResult:
+    policy = policy or SleepPolicy()
     fact_candidates = payload.get("fact_candidates", [])
+    commitment_updates = payload.get("commitment_updates", [])
+    skill_candidates = payload.get("skill_candidates", [])
+    notes = payload.get("notes", [])
+
     inserted_fact_ids: list[str] = []
     skipped_candidates: list[str] = []
     contested_fact_ids: list[str] = []
-    last_run = db.last_sleep_run()
-    cutoff_date = last_run["timestamp"] if last_run else datetime.utcnow().isoformat()
-    db.apply_confidence_decay(cutoff_date)
+    staged_item_ids: list[str] = []
+    applied_commitment_ids: list[str] = []
+    applied_skill_ids: list[str] = []
+    staged_notes: list[str] = []
 
     if not isinstance(fact_candidates, list):
         raise ValueError("fact_candidates must be a list")
+    if not isinstance(commitment_updates, list):
+        raise ValueError("commitment_updates must be a list")
+    if not isinstance(skill_candidates, list):
+        raise ValueError("skill_candidates must be a list")
+    if not isinstance(notes, list):
+        raise ValueError("notes must be a list")
+
+    cutoff = (datetime.utcnow() - timedelta(days=policy.decay_days)).isoformat()
+    db.apply_fact_decay(cutoff)
+    db.dedupe_facts()
 
     for candidate in fact_candidates:
         if not isinstance(candidate, dict):
             skipped_candidates.append("invalid_candidate")
             continue
-        statement = candidate.get("statement")
-        provenance_type = candidate.get("provenance_type")
-        source_ref = candidate.get("source_ref")
+        statement = str(candidate.get("statement") or "").strip()
+        provenance_type = str(candidate.get("provenance_type") or "").strip()
+        source_ref = str(candidate.get("source_ref") or "").strip()
 
         if not statement or not provenance_type or not source_ref:
             skipped_candidates.append("missing_fields")
@@ -54,9 +89,6 @@ def apply_sleep_output(db: Database, payload: dict[str, object]) -> Consolidatio
         if provenance_type not in CONFIDENCE_DEFAULTS:
             skipped_candidates.append("unknown_provenance")
             continue
-        if not can_promote_fact(candidate):
-            skipped_candidates.append("promotion_gate")
-            continue
         if not db.episode_exists(str(source_ref)):
             skipped_candidates.append("missing_source")
             continue
@@ -65,26 +97,80 @@ def apply_sleep_output(db: Database, payload: dict[str, object]) -> Consolidatio
             skipped_candidates.append("quarantined_source")
             continue
 
-        existing = db.search_facts(str(statement), limit=5)
+        default_confidence = float(CONFIDENCE_DEFAULTS[str(provenance_type)])
+        candidate_confidence = _coerce_confidence(candidate.get("confidence"), default_confidence)
+        candidate_payload = {
+            "statement": statement,
+            "provenance_type": provenance_type,
+            "source_ref": source_ref,
+            "confidence": candidate_confidence,
+            "tags": candidate.get("tags", []),
+        }
+
+        if provenance_type not in policy.allow_fact_provenance:
+            staged_item_ids.append(
+                _stage_item(
+                    db,
+                    kind="fact",
+                    payload=candidate_payload,
+                    provenance_type=provenance_type,
+                    source_ref=source_ref,
+                )
+            )
+            continue
+        if not can_promote_fact(provenance_type, source_ref, candidate_confidence):
+            staged_item_ids.append(
+                _stage_item(
+                    db,
+                    kind="fact",
+                    payload=candidate_payload,
+                    provenance_type=provenance_type,
+                    source_ref=source_ref,
+                )
+            )
+            continue
+
+        existing = db.search_facts(statement, limit=5)
         if existing and any(row["statement"] == statement for row in existing):
             skipped_candidates.append("duplicate")
             continue
 
         contested = 0
         contradictory_ids: list[str] = []
+        blocked_by_contradiction = False
         for row in existing:
-            if _is_contradiction(str(statement), row["statement"]):
-                contested = 1
+            if _is_contradiction(statement, row["statement"]):
                 contradictory_ids.append(str(row["id"]))
+                if float(row["confidence"]) >= policy.confidence_threshold:
+                    staged_item_ids.append(
+                        _stage_item(
+                            db,
+                            kind="fact",
+                            payload={
+                                **candidate_payload,
+                                "contested": True,
+                                "related_fact_ids": contradictory_ids,
+                            },
+                            provenance_type=provenance_type,
+                            source_ref=source_ref,
+                        )
+                    )
+                    skipped_candidates.append("contradiction_high_confidence")
+                    blocked_by_contradiction = True
+                    break
+                contested = 1
+
+        if blocked_by_contradiction:
+            continue
 
         fact_id = str(uuid.uuid4())
         created_at = datetime.utcnow().isoformat()
         db.insert_fact(
             fact_id=fact_id,
-            statement=str(statement),
-            provenance_type=str(provenance_type),
-            source_ref=str(source_ref),
-            confidence=CONFIDENCE_DEFAULTS[str(provenance_type)],
+            statement=statement,
+            provenance_type=provenance_type,
+            source_ref=source_ref,
+            confidence=candidate_confidence,
             created_at=created_at,
             contested=contested,
         )
@@ -97,43 +183,218 @@ def apply_sleep_output(db: Database, payload: dict[str, object]) -> Consolidatio
                     link_id=link_id,
                     fact_id=fact_id,
                     related_fact_id=related_id,
-                    episode_id=str(source_ref),
+                    episode_id=source_ref,
                     link_type="contradicts",
                     created_at=datetime.utcnow().isoformat(),
                 )
                 db.mark_fact_contested(related_id)
 
+    for candidate in commitment_updates:
+        if not isinstance(candidate, dict):
+            skipped_candidates.append("invalid_commitment")
+            continue
+        description = str(candidate.get("description") or "").strip()
+        status = str(candidate.get("status") or "pending").strip()
+        source_ref = str(candidate.get("source_ref") or "").strip()
+        commitment_id = candidate.get("commitment_id")
+        priority = int(candidate.get("priority", 3) or 3)
+        due_date = candidate.get("due_date")
+        if not description or not source_ref:
+            skipped_candidates.append("commitment_missing_fields")
+            continue
+        if not _is_explicit_commitment(db, source_ref, description, candidate):
+            staged_item_ids.append(
+                _stage_item(
+                    db,
+                    kind="commitment",
+                    payload=candidate,
+                    provenance_type="USER_REPORTED",
+                    source_ref=source_ref,
+                )
+            )
+            continue
+        now = datetime.utcnow().isoformat()
+        if commitment_id and db.fetch_commitment(str(commitment_id)):
+            db.update_commitment(
+                commitment_id=str(commitment_id),
+                description=description,
+                status=status,
+                priority=priority,
+                due_date=str(due_date) if due_date else None,
+                last_touched=now,
+            )
+            applied_commitment_ids.append(str(commitment_id))
+        else:
+            new_id = str(commitment_id or uuid.uuid4())
+            db.insert_commitment(
+                commitment_id=new_id,
+                description=description,
+                status=status,
+                priority=priority,
+                due_date=str(due_date) if due_date else None,
+                created_at=now,
+                last_touched=now,
+                source_ref=source_ref,
+            )
+            applied_commitment_ids.append(new_id)
+
+    for candidate in skill_candidates:
+        if not isinstance(candidate, dict):
+            skipped_candidates.append("invalid_skill")
+            continue
+        name = str(candidate.get("name") or "").strip()
+        trigger = str(candidate.get("trigger") or "").strip()
+        steps = candidate.get("steps") or []
+        source_ref = str(candidate.get("source_ref") or "").strip()
+        evidence = candidate.get("success_evidence") or []
+        if not name or not trigger or not steps or not source_ref:
+            skipped_candidates.append("skill_missing_fields")
+            continue
+        if not _skill_evidence_strong(evidence) or not _steps_tool_safe(steps):
+            staged_item_ids.append(
+                _stage_item(
+                    db,
+                    kind="skill",
+                    payload=candidate,
+                    provenance_type="USER_REPORTED",
+                    source_ref=source_ref,
+                )
+            )
+            continue
+        if db.fetch_skill_by_name(name):
+            skipped_candidates.append("skill_duplicate")
+            continue
+        db.insert_skill(
+            skill_id=str(uuid.uuid4()),
+            name=name,
+            trigger=trigger,
+            steps=json.dumps(steps),
+            created_at=datetime.utcnow().isoformat(),
+            source_ref=source_ref,
+        )
+        applied_skill_ids.append(name)
+
+    for note in notes:
+        if isinstance(note, str) and note.strip():
+            staged_notes.append(note.strip())
+
+    if staged_notes:
+        staged_item_ids.append(
+            _stage_item(
+                db,
+                kind="commitment",
+                payload={"note_only": True, "notes": staged_notes},
+                provenance_type="SYSTEM_OBSERVED",
+                source_ref="sleep_notes",
+            )
+        )
+
     return ConsolidationResult(
         inserted_fact_ids=inserted_fact_ids,
         skipped_candidates=skipped_candidates,
         contested_fact_ids=contested_fact_ids,
+        staged_item_ids=staged_item_ids,
+        applied_commitment_ids=applied_commitment_ids,
+        applied_skill_ids=applied_skill_ids,
+        notes=staged_notes,
     )
 
 
-def can_promote_fact(candidate: dict[str, object]) -> bool:
-    provenance_type = candidate.get("provenance_type")
-    if provenance_type == "AGENT_OUTPUT":
+def apply_sleep_output(db: Database, payload: dict[str, object]) -> ConsolidationResult:
+    return apply_sleep_changes(db, payload, SleepPolicy())
+
+
+def can_promote_fact(provenance_type: str, source_ref: str, confidence: float) -> bool:
+    if not provenance_type or not source_ref:
         return False
-    if not candidate.get("source_ref"):
+    if provenance_type in FORBIDDEN_FACT_TYPES:
         return False
-    confidence = candidate.get("confidence")
-    confidence_value = CONFIDENCE_DEFAULTS.get(str(provenance_type), 0.0)
-    if isinstance(confidence, (int, float)):
-        confidence_value = float(confidence)
-    elif isinstance(confidence, str) and confidence.strip():
-        try:
-            confidence_value = float(confidence)
-        except ValueError:
-            confidence_value = CONFIDENCE_DEFAULTS.get(str(provenance_type), 0.0)
-    if provenance_type == ProvenanceType.INFERRED.value and confidence_value < 0.5:
+    if provenance_type == ProvenanceType.INFERRED.value and confidence < 0.5:
         return False
     return True
 
 
+def _stage_item(
+    db: Database,
+    kind: str,
+    payload: dict[str, object],
+    provenance_type: str,
+    source_ref: str,
+) -> str:
+    item_id = str(uuid.uuid4())
+    db.insert_staged_item(
+        item_id=item_id,
+        kind=kind,
+        payload=json.dumps(payload),
+        status="pending",
+        created_at=datetime.utcnow().isoformat(),
+        source_ref=source_ref,
+        provenance_type=provenance_type,
+        next_check_at=datetime.utcnow().isoformat(),
+    )
+    return item_id
+
+
+def _is_explicit_commitment(
+    db: Database,
+    source_ref: str,
+    description: str,
+    candidate: dict[str, object],
+) -> bool:
+    explicit_flag = candidate.get("explicit_request")
+    if isinstance(explicit_flag, bool):
+        return explicit_flag
+    episode = db.fetch_episode(source_ref)
+    if not episode:
+        return False
+    user_text = (episode["user_input"] or "").lower()
+    description_tokens = description.lower()
+    explicit_markers = [
+        "please",
+        "remind me",
+        "i will",
+        "i'll",
+        "we will",
+        "set a reminder",
+        "remember to",
+        "need to",
+        "let's",
+    ]
+    return description_tokens in user_text or any(marker in user_text for marker in explicit_markers)
+
+
+def _skill_evidence_strong(evidence: object) -> bool:
+    return isinstance(evidence, list) and len(evidence) >= 2
+
+
+def _steps_tool_safe(steps: object) -> bool:
+    if not isinstance(steps, list):
+        return False
+    unsafe_markers = {"sudo", "rm -rf", "format disk", "delete system"}
+    for step in steps:
+        if not isinstance(step, str):
+            return False
+        lowered = step.lower()
+        if any(marker in lowered for marker in unsafe_markers):
+            return False
+    return True
+
+
+def _coerce_confidence(value: object, default: float) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            return float(value)
+        except ValueError:
+            return default
+    return default
+
+
 def _normalize(text: str) -> str:
     lowered = text.lower()
-    lowered = re.sub(r"[^a-z0-9\\s]", "", lowered)
-    return re.sub(r"\\s+", " ", lowered).strip()
+    lowered = re.sub(r"[^a-z0-9\s]", "", lowered)
+    return re.sub(r"\s+", " ", lowered).strip()
 
 
 def _is_contradiction(statement: str, existing: str) -> bool:
