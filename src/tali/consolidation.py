@@ -30,6 +30,9 @@ def apply_sleep_output(db: Database, payload: dict[str, object]) -> Consolidatio
     inserted_fact_ids: list[str] = []
     skipped_candidates: list[str] = []
     contested_fact_ids: list[str] = []
+    last_run = db.last_sleep_run()
+    cutoff_date = last_run["timestamp"] if last_run else datetime.utcnow().isoformat()
+    db.apply_confidence_decay(cutoff_date)
 
     if not isinstance(fact_candidates, list):
         raise ValueError("fact_candidates must be a list")
@@ -51,8 +54,15 @@ def apply_sleep_output(db: Database, payload: dict[str, object]) -> Consolidatio
         if provenance_type not in CONFIDENCE_DEFAULTS:
             skipped_candidates.append("unknown_provenance")
             continue
+        if not can_promote_fact(candidate):
+            skipped_candidates.append("promotion_gate")
+            continue
         if not db.episode_exists(str(source_ref)):
             skipped_candidates.append("missing_source")
+            continue
+        episode = db.fetch_episode(str(source_ref))
+        if episode and episode["quarantine"]:
+            skipped_candidates.append("quarantined_source")
             continue
 
         existing = db.search_facts(str(statement), limit=5)
@@ -98,6 +108,26 @@ def apply_sleep_output(db: Database, payload: dict[str, object]) -> Consolidatio
         skipped_candidates=skipped_candidates,
         contested_fact_ids=contested_fact_ids,
     )
+
+
+def can_promote_fact(candidate: dict[str, object]) -> bool:
+    provenance_type = candidate.get("provenance_type")
+    if provenance_type == "AGENT_OUTPUT":
+        return False
+    if not candidate.get("source_ref"):
+        return False
+    confidence = candidate.get("confidence")
+    confidence_value = CONFIDENCE_DEFAULTS.get(str(provenance_type), 0.0)
+    if isinstance(confidence, (int, float)):
+        confidence_value = float(confidence)
+    elif isinstance(confidence, str) and confidence.strip():
+        try:
+            confidence_value = float(confidence)
+        except ValueError:
+            confidence_value = CONFIDENCE_DEFAULTS.get(str(provenance_type), 0.0)
+    if provenance_type == ProvenanceType.INFERRED.value and confidence_value < 0.5:
+        return False
+    return True
 
 
 def _normalize(text: str) -> str:

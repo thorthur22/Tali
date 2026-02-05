@@ -293,29 +293,53 @@ class Database:
             )
             return cursor.fetchall()
 
-    def list_episodes_since(self, timestamp: str | None, limit: int) -> list[sqlite3.Row]:
+    def list_episodes_since(
+        self, timestamp: str | None, limit: int, exclude_quarantined: bool = True
+    ) -> list[sqlite3.Row]:
         with self.connect() as connection:
-            if timestamp:
-                cursor = connection.execute(
-                    """
-                    SELECT * FROM episodes
-                    WHERE timestamp > ? AND quarantine = 0
-                    ORDER BY timestamp ASC
-                    LIMIT ?
-                    """,
-                    (timestamp, limit),
-                )
-            else:
-                cursor = connection.execute(
-                    """
-                    SELECT * FROM episodes
-                    WHERE quarantine = 0
-                    ORDER BY timestamp ASC
-                    LIMIT ?
-                    """,
-                    (limit,),
-                )
+            where_clause = "WHERE timestamp > ?" if timestamp else "WHERE 1=1"
+            params: list[object] = [timestamp] if timestamp else []
+            if exclude_quarantined:
+                where_clause += " AND quarantine = 0"
+            params.append(limit)
+            cursor = connection.execute(
+                f"""
+                SELECT * FROM episodes
+                {where_clause}
+                ORDER BY timestamp ASC
+                LIMIT ?
+                """,
+                params,
+            )
             return cursor.fetchall()
+
+    def fetch_episodes_since_last_sleep(
+        self, limit: int, exclude_quarantined: bool = True
+    ) -> list[sqlite3.Row]:
+        last_run = self.last_sleep_run()
+        last_timestamp = last_run["last_episode_timestamp"] if last_run else None
+        return self.list_episodes_since(
+            last_timestamp, limit=limit, exclude_quarantined=exclude_quarantined
+        )
+
+    def fetch_episode(self, episode_id: str) -> sqlite3.Row | None:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "SELECT * FROM episodes WHERE id = ?",
+                (episode_id,),
+            )
+            return cursor.fetchone()
+
+    def apply_confidence_decay(self, cutoff_date: str) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE facts
+                SET confidence = MAX(0.0, confidence - decay_rate)
+                WHERE last_confirmed < ?
+                """,
+                (cutoff_date,),
+            )
 
     def last_sleep_run(self) -> sqlite3.Row | None:
         with self.connect() as connection:

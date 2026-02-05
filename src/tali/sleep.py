@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -36,7 +35,10 @@ def run_sleep(db: Database, output_dir: Path, llm: LLMClient, episode_limit: int
     output_dir.mkdir(parents=True, exist_ok=True)
     last_run = db.last_sleep_run()
     last_timestamp = last_run["last_episode_timestamp"] if last_run else None
-    episodes = db.list_episodes_since(last_timestamp, limit=episode_limit)
+    episodes = db.fetch_episodes_since_last_sleep(
+        limit=episode_limit,
+        exclude_quarantined=True,
+    )
     prompt = build_sleep_prompt(episodes)
     response = llm.generate(prompt)
     payload = _parse_json(response.content)
@@ -90,13 +92,7 @@ def build_sleep_prompt(episodes: Iterable[object]) -> str:
 
 
 def _parse_json(text: str) -> dict[str, object]:
-    try:
-        payload = json.loads(text)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if not match:
-            raise
-        payload = json.loads(match.group(0))
+    payload = json.loads(text)
     if not isinstance(payload, dict):
         raise ValueError("Sleep output must be a JSON object.")
     return payload
