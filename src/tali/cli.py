@@ -25,6 +25,7 @@ from tali.embeddings import OllamaEmbeddingClient, OpenAIEmbeddingClient
 from tali.guardrails import Guardrails
 from tali.llm import OllamaClient, OpenAIClient
 from tali.retrieval import Retriever
+from tali.self_care import SleepScheduler, resolve_staged_items
 from tali.sleep import load_sleep_output, run_sleep
 from tali.snapshots import create_snapshot, diff_snapshot, list_snapshots, rollback_snapshot
 from tali.vector_index import VectorIndex
@@ -90,8 +91,41 @@ def chat(message: Optional[str] = typer.Argument(None, help="Message to send to 
     vector_index = VectorIndex(paths.vector_dir / "memory.index", config.embeddings.dim, embedder)
     retriever = Retriever(db, RetrievalConfig(), vector_index=vector_index)
     guardrails = Guardrails(GuardrailConfig())
+    scheduler = SleepScheduler(paths.data_dir, db, llm, vector_index)
+    scheduler.start()
 
     def run_turn(user_input: str) -> None:
+        scheduler.update_activity()
+        resolution = resolve_staged_items(db, user_input)
+        if resolution and resolution.applied_fact_id:
+            facts = db.fetch_facts_by_ids([resolution.applied_fact_id])
+            if facts:
+                vector_index.add(
+                    item_type="fact", item_id=resolution.applied_fact_id, text=facts[0]["statement"]
+                )
+        if resolution and resolution.clarification_question:
+            episode = build_episode(
+                user_input=user_input,
+                guardrail=guardrails.enforce(resolution.clarification_question, retriever.retrieve(user_input).bundle),
+                tool_calls=[],
+                outcome="clarification",
+                quarantine=0,
+            )
+            db.insert_episode(
+                episode_id=episode.id,
+                user_input=episode.user_input,
+                agent_output=episode.agent_output,
+                tool_calls=episode.tool_calls,
+                outcome=episode.outcome,
+                quarantine=episode.quarantine,
+            )
+            vector_index.add(
+                item_type="episode",
+                item_id=episode.id,
+                text=f"{episode.user_input}\n{episode.agent_output}",
+            )
+            typer.echo(episode.agent_output)
+            return
         retrieval_context = retriever.retrieve(user_input)
         prompt = build_prompt(retrieval_context.bundle, user_input)
         response = llm.generate(prompt)
@@ -120,6 +154,7 @@ def chat(message: Optional[str] = typer.Argument(None, help="Message to send to 
 
     if message:
         run_turn(message)
+        scheduler.stop()
         return
 
     typer.echo("Tali chat (type 'exit' to quit)")
@@ -128,6 +163,7 @@ def chat(message: Optional[str] = typer.Argument(None, help="Message to send to 
         if user_input.strip().lower() in {"exit", "quit"}:
             break
         run_turn(user_input)
+    scheduler.stop()
 
 
 @app.command()
@@ -147,27 +183,47 @@ def sleep(
     vector_index = VectorIndex(paths.vector_dir / "memory.index", config.embeddings.dim, embedder)
     if apply:
         snapshot = create_snapshot(paths.data_dir)
-        payload = load_sleep_output(apply)
-        result = apply_sleep_output(db, payload)
-        for fact_id in result.inserted_fact_ids:
-            facts = db.fetch_facts_by_ids([fact_id])
-            if facts:
-                vector_index.add(item_type="fact", item_id=fact_id, text=facts[0]["statement"])
-        typer.echo(
-            json.dumps(
-                {
-                    "inserted_fact_ids": result.inserted_fact_ids,
-                    "skipped_candidates": result.skipped_candidates,
-                    "contested_fact_ids": result.contested_fact_ids,
-                    "snapshot_id": snapshot.id,
-                },
-                indent=2,
+        try:
+            payload = load_sleep_output(apply)
+            result = apply_sleep_output(db, payload)
+            for fact_id in result.inserted_fact_ids:
+                facts = db.fetch_facts_by_ids([fact_id])
+                if facts:
+                    vector_index.add(item_type="fact", item_id=fact_id, text=facts[0]["statement"])
+            typer.echo(
+                json.dumps(
+                    {
+                        "inserted_fact_ids": result.inserted_fact_ids,
+                        "skipped_candidates": result.skipped_candidates,
+                        "contested_fact_ids": result.contested_fact_ids,
+                        "staged_item_ids": result.staged_item_ids,
+                        "snapshot_id": snapshot.id,
+                    },
+                    indent=2,
+                )
             )
-        )
+        except Exception:
+            rollback_snapshot(paths.data_dir, snapshot)
+            raise
         return
-    target_dir = output_dir or paths.data_dir / "sleep"
-    output_path = run_sleep(db, target_dir, llm=llm)
-    typer.echo(f"Sleep output written to {output_path}")
+    if output_dir:
+        target_dir = output_dir
+        output_path = run_sleep(db, target_dir, llm=llm)
+        typer.echo(f"Sleep output written to {output_path}")
+        return
+    last_run = db.last_sleep_run()
+    last_time = last_run["timestamp"] if last_run else "never"
+    episodes_since = db.count_episodes_since_last_sleep()
+    typer.echo(
+        json.dumps(
+            {
+                "last_sleep": last_time,
+                "episodes_since_last_sleep": episodes_since,
+                "message": "Sleep runs automatically in chat.",
+            },
+            indent=2,
+        )
+    )
 
 
 @app.command()
@@ -228,6 +284,33 @@ def snapshot() -> None:
     paths = load_paths(Path.cwd())
     snapshot = create_snapshot(paths.data_dir)
     typer.echo(f"Snapshot created: {snapshot.id}")
+
+
+@app.command()
+def doctor() -> None:
+    """Validate core invariants and report staged items."""
+    paths = load_paths(Path.cwd())
+    db = _init_db(paths.db_path)
+    violations: list[str] = []
+    facts = db.list_facts()
+    for row in facts:
+        if row["provenance_type"] == "AGENT_OUTPUT":
+            violations.append(f"Fact {row['id']} has forbidden provenance.")
+        if not row["source_ref"]:
+            violations.append(f"Fact {row['id']} missing source_ref.")
+        confidence = float(row["confidence"])
+        if confidence < 0.0 or confidence > 1.0:
+            violations.append(f"Fact {row['id']} has confidence out of range.")
+    staged_count = db.count_staged_items()
+    oldest = db.oldest_pending_staged_item()
+    report = {
+        "violations": violations,
+        "staged_items": staged_count,
+        "oldest_pending_staged_item": dict(oldest) if oldest else None,
+    }
+    typer.echo(json.dumps(report, indent=2))
+    if violations:
+        raise typer.Exit(code=1)
 
 
 @app.command()

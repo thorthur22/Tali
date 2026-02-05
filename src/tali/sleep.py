@@ -42,14 +42,13 @@ def run_sleep(db: Database, output_dir: Path, llm: LLMClient, episode_limit: int
     prompt = build_sleep_prompt(episodes)
     response = llm.generate(prompt)
     payload = _parse_json(response.content)
-    if not isinstance(payload, dict):
-        raise ValueError("Sleep output must be a JSON object.")
+    _validate_sleep_payload(payload)
     result = SleepResult(
         generated_at=datetime.utcnow().isoformat(),
-        fact_candidates=payload.get("fact_candidates", []),
-        commitment_updates=payload.get("commitment_updates", []),
-        skill_candidates=payload.get("skill_candidates", []),
-        notes=payload.get("notes", []),
+        fact_candidates=payload["fact_candidates"],
+        commitment_updates=payload["commitment_updates"],
+        skill_candidates=payload["skill_candidates"],
+        notes=payload["notes"],
     )
     output_path = output_dir / f"sleep_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
     output_path.write_text(result.to_json())
@@ -63,8 +62,7 @@ def run_sleep(db: Database, output_dir: Path, llm: LLMClient, episode_limit: int
 
 def load_sleep_output(path: Path) -> dict[str, object]:
     payload = _parse_json(path.read_text())
-    if not isinstance(payload, dict):
-        raise ValueError("Sleep output must be a JSON object.")
+    _validate_sleep_payload(payload)
     return payload
 
 
@@ -73,11 +71,12 @@ def build_sleep_prompt(episodes: Iterable[object]) -> str:
         "You are the consolidation engine. Return strict JSON only.",
         "Extract fact_candidates from episodes. Facts must be grounded to episodes.",
         "Never include AGENT_OUTPUT provenance.",
+        "Return ALL keys even if empty arrays.",
         "Output JSON format:",
         "{",
         '  "fact_candidates": [{"statement": "...", "provenance_type": "USER_REPORTED", "source_ref": "episode_id", "tags": []}],',
-        '  "commitment_updates": [],',
-        '  "skill_candidates": [],',
+        '  "commitment_updates": [{"commitment_id": null, "description": "...", "status": "pending", "source_ref": "episode_id"}],',
+        '  "skill_candidates": [{"name": "...", "trigger": "...", "steps": ["..."], "source_ref": "episode_id"}],',
         '  "notes": []',
         "}",
         f"Forbidden fact types: {sorted(FORBIDDEN_FACT_TYPES)}",
@@ -92,7 +91,20 @@ def build_sleep_prompt(episodes: Iterable[object]) -> str:
 
 
 def _parse_json(text: str) -> dict[str, object]:
-    payload = json.loads(text)
+    """Parse strict JSON from the model."""
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Sleep output must be strict JSON with no extra text.") from exc
     if not isinstance(payload, dict):
         raise ValueError("Sleep output must be a JSON object.")
     return payload
+
+
+def _validate_sleep_payload(payload: dict[str, object]) -> None:
+    required_keys = ("fact_candidates", "commitment_updates", "skill_candidates", "notes")
+    for key in required_keys:
+        if key not in payload:
+            raise ValueError(f"Sleep output missing required key: {key}")
+        if not isinstance(payload[key], list):
+            raise ValueError(f"Sleep output key {key} must be a list.")
