@@ -120,12 +120,14 @@ class ToolRunner:
                     )
                 )
                 continue
+            details = self._format_approval_details(call)
             approval: ApprovalOutcome = self.approvals.resolve(
                 prompt_fn=prompt_fn,
                 tool_name=call.name,
                 signature=decision.signature,
                 requires_approval=decision.requires_approval,
                 reason="; ".join(decision.red_flags) if decision.red_flags else None,
+                details=details,
             )
             if not approval.approved:
                 record = ToolRecord(
@@ -208,6 +210,19 @@ class ToolRunner:
                 )
             )
         return tool_results, tool_records
+
+    def _format_approval_details(self, call: ToolCall) -> str:
+        purpose = call.purpose or ""
+        try:
+            args_text = json.dumps(call.args, indent=2)
+        except (TypeError, ValueError):
+            args_text = str(call.args)
+        lines = [
+            f"Purpose: {purpose}" if purpose else "Purpose: (none provided)",
+            "Args:",
+            args_text,
+        ]
+        return "\n".join(lines)
 
     def _skipped_record(self, call: ToolCall, reason: str) -> ToolRecord:
         return ToolRecord(

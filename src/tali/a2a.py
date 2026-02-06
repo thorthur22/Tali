@@ -234,6 +234,7 @@ class A2APoller:
         result = self.task_runner.run_turn(
             f"Delegated task: {request.title}\n{request.description}",
             prompt_fn=self.prompt_fn,
+            show_plans=False,
         )
         run_row = self.db.fetch_run(run_id)
         if run_row and run_row["status"] == "done":

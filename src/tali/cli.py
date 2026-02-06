@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import platform
 import subprocess
+import re
+import shutil
 from datetime import datetime
 from uuid import uuid4
 from pathlib import Path
@@ -19,17 +22,21 @@ from tali.config import (
     LLMSettings,
     RetrievalConfig,
     ToolSettings,
+    TaskRunnerConfig,
     Paths,
+    SharedSettings,
     load_config,
     load_paths,
+    load_shared_settings,
     save_config,
+    save_shared_settings,
 )
 from tali.agent_identity import resolve_agent
 from tali.a2a import A2AClient, A2APoller, AgentProfile
 from tali.a2a_registry import AgentRecord, Registry
 from tali.consolidation import apply_sleep_output
 from tali.db import Database
-from tali.episode import build_episode
+from tali.episode import build_episode, build_prompt
 from tali.embeddings import OllamaEmbeddingClient, OpenAIEmbeddingClient
 from tali.guardrails import GuardrailResult, Guardrails
 from tali.llm import OllamaClient, OpenAIClient
@@ -39,8 +46,8 @@ from tali.sleep import load_sleep_output, run_sleep
 from tali.snapshots import create_snapshot, diff_snapshot, list_snapshots, rollback_snapshot
 from tali.vector_index import VectorIndex
 from tali.approvals import ApprovalManager
-from tali.task_runner import TaskRunner
-from tali.hooks import HookManager
+from tali.task_runner import TaskRunner, TaskRunnerSettings
+from tali.hooks.core import HookManager
 from tali.idle import IdleScheduler
 from tali.knowledge_sources import KnowledgeSourceRegistry
 from tali.questions import mark_question_asked, resolve_answered_question, select_question_to_ask
@@ -85,9 +92,26 @@ def _load_or_raise_config(paths: Paths, existing: AppConfig | None = None) -> Ap
             llm=config.llm,
             embeddings=config.embeddings,
             tools=config.tools,
+            task_runner=config.task_runner,
         )
         save_config(paths.config_path, updated)
-        return updated
+        config = updated
+    shared_path = paths.shared_home / "config.json"
+    shared = load_shared_settings(shared_path)
+    if shared:
+        config = AppConfig(
+            agent_id=config.agent_id,
+            agent_name=config.agent_name,
+            created_at=config.created_at,
+            capabilities=config.capabilities,
+            llm=config.llm or shared.llm,
+            embeddings=config.embeddings or shared.embeddings,
+            tools=config.tools or shared.tools,
+            task_runner=config.task_runner,
+        )
+    if not config.llm or not config.embeddings or not config.tools:
+        typer.echo("Shared config missing; run `tali setup` to configure shared settings.")
+        raise typer.Exit(code=1)
     return config
 
 
@@ -197,6 +221,7 @@ def _pull_ollama_model(model: str) -> None:
 def chat(
     message: Optional[str] = typer.Argument(None, help="Message to send to the agent."),
     verbose_tools: bool = typer.Option(False, "--verbose-tools", help="Show full tool output."),
+    show_plans: bool = typer.Option(False, "--show-plans", help="Show task planning steps."),
 ) -> None:
     """Start a chat loop or run a single turn if message is provided."""
     paths, existing_config = _resolve_paths()
@@ -227,6 +252,8 @@ def chat(
     tool_settings = config.tools if isinstance(config.tools, ToolSettings) else ToolSettings()
     if tool_settings.approval_mode not in {"prompt", "auto_approve_safe", "deny"}:
         tool_settings = replace(tool_settings, approval_mode="prompt")
+    if tool_settings.fs_root is None or not str(tool_settings.fs_root).strip():
+        tool_settings = replace(tool_settings, fs_root=str(Path.home()))
     registry = build_default_registry(paths, tool_settings)
     policy = ToolPolicy(tool_settings, registry, paths)
     approvals = ApprovalManager(mode=tool_settings.approval_mode)
@@ -254,6 +281,36 @@ def chat(
     )
     if a2a_client.secret is None:
         console.print("[dim]A2A: shared secret missing; messages are unsigned.[/dim]")
+    agent_context = "\n".join(
+        [
+            f"Agent name: {config.agent_name}",
+            f"Agent home: {paths.agent_home}",
+            f"Config path: {paths.config_path}",
+            f"LLM model: {config.llm.model}",
+            f"Tool fs_root: {tool_settings.fs_root}",
+            f"OS: {platform.system()} {platform.release()}",
+            "The agent is distinct from the LLM model.",
+            "You are the LLM planner; the Tali agent executes tool calls you request.",
+            "Use config.json (not config.txt).",
+            "Do not use tools for greetings or small talk.",
+        ]
+    )
+    task_runner_config = (
+        config.task_runner if isinstance(config.task_runner, TaskRunnerConfig) else None
+    )
+    task_runner_settings = (
+        TaskRunnerSettings(
+            max_tasks_per_turn=task_runner_config.max_tasks_per_turn,
+            max_llm_calls_per_task=task_runner_config.max_llm_calls_per_task,
+            max_tool_calls_per_task=task_runner_config.max_tool_calls_per_task,
+            max_total_llm_calls_per_run_per_turn=(
+                task_runner_config.max_total_llm_calls_per_run_per_turn
+            ),
+            max_total_steps_per_turn=task_runner_config.max_total_steps_per_turn,
+        )
+        if task_runner_config
+        else None
+    )
     task_runner = TaskRunner(
         db=db,
         llm=llm,
@@ -263,6 +320,9 @@ def chat(
         tool_descriptions=tool_descriptions,
         hook_manager=hook_manager,
         a2a_client=a2a_client,
+        agent_context=agent_context,
+        status_fn=(lambda msg: console.print(f"[dim]{escape(msg)}[/dim]")),
+        settings=task_runner_settings,
     )
     poller = A2APoller(
         db=db,
@@ -273,6 +333,115 @@ def chat(
     )
     poller.start()
 
+    def _is_small_talk(text: str) -> bool:
+        lowered = text.strip().lower()
+        if re.match(r"^(hi|hello|hey|yo|oi)(\b|$)", lowered):
+            return True
+        starters = [
+            "how are you",
+            "how you doing",
+            "hows it going",
+            "how's it going",
+            "what's up",
+            "whats up",
+        ]
+        if any(lowered.startswith(starter) for starter in starters):
+            return True
+        phrases = [
+            "thanks",
+            "thank you",
+            "appreciate it",
+            "good job",
+            "good work",
+            "great job",
+            "great work",
+            "nice work",
+            "well done",
+        ]
+        return any(phrase in lowered for phrase in phrases)
+
+    def _is_name_question(text: str) -> bool:
+        lowered = text.strip().lower()
+        triggers = [
+            "what's your name",
+            "what is your name",
+            "who are you",
+            "your name",
+            "hi burt",
+            "hello burt",
+            "hey burt",
+        ]
+        return any(trigger in lowered for trigger in triggers)
+
+    def _is_open_ended(text: str) -> bool:
+        lowered = text.strip().lower()
+        starters = [
+            "what do you think",
+            "what's your take",
+            "how do you feel",
+            "should i",
+            "would you",
+            "why",
+        ]
+        return any(lowered.startswith(starter) for starter in starters) or lowered.endswith("?")
+
+    def _is_action_request(text: str) -> bool:
+        lowered = text.strip().lower()
+        keywords = [
+            "create",
+            "make",
+            "write",
+            "save",
+            "add",
+            "generate",
+            "build",
+            "compose",
+            "draft",
+            "produce",
+            "open",
+            "read",
+            "view",
+            "show",
+            "display",
+            "search",
+            "find",
+            "fetch",
+            "download",
+            "upload",
+            "edit",
+            "change",
+            "update",
+            "delete",
+            "remove",
+            "run",
+            "execute",
+            "list",
+            "read file",
+            "open file",
+            "search",
+            "fetch",
+            "download",
+            "apply",
+            "fix",
+            "refactor",
+            "implement",
+            "rename",
+            "move",
+            "copy",
+            "replace",
+            "append",
+            "insert",
+            "modify",
+            "configure",
+            "set up",
+            "setup",
+            "install",
+            "uninstall",
+            "upgrade",
+            "downgrade",
+        ]
+        return any(keyword in lowered for keyword in keywords)
+
     def run_turn(user_input: str) -> None:
         scheduler.update_activity()
         idle_scheduler.update_activity()
@@ -281,6 +450,87 @@ def chat(
             console.print(f"[dim]{escape(msg)}[/dim]")
         pending_question_row = db.fetch_last_asked_question()
         has_pending_question = bool(pending_question_row and pending_question_row["status"] == "asked")
+        def _run_task_runner_turn() -> None:
+            with console.status(
+                "[bold yellow]Working... (planning tasks and tool calls)[/bold yellow]"
+            ):
+                result = task_runner.run_turn(user_input, prompt_fn=console.input, show_plans=show_plans)
+            tool_calls_log: list[dict[str, str]] = []
+            for record in result.tool_records:
+                tool_calls_log.append(
+                    {
+                        "id": record.id,
+                        "name": record.name,
+                        "status": record.status,
+                        "approval_mode": record.approval_mode or "",
+                        "result_ref": record.result_ref or "",
+                        "summary": record.result_summary or "",
+                    }
+                )
+                console.print(
+                    f"[bold magenta]Tool[/bold magenta] {record.name} {record.id} status={record.status}"
+                )
+                if record.result_summary:
+                    console.print(f"[dim]{escape(record.result_summary)}[/dim]")
+                if verbose_tools and record.result_json:
+                    console.print(f"[dim]{escape(record.result_json)}[/dim]")
+            guardrail = GuardrailResult(safe_output=result.message, flags=[])
+            episode = build_episode(
+                user_input=user_input,
+                guardrail=guardrail,
+                tool_calls=tool_calls_log,
+                outcome="ok",
+                quarantine=0,
+            )
+            db.insert_episode(
+                episode_id=episode.id,
+                user_input=episode.user_input,
+                agent_output=episode.agent_output,
+                tool_calls=episode.tool_calls,
+                outcome=episode.outcome,
+                quarantine=episode.quarantine,
+            )
+            if has_pending_question:
+                answer_payload = resolve_answered_question(
+                    db, user_input, dict(pending_question_row), source_ref=episode.id
+                )
+                if answer_payload:
+                    db.insert_staged_item(
+                        item_id=str(uuid4()),
+                        kind="fact",
+                        payload=json.dumps(answer_payload),
+                        status="pending",
+                        created_at=episode.timestamp,
+                        source_ref=episode.id,
+                        provenance_type="USER_REPORTED",
+                        next_check_at=episode.timestamp,
+                    )
+            for record in result.tool_records:
+                db.insert_tool_call(
+                    tool_call_id=record.id,
+                    episode_id=episode.id,
+                    tool_name=record.name,
+                    args=record.args,
+                    status=record.status,
+                    result_json=record.result_json,
+                    result_hash=record.result_hash,
+                    result_path=record.result_path,
+                    started_at=record.started_at,
+                    ended_at=record.ended_at,
+                    risk_level=record.risk_level,
+                    approval_mode=record.approval_mode,
+                )
+            vector_index.add(
+                item_type="episode",
+                item_id=episode.id,
+                text=f"{episode.user_input}\n{episode.agent_output}",
+            )
+            console.print(
+                f"[bold green]Tali[/bold green]: {escape(episode.agent_output)}"
+            )
+            hook_messages = hook_manager.run("on_turn_end", {"episode_id": episode.id, "run_id": result.run_id})
+            for msg in hook_messages:
+                console.print(f"[dim]{escape(msg)}[/dim]")
         resolution = resolve_staged_items(db, user_input)
         if resolution and resolution.applied_fact_id:
             facts = db.fetch_facts_by_ids([resolution.applied_fact_id])
@@ -294,6 +544,44 @@ def chat(
                 guardrail=guardrails.enforce(resolution.clarification_question, retriever.retrieve(user_input).bundle),
                 tool_calls=[],
                 outcome="clarification",
+                quarantine=0,
+            )
+            db.insert_episode(
+                episode_id=episode.id,
+                user_input=episode.user_input,
+                agent_output=episode.agent_output,
+                tool_calls=episode.tool_calls,
+                outcome=episode.outcome,
+                quarantine=episode.quarantine,
+            )
+            vector_index.add(
+                item_type="episode",
+                item_id=episode.id,
+                text=f"{episode.user_input}\n{episode.agent_output}",
+            )
+            console.print(
+                f"[bold green]Tali[/bold green]: {escape(episode.agent_output)}"
+            )
+            return
+        active_run = db.fetch_active_run()
+        if active_run and active_run["status"] in {"active", "blocked"}:
+            _run_task_runner_turn()
+            return
+        if "facts we need to validate" in user_input.lower() or "staged" in user_input.lower():
+            staged = db.list_staged_items(["pending", "verifying"], limit=5)
+            if staged:
+                lines = ["Staged items to validate:"]
+                for row in staged:
+                    lines.append(f"- {row['kind']} {row['payload']}")
+                message = "\n".join(lines)
+            else:
+                message = "No staged items pending validation."
+            guardrail = guardrails.enforce(message, retriever.retrieve(user_input).bundle)
+            episode = build_episode(
+                user_input=user_input,
+                guardrail=guardrail,
+                tool_calls=[],
+                outcome="ok",
                 quarantine=0,
             )
             db.insert_episode(
@@ -341,84 +629,7 @@ def chat(
                     f"[bold green]Tali[/bold green]: {escape(episode.agent_output)}"
                 )
                 return
-        with console.status("[bold yellow]Working...[/bold yellow]"):
-            result = task_runner.run_turn(user_input, prompt_fn=console.input)
-        tool_calls_log: list[dict[str, str]] = []
-        for record in result.tool_records:
-            tool_calls_log.append(
-                {
-                    "id": record.id,
-                    "name": record.name,
-                    "status": record.status,
-                    "approval_mode": record.approval_mode or "",
-                    "result_ref": record.result_ref or "",
-                    "summary": record.result_summary or "",
-                }
-            )
-            console.print(
-                f"[bold magenta]Tool[/bold magenta] {record.name} {record.id} status={record.status}"
-            )
-            if record.result_summary:
-                console.print(f"[dim]{escape(record.result_summary)}[/dim]")
-            if verbose_tools and record.result_json:
-                console.print(f"[dim]{escape(record.result_json)}[/dim]")
-        guardrail = GuardrailResult(safe_output=result.message, flags=[])
-        episode = build_episode(
-            user_input=user_input,
-            guardrail=guardrail,
-            tool_calls=tool_calls_log,
-            outcome="ok",
-            quarantine=0,
-        )
-        db.insert_episode(
-            episode_id=episode.id,
-            user_input=episode.user_input,
-            agent_output=episode.agent_output,
-            tool_calls=episode.tool_calls,
-            outcome=episode.outcome,
-            quarantine=episode.quarantine,
-        )
-        if has_pending_question:
-            answer_payload = resolve_answered_question(
-                db, user_input, dict(pending_question_row), source_ref=episode.id
-            )
-            if answer_payload:
-                db.insert_staged_item(
-                    item_id=str(uuid4()),
-                    kind="fact",
-                    payload=json.dumps(answer_payload),
-                    status="pending",
-                    created_at=episode.timestamp,
-                    source_ref=episode.id,
-                    provenance_type="USER_REPORTED",
-                    next_check_at=episode.timestamp,
-                )
-        for record in result.tool_records:
-            db.insert_tool_call(
-                tool_call_id=record.id,
-                episode_id=episode.id,
-                tool_name=record.name,
-                args=record.args,
-                status=record.status,
-                result_json=record.result_json,
-                result_hash=record.result_hash,
-                result_path=record.result_path,
-                started_at=record.started_at,
-                ended_at=record.ended_at,
-                risk_level=record.risk_level,
-                approval_mode=record.approval_mode,
-            )
-        vector_index.add(
-            item_type="episode",
-            item_id=episode.id,
-            text=f"{episode.user_input}\n{episode.agent_output}",
-        )
-        console.print(
-            f"[bold green]Tali[/bold green]: {escape(episode.agent_output)}"
-        )
-        hook_messages = hook_manager.run("on_turn_end", {"episode_id": episode.id, "run_id": result.run_id})
-        for msg in hook_messages:
-            console.print(f"[dim]{escape(msg)}[/dim]")
+        _run_task_runner_turn()
 
     if message:
         run_turn(message)
@@ -617,6 +828,22 @@ def swarm(prompt: str = typer.Argument(..., help="Swarm task prompt.")) -> None:
             capabilities=config.capabilities,
         ),
     )
+    task_runner_config = (
+        config.task_runner if isinstance(config.task_runner, TaskRunnerConfig) else None
+    )
+    task_runner_settings = (
+        TaskRunnerSettings(
+            max_tasks_per_turn=task_runner_config.max_tasks_per_turn,
+            max_llm_calls_per_task=task_runner_config.max_llm_calls_per_task,
+            max_tool_calls_per_task=task_runner_config.max_tool_calls_per_task,
+            max_total_llm_calls_per_run_per_turn=(
+                task_runner_config.max_total_llm_calls_per_run_per_turn
+            ),
+            max_total_steps_per_turn=task_runner_config.max_total_steps_per_turn,
+        )
+        if task_runner_config
+        else None
+    )
     task_runner = TaskRunner(
         db=db,
         llm=llm,
@@ -625,9 +852,28 @@ def swarm(prompt: str = typer.Argument(..., help="Swarm task prompt.")) -> None:
         tool_runner=runner,
         tool_descriptions=tool_descriptions,
         a2a_client=a2a_client,
+        settings=task_runner_settings,
     )
-    result = task_runner.run_turn(prompt, prompt_fn=typer.prompt)
+    result = task_runner.run_turn(prompt, prompt_fn=typer.prompt, show_plans=show_plans)
     typer.echo(result.message)
+
+
+@app.command("delete-agent")
+def delete_agent(agent_name: str = typer.Argument(..., help="Agent name to delete.")) -> None:
+    """Delete an agent by name."""
+    root = Path.home() / ".tali"
+    agent_home = root / agent_name
+    if not agent_home.exists():
+        typer.echo("Agent not found.")
+        raise typer.Exit(code=1)
+    registry = Registry(root / "shared" / "registry.json")
+    registry.remove(agent_name)
+    typer.echo(f"Deleting agent data at {agent_home} ...")
+    shutil.rmtree(agent_home)
+    remaining = [p for p in root.iterdir() if p.is_dir() and p.name != "shared" and (p / "config.json").exists()]
+    if not remaining:
+        typer.echo("No agents remain. Launching setup to create a new agent.")
+        setup()
 
 
 @patch_app.command("list")
@@ -959,6 +1205,10 @@ def setup() -> None:
     else:
         _prompt_ollama_download(embed_model)
     embed_dim = typer.prompt("Embedding dimension", default="1536")
+    typer.echo(
+        "File access is scoped by tools.fs_root (default: your user profile). "
+        "You can change it to narrow or expand the agent's file access for security."
+    )
 
     agent_id = existing_config.agent_id if existing_config and existing_config.agent_id else str(uuid4())
     created_at = existing_config.created_at if existing_config and existing_config.created_at else datetime.utcnow().isoformat()
@@ -968,6 +1218,13 @@ def setup() -> None:
         agent_name=agent_name,
         created_at=created_at,
         capabilities=capabilities,
+        llm=None,
+        embeddings=None,
+        tools=None,
+        task_runner=None,
+    )
+    save_config(paths.config_path, config)
+    shared_settings = SharedSettings(
         llm=LLMSettings(provider=provider, model=model, base_url=base_url, api_key=api_key),
         embeddings=EmbeddingSettings(
             provider=embed_provider,
@@ -976,9 +1233,9 @@ def setup() -> None:
             api_key=embed_api_key,
             dim=int(embed_dim),
         ),
-        tools=ToolSettings(),
+        tools=ToolSettings(fs_root=str(Path.home())),
     )
-    save_config(paths.config_path, config)
+    save_shared_settings(paths.shared_home / "config.json", shared_settings)
     paths.vector_dir.mkdir(parents=True, exist_ok=True)
     paths.logs_dir.mkdir(parents=True, exist_ok=True)
     paths.snapshots_dir.mkdir(parents=True, exist_ok=True)

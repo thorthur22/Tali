@@ -63,7 +63,7 @@ class HookManager:
         if not self.hooks_dir.exists():
             return
         for path in sorted(self.hooks_dir.glob("*.py")):
-            if path.name.startswith("_"):
+            if path.name.startswith("_") or path.name in {"core.py", "__init__.py"}:
                 continue
             module = self._load_module(path)
             if not module:

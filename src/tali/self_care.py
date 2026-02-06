@@ -336,9 +336,21 @@ def _is_relevant(user_input: str, statement: str) -> bool:
 
 def _parse_confirmation(user_input: str) -> bool | None:
     normalized = user_input.strip().lower()
-    if normalized in {"yes", "y", "yep", "correct", "affirmative", "sure"}:
+    if normalized.startswith(("yes", "yep", "y ", "y,", "y.")) or normalized in {
+        "yes",
+        "y",
+        "yep",
+        "correct",
+        "affirmative",
+        "sure",
+    }:
         return True
-    if normalized in {"no", "n", "nope", "negative"}:
+    if normalized.startswith(("no", "nope", "n ", "n,", "n.")) or normalized in {
+        "no",
+        "n",
+        "nope",
+        "negative",
+    }:
         return False
     return None
 

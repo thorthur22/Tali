@@ -476,6 +476,9 @@ class Database:
             return cursor.fetchall()
 
     def search_episodes(self, query: str, limit: int) -> list[sqlite3.Row]:
+        safe_query = "".join(ch if ch.isalnum() else " " for ch in query).strip()
+        if not safe_query:
+            return []
         with self.connect() as connection:
             cursor = connection.execute(
                 """
@@ -485,7 +488,7 @@ class Database:
                 ORDER BY rank
                 LIMIT ?
                 """,
-                (query, limit),
+                (safe_query, limit),
             )
             return cursor.fetchall()
 
@@ -1139,7 +1142,7 @@ class Database:
         with self.connect() as connection:
             connection.execute(
                 """
-                INSERT INTO agent_messages (
+                INSERT OR IGNORE INTO agent_messages (
                     id, timestamp, direction, from_agent_id, from_agent_name, to_agent_id, to_agent_name,
                     topic, correlation_id, payload, status, provenance_type
                 )
@@ -1171,6 +1174,22 @@ class Database:
                 LIMIT ?
                 """,
                 (limit,),
+            )
+            return cursor.fetchall()
+
+    def list_staged_items(self, statuses: list[str], limit: int = 10) -> list[sqlite3.Row]:
+        if not statuses:
+            return []
+        placeholders = ", ".join("?" for _ in statuses)
+        with self.connect() as connection:
+            cursor = connection.execute(
+                f"""
+                SELECT * FROM staged_items
+                WHERE status IN ({placeholders})
+                ORDER BY created_at ASC
+                LIMIT ?
+                """,
+                (*statuses, limit),
             )
             return cursor.fetchall()
 

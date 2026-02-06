@@ -89,3 +89,14 @@ class Registry:
                     break
             payload["agents"] = agents
             self.save(payload)
+
+    def remove(self, agent_name: str) -> bool:
+        with self._lock:
+            payload = self.load()
+            agents = payload.get("agents", [])
+            remaining = [agent for agent in agents if agent.get("agent_name") != agent_name]
+            if len(remaining) == len(agents):
+                return False
+            payload["agents"] = remaining
+            self.save(payload)
+            return True

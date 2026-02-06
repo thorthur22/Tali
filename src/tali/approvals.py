@@ -33,6 +33,7 @@ class ApprovalManager:
         signature: str | None,
         requires_approval: bool,
         reason: str | None,
+        details: str | None = None,
     ) -> ApprovalOutcome:
         if self.mode == "deny":
             return ApprovalOutcome(approved=False, approval_mode="denied", reason="session denied")
@@ -44,6 +45,7 @@ class ApprovalManager:
             return ApprovalOutcome(approved=True, approval_mode="auto")
 
         reason_line = f"Reason: {reason}" if reason else "Reason: policy requires approval"
+        details_line = f"Details:\n{details}" if details else None
         title = f"Approve tool call '{tool_name}'?"
         if questionary:
             choices = [
@@ -59,11 +61,8 @@ class ApprovalManager:
                     {"name": "Deny all for session", "value": "d"},
                 ]
             )
-            choice = questionary.select(
-                title,
-                choices=choices,
-                instruction=reason_line,
-            ).ask()
+            instruction = reason_line if not details_line else f"{reason_line}\n{details_line}"
+            choice = questionary.select(title, choices=choices, instruction=instruction).ask()
             if choice is None:
                 choice = "n"
         else:
@@ -71,6 +70,7 @@ class ApprovalManager:
                 [
                     title,
                     reason_line,
+                    details_line or "",
                     "Options: [a]pprove once, approve [t]ool for session, approve [s]ignature for session,",
                     "         approve all safe for session [y], [n]o once, [d]eny all for session",
                     "Choice: ",

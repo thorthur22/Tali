@@ -36,14 +36,18 @@ class ReviewResult:
     user_message: str
 
 
-def build_decomposition_prompt(user_prompt: str, tool_descriptions: str) -> str:
+def build_decomposition_prompt(user_prompt: str, tool_descriptions: str, agent_context: str) -> str:
     return "\n".join(
         [
             "You are an execution planner. Return STRICT JSON ONLY. No reasoning.",
+            "You are planning for the Tali agent, which executes tools on your behalf.",
+            "Do NOT claim you lack tool access; request tools when needed.",
             "Decompose the user request into specific, actionable, verifiable tasks.",
             "Prefer 3-12 tasks; if the request is tiny, allow 1-3 tasks.",
             "If the request is ambiguous, include an early task to clarify with the user.",
             "Include dependencies as indexes of earlier tasks.",
+            "Do NOT use tools for greetings or small talk.",
+            "Set requires_tools=true for any task needing files, shell, web, or python tools.",
             "Required JSON schema:",
             "{",
             '  "tasks": [',
@@ -58,6 +62,8 @@ def build_decomposition_prompt(user_prompt: str, tool_descriptions: str) -> str:
             "}",
             "Available tools:",
             tool_descriptions,
+            "Agent context:",
+            agent_context,
             "User request:",
             user_prompt,
         ]
@@ -122,15 +128,26 @@ def build_action_plan_prompt(
     task_outputs_json: str | None,
     tool_descriptions: str,
     recent_tool_summaries: list[str],
+    recent_tool_outputs: list[str],
+    agent_context: str,
 ) -> str:
     parts = [
         "You are the task action planner. Return STRICT JSON ONLY. No reasoning.",
+        "You are planning for the Tali agent, which executes tools on your behalf.",
+        "Do NOT claim you lack tool access; request tools when needed.",
         "Choose the single next action for this task.",
         "Valid next_action_type values:",
         '"respond", "tool_call", "ask_user", "store_output", "mark_done", "block", "fail", "delegate"',
         "If asking the user, keep it to ONE minimal question.",
         "If using a tool, provide tool_name and tool_args.",
+        "Always include tool_args as an object; use {} when a tool takes no args.",
+        "When work requires files, shell, web, or python, choose tool_call.",
         "If storing outputs, provide outputs_json as an object.",
+        "Use recent tool outputs to decide next steps; do NOT repeat a tool call if the output already provides the needed info.",
+        "For fs.list, omit the path to list fs_root; never pass an empty string path.",
+        "Avoid shell.run unless using allowed read-only commands (git status/diff/log, ls/dir, cat/type).",
+        "To find the Desktop, prefer fs.list on fs_root and locate 'Desktop'. If no Desktop entry exists, ask the user for a path.",
+        "Use the OS info from agent context to avoid OS-specific assumptions.",
         "JSON schema:",
         "{",
         '  "next_action_type": "respond|tool_call|ask_user|store_output|mark_done|block|fail|delegate",',
@@ -152,8 +169,12 @@ def build_action_plan_prompt(
         f"Outputs JSON: {task_outputs_json or ''}",
         "Recent tool results:",
         "\n".join(recent_tool_summaries) if recent_tool_summaries else "- None",
+        "Recent tool outputs:",
+        "\n".join(recent_tool_outputs) if recent_tool_outputs else "- None",
         "Available tools:",
         tool_descriptions,
+        "Agent context:",
+        agent_context,
     ]
     return "\n".join(parts)
 

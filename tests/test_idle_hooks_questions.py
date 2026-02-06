@@ -9,7 +9,7 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 
 from tali.db import Database
-from tali.hooks import Hook, HookActions, HookManager
+from tali.hooks.core import Hook, HookActions, HookManager
 from tali.idle import IdleLock, IdleScheduler
 from tali.knowledge_sources import KnowledgeSourceRegistry
 from tali.questions import mark_question_asked, queue_question, select_question_to_ask

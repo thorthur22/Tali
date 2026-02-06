@@ -97,6 +97,8 @@ class ToolPolicy:
         root = Path(self.settings.fs_root) if self.settings.fs_root else self.paths.data_dir
         target = call.args.get("path")
         if not isinstance(target, str) or not target:
+            if call.name == "fs.list":
+                return None
             return "path is required"
         candidate = Path(target)
         if not candidate.is_absolute():

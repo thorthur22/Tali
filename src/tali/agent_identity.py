@@ -9,7 +9,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from tali.config import AppConfig, LLMSettings, EmbeddingSettings, ToolSettings, load_config, save_config
+from tali.config import (
+    AppConfig,
+    LLMSettings,
+    EmbeddingSettings,
+    ToolSettings,
+    load_config,
+    save_config,
+)
 
 
 AGENT_NAME_PATTERN = re.compile(r"^[a-z0-9-_]{2,32}$")
@@ -141,6 +148,7 @@ def _ensure_agent_config(agent_home: Path, agent_name: str) -> AppConfig:
                 llm=config.llm,
                 embeddings=config.embeddings,
                 tools=config.tools,
+                task_runner=config.task_runner,
             )
             save_config(config_path, updated)
             return updated
@@ -153,6 +161,7 @@ def _ensure_agent_config(agent_home: Path, agent_name: str) -> AppConfig:
         llm=LLMSettings(provider="ollama", model="llama3", base_url="http://localhost:11434"),
         embeddings=EmbeddingSettings(provider="ollama", model="nomic-embed-text", base_url="http://localhost:11434"),
         tools=ToolSettings(),
+        task_runner=None,
     )
     save_config(config_path, config)
     return config
