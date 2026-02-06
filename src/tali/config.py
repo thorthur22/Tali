@@ -6,27 +6,64 @@ from typing import Literal
 
 @dataclass(frozen=True)
 class Paths:
-    base_dir: Path
+    root_dir: Path
+    agent_name: str
+
+    @property
+    def agent_home(self) -> Path:
+        return self.root_dir / self.agent_name
+
+    @property
+    def shared_home(self) -> Path:
+        return self.root_dir / "shared"
 
     @property
     def data_dir(self) -> Path:
-        return self.base_dir
+        return self.agent_home
 
     @property
     def tool_results_dir(self) -> Path:
-        return self.base_dir / "tool_results"
+        return self.agent_home / "tool_results"
 
     @property
     def db_path(self) -> Path:
-        return self.data_dir / "tali.db"
+        return self.agent_home / "db.sqlite"
 
     @property
     def vector_dir(self) -> Path:
-        return self.data_dir / "vectors"
+        return self.agent_home / "vectors"
 
     @property
     def config_path(self) -> Path:
-        return self.data_dir / "config.json"
+        return self.agent_home / "config.json"
+
+    @property
+    def logs_dir(self) -> Path:
+        return self.agent_home / "logs"
+
+    @property
+    def snapshots_dir(self) -> Path:
+        return self.agent_home / "snapshots"
+
+    @property
+    def sleep_dir(self) -> Path:
+        return self.agent_home / "sleep"
+
+    @property
+    def runs_dir(self) -> Path:
+        return self.agent_home / "runs"
+
+    @property
+    def patches_dir(self) -> Path:
+        return self.agent_home / "patches"
+
+    @property
+    def inbox_dir(self) -> Path:
+        return self.agent_home / "inbox"
+
+    @property
+    def outbox_dir(self) -> Path:
+        return self.agent_home / "outbox"
 
 
 @dataclass(frozen=True)
@@ -83,22 +120,30 @@ class ToolSettings:
 
 @dataclass(frozen=True)
 class AppConfig:
+    agent_id: str
+    agent_name: str
+    created_at: str
+    capabilities: list[str]
     llm: LLMSettings
     embeddings: EmbeddingSettings
     tools: ToolSettings
 
 
-def load_paths(base_dir: Path | None = None) -> Paths:
-    resolved = base_dir or (Path.home() / ".tali")
-    return Paths(base_dir=resolved)
+def load_paths(root_dir: Path, agent_name: str) -> Paths:
+    return Paths(root_dir=root_dir, agent_name=agent_name)
 
 
 def load_config(path: Path) -> AppConfig:
     payload = json.loads(path.read_text())
+    agent = payload.get("agent", {})
     llm = payload.get("llm", {})
     embeddings = payload.get("embeddings", {})
     tools = payload.get("tools", {})
     return AppConfig(
+        agent_id=agent.get("agent_id", ""),
+        agent_name=agent.get("agent_name", ""),
+        created_at=agent.get("created_at", ""),
+        capabilities=list(agent.get("capabilities", [])),
         llm=LLMSettings(
             provider=llm["provider"],
             model=llm["model"],
@@ -133,6 +178,12 @@ def load_config(path: Path) -> AppConfig:
 def save_config(path: Path, config: AppConfig) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
+        "agent": {
+            "agent_id": config.agent_id,
+            "agent_name": config.agent_name,
+            "created_at": config.created_at,
+            "capabilities": config.capabilities,
+        },
         "llm": {
             "provider": config.llm.provider,
             "model": config.llm.model,

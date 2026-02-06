@@ -121,6 +121,101 @@ CREATE INDEX IF NOT EXISTS idx_tool_calls_episode ON tool_calls (episode_id);
 CREATE INDEX IF NOT EXISTS idx_staged_status_nextcheck ON staged_items (status, next_check_at);
 CREATE INDEX IF NOT EXISTS idx_staged_kind ON staged_items (kind);
 
+CREATE TABLE IF NOT EXISTS runs (
+  id TEXT PRIMARY KEY,
+  created_at DATETIME NOT NULL,
+  status TEXT NOT NULL,
+  user_prompt TEXT NOT NULL,
+  current_task_id TEXT,
+  last_error TEXT
+);
+
+CREATE TABLE IF NOT EXISTS tasks (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  parent_task_id TEXT,
+  ordinal INTEGER NOT NULL,
+  title TEXT NOT NULL,
+  description TEXT,
+  status TEXT NOT NULL,
+  inputs_json TEXT,
+  outputs_json TEXT,
+  requires_tools INTEGER DEFAULT 0,
+  created_at DATETIME NOT NULL,
+  updated_at DATETIME NOT NULL,
+  FOREIGN KEY(run_id) REFERENCES runs(id)
+);
+
+CREATE TABLE IF NOT EXISTS task_events (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  timestamp DATETIME NOT NULL,
+  event_type TEXT NOT NULL,
+  payload TEXT,
+  FOREIGN KEY(task_id) REFERENCES tasks(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_run_status ON tasks (run_id, status);
+CREATE INDEX IF NOT EXISTS idx_tasks_run_ordinal ON tasks (run_id, ordinal);
+CREATE INDEX IF NOT EXISTS idx_task_events_task_time ON task_events (task_id, timestamp);
+
+CREATE TABLE IF NOT EXISTS user_questions (
+  id TEXT PRIMARY KEY,
+  question TEXT NOT NULL,
+  reason TEXT,
+  created_at DATETIME NOT NULL,
+  status TEXT NOT NULL,
+  priority INTEGER DEFAULT 3,
+  next_ask_at DATETIME,
+  attempts INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS patch_proposals (
+  id TEXT PRIMARY KEY,
+  created_at DATETIME NOT NULL,
+  title TEXT NOT NULL,
+  rationale TEXT,
+  files_json TEXT NOT NULL,
+  diff_text TEXT NOT NULL,
+  status TEXT NOT NULL,
+  test_results TEXT,
+  rollback_ref TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_questions_status_next ON user_questions (status, next_ask_at);
+CREATE INDEX IF NOT EXISTS idx_patch_status ON patch_proposals (status, created_at);
+
+CREATE TABLE IF NOT EXISTS agent_messages (
+  id TEXT PRIMARY KEY,
+  timestamp DATETIME NOT NULL,
+  direction TEXT NOT NULL,
+  from_agent_id TEXT,
+  from_agent_name TEXT,
+  to_agent_id TEXT,
+  to_agent_name TEXT,
+  topic TEXT NOT NULL,
+  correlation_id TEXT,
+  payload TEXT NOT NULL,
+  status TEXT NOT NULL,
+  provenance_type TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_messages_status ON agent_messages (status, timestamp);
+
+CREATE TABLE IF NOT EXISTS delegations (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  correlation_id TEXT NOT NULL,
+  to_agent_id TEXT,
+  to_agent_name TEXT,
+  status TEXT NOT NULL,
+  created_at DATETIME NOT NULL,
+  updated_at DATETIME NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_delegations_corr ON delegations (correlation_id);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS episodes_fts USING fts5(
   id,
   user_input,
@@ -455,6 +550,19 @@ class Database:
             )
             return cursor.rowcount
 
+    def prune_episodes(self, cutoff_timestamp: str, max_importance: float = 0.1) -> int:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM episodes
+                WHERE timestamp < ?
+                  AND quarantine = 0
+                  AND importance <= ?
+                """,
+                (cutoff_timestamp, max_importance),
+            )
+            return cursor.rowcount
+
     def insert_commitment(
         self,
         commitment_id: str,
@@ -689,3 +797,439 @@ class Database:
                 """,
                 (hypothesis_id, statement, origin_episode_id, confidence, status, created_at),
             )
+
+    def insert_run(
+        self,
+        run_id: str,
+        created_at: str,
+        status: str,
+        user_prompt: str,
+        current_task_id: str | None = None,
+        last_error: str | None = None,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO runs (id, created_at, status, user_prompt, current_task_id, last_error)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (run_id, created_at, status, user_prompt, current_task_id, last_error),
+            )
+
+    def update_run_status(
+        self,
+        run_id: str,
+        status: str,
+        current_task_id: str | None = None,
+        last_error: str | None = None,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE runs
+                SET status = ?, current_task_id = ?, last_error = ?
+                WHERE id = ?
+                """,
+                (status, current_task_id, last_error, run_id),
+            )
+
+    def fetch_run(self, run_id: str) -> sqlite3.Row | None:
+        with self.connect() as connection:
+            cursor = connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,))
+            return cursor.fetchone()
+
+    def fetch_active_run(self) -> sqlite3.Row | None:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                SELECT * FROM runs
+                WHERE status IN ('active', 'blocked')
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            )
+            return cursor.fetchone()
+
+    def insert_task(
+        self,
+        task_id: str,
+        run_id: str,
+        parent_task_id: str | None,
+        ordinal: int,
+        title: str,
+        description: str | None,
+        status: str,
+        inputs_json: str | None,
+        outputs_json: str | None,
+        requires_tools: int,
+        created_at: str,
+        updated_at: str,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO tasks (
+                    id, run_id, parent_task_id, ordinal, title, description, status,
+                    inputs_json, outputs_json, requires_tools, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    run_id,
+                    parent_task_id,
+                    ordinal,
+                    title,
+                    description,
+                    status,
+                    inputs_json,
+                    outputs_json,
+                    requires_tools,
+                    created_at,
+                    updated_at,
+                ),
+            )
+
+    def update_task_status(
+        self,
+        task_id: str,
+        status: str,
+        outputs_json: str | None,
+        updated_at: str,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE tasks
+                SET status = ?, outputs_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (status, outputs_json, updated_at, task_id),
+            )
+
+    def update_task_outputs(
+        self,
+        task_id: str,
+        outputs_json: str | None,
+        updated_at: str,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE tasks
+                SET outputs_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (outputs_json, updated_at, task_id),
+            )
+
+    def fetch_task(self, task_id: str) -> sqlite3.Row | None:
+        with self.connect() as connection:
+            cursor = connection.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
+            return cursor.fetchone()
+
+    def fetch_tasks_for_run(self, run_id: str) -> list[sqlite3.Row]:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                SELECT * FROM tasks
+                WHERE run_id = ?
+                ORDER BY ordinal ASC
+                """,
+                (run_id,),
+            )
+            return cursor.fetchall()
+
+    def insert_task_event(
+        self,
+        event_id: str,
+        task_id: str,
+        timestamp: str,
+        event_type: str,
+        payload: str | None,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO task_events (id, task_id, timestamp, event_type, payload)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (event_id, task_id, timestamp, event_type, payload),
+            )
+
+    def insert_user_question(
+        self,
+        question_id: str,
+        question: str,
+        reason: str | None,
+        created_at: str,
+        status: str,
+        priority: int,
+        next_ask_at: str | None,
+        attempts: int = 0,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO user_questions
+                (id, question, reason, created_at, status, priority, next_ask_at, attempts)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    question_id,
+                    question,
+                    reason,
+                    created_at,
+                    status,
+                    priority,
+                    next_ask_at,
+                    attempts,
+                ),
+            )
+
+    def fetch_next_user_question(self, now_timestamp: str) -> sqlite3.Row | None:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                SELECT * FROM user_questions
+                WHERE status = 'queued'
+                  AND (next_ask_at IS NULL OR next_ask_at <= ?)
+                ORDER BY priority DESC, created_at ASC
+                LIMIT 1
+                """,
+                (now_timestamp,),
+            )
+            return cursor.fetchone()
+
+    def fetch_last_asked_question(self) -> sqlite3.Row | None:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                SELECT * FROM user_questions
+                WHERE status = 'asked'
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            )
+            return cursor.fetchone()
+
+    def update_user_question_status(
+        self,
+        question_id: str,
+        status: str,
+        next_ask_at: str | None,
+        attempts: int,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE user_questions
+                SET status = ?, next_ask_at = ?, attempts = ?
+                WHERE id = ?
+                """,
+                (status, next_ask_at, attempts, question_id),
+            )
+
+    def count_user_questions_since(self, since_timestamp: str) -> int:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                SELECT COUNT(*) as count FROM user_questions
+                WHERE created_at >= ?
+                """,
+                (since_timestamp,),
+            )
+            row = cursor.fetchone()
+            return int(row["count"]) if row else 0
+
+    def insert_patch_proposal(
+        self,
+        proposal_id: str,
+        created_at: str,
+        title: str,
+        rationale: str | None,
+        files_json: str,
+        diff_text: str,
+        status: str,
+        test_results: str | None = None,
+        rollback_ref: str | None = None,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO patch_proposals
+                (id, created_at, title, rationale, files_json, diff_text, status, test_results, rollback_ref)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    proposal_id,
+                    created_at,
+                    title,
+                    rationale,
+                    files_json,
+                    diff_text,
+                    status,
+                    test_results,
+                    rollback_ref,
+                ),
+            )
+
+    def list_patch_proposals(self) -> list[sqlite3.Row]:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                SELECT * FROM patch_proposals
+                ORDER BY created_at DESC
+                """
+            )
+            return cursor.fetchall()
+
+    def fetch_patch_proposal(self, proposal_id: str) -> sqlite3.Row | None:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "SELECT * FROM patch_proposals WHERE id = ?",
+                (proposal_id,),
+            )
+            return cursor.fetchone()
+
+    def update_patch_proposal(
+        self,
+        proposal_id: str,
+        status: str,
+        test_results: str | None,
+        rollback_ref: str | None,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE patch_proposals
+                SET status = ?, test_results = ?, rollback_ref = ?
+                WHERE id = ?
+                """,
+                (status, test_results, rollback_ref, proposal_id),
+            )
+
+    def count_patch_proposals_since(self, since_timestamp: str) -> int:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                SELECT COUNT(*) as count FROM patch_proposals
+                WHERE created_at >= ?
+                """,
+                (since_timestamp,),
+            )
+            row = cursor.fetchone()
+            return int(row["count"]) if row else 0
+
+    def insert_agent_message(
+        self,
+        message_id: str,
+        timestamp: str,
+        direction: str,
+        from_agent_id: str | None,
+        from_agent_name: str | None,
+        to_agent_id: str | None,
+        to_agent_name: str | None,
+        topic: str,
+        correlation_id: str | None,
+        payload: str,
+        status: str,
+        provenance_type: str,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO agent_messages (
+                    id, timestamp, direction, from_agent_id, from_agent_name, to_agent_id, to_agent_name,
+                    topic, correlation_id, payload, status, provenance_type
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    message_id,
+                    timestamp,
+                    direction,
+                    from_agent_id,
+                    from_agent_name,
+                    to_agent_id,
+                    to_agent_name,
+                    topic,
+                    correlation_id,
+                    payload,
+                    status,
+                    provenance_type,
+                ),
+            )
+
+    def list_unread_agent_messages(self, limit: int = 20) -> list[sqlite3.Row]:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                SELECT * FROM agent_messages
+                WHERE status = 'unread'
+                ORDER BY timestamp DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            return cursor.fetchall()
+
+    def mark_agent_message(self, message_id: str, status: str) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE agent_messages SET status = ? WHERE id = ?",
+                (status, message_id),
+            )
+
+    def insert_delegation(
+        self,
+        delegation_id: str,
+        task_id: str,
+        run_id: str,
+        correlation_id: str,
+        to_agent_id: str | None,
+        to_agent_name: str | None,
+        status: str,
+        created_at: str,
+        updated_at: str,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO delegations (
+                    id, task_id, run_id, correlation_id, to_agent_id, to_agent_name,
+                    status, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    delegation_id,
+                    task_id,
+                    run_id,
+                    correlation_id,
+                    to_agent_id,
+                    to_agent_name,
+                    status,
+                    created_at,
+                    updated_at,
+                ),
+            )
+
+    def update_delegation_status(self, correlation_id: str, status: str, updated_at: str) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE delegations
+                SET status = ?, updated_at = ?
+                WHERE correlation_id = ?
+                """,
+                (status, updated_at, correlation_id),
+            )
+
+    def fetch_delegation(self, correlation_id: str) -> sqlite3.Row | None:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "SELECT * FROM delegations WHERE correlation_id = ?",
+                (correlation_id,),
+            )
+            return cursor.fetchone()

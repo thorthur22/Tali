@@ -61,12 +61,14 @@ class SleepScheduler:
         llm: Any,
         vector_index: "VectorIndex",
         sleep_interval_s: int = 60,
+        hook_manager: Any | None = None,
     ) -> None:
         self.data_dir = data_dir
         self.db = db
         self.llm = llm
         self.vector_index = vector_index
         self.sleep_interval_s = sleep_interval_s
+        self.hook_manager = hook_manager
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_activity = datetime.utcnow()
@@ -88,7 +90,13 @@ class SleepScheduler:
     def _loop(self) -> None:
         while not self._stop_event.is_set():
             if self._should_run():
-                run_auto_sleep(self.data_dir, self.db, self.llm, self.vector_index)
+                run_auto_sleep(
+                    self.data_dir,
+                    self.db,
+                    self.llm,
+                    self.vector_index,
+                    hook_manager=self.hook_manager,
+                )
             time.sleep(self.sleep_interval_s)
 
     def _should_run(self) -> bool:
@@ -106,7 +114,13 @@ class SleepScheduler:
         return False
 
 
-def run_auto_sleep(data_dir: Path, db: Database, llm: Any, vector_index: "VectorIndex") -> None:
+def run_auto_sleep(
+    data_dir: Path,
+    db: Database,
+    llm: Any,
+    vector_index: "VectorIndex",
+    hook_manager: Any | None = None,
+) -> None:
     from tali.sleep import load_sleep_output, run_sleep
 
     lock = SleepLock(data_dir)
@@ -137,6 +151,8 @@ def run_auto_sleep(data_dir: Path, db: Database, llm: Any, vector_index: "Vector
                 "contested_fact_ids": result.contested_fact_ids,
             }
         )
+        if hook_manager:
+            hook_manager.run("on_sleep_complete", audit)
     except Exception as exc:  # noqa: BLE001
         error = _format_sleep_error(exc)
         audit["error"] = error
