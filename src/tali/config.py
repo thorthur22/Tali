@@ -18,6 +18,10 @@ class Paths:
         return self.root_dir / "shared"
 
     @property
+    def models_dir(self) -> Path:
+        return self.root_dir / "models"
+
+    @property
     def data_dir(self) -> Path:
         return self.agent_home
 
@@ -132,6 +136,7 @@ class AppConfig:
     agent_id: str
     agent_name: str
     created_at: str
+    role_description: str
     capabilities: list[str]
     llm: LLMSettings | None
     embeddings: EmbeddingSettings | None
@@ -161,6 +166,7 @@ def load_config(path: Path) -> AppConfig:
         agent_id=agent.get("agent_id", ""),
         agent_name=agent.get("agent_name", ""),
         created_at=agent.get("created_at", ""),
+        role_description=str(agent.get("role_description", "")),
         capabilities=list(agent.get("capabilities", [])),
         llm=LLMSettings(
             provider=llm["provider"],
@@ -256,6 +262,7 @@ def save_config(path: Path, config: AppConfig) -> None:
             "agent_id": config.agent_id,
             "agent_name": config.agent_name,
             "created_at": config.created_at,
+            "role_description": config.role_description,
             "capabilities": config.capabilities,
         }
     }

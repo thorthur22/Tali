@@ -5,6 +5,7 @@ import platform
 import subprocess
 import re
 import shutil
+from urllib.parse import urlparse
 from datetime import datetime
 from uuid import uuid4
 from pathlib import Path
@@ -31,7 +32,7 @@ from tali.config import (
     save_config,
     save_shared_settings,
 )
-from tali.agent_identity import resolve_agent
+from tali.agent_identity import resolve_agent, validate_agent_name
 from tali.a2a import A2AClient, A2APoller, AgentProfile
 from tali.a2a_registry import AgentRecord, Registry
 from tali.consolidation import apply_sleep_output
@@ -55,12 +56,29 @@ from tali.patches import apply_patch, reverse_patch, run_patch_tests
 from tali.tools.registry import build_default_registry
 from tali.tools.policy import ToolPolicy
 from tali.tools.runner import ToolRunner
+from tali.model_catalog import list_models as list_catalog_models, download_model as download_catalog_model
 
 app = typer.Typer(help="Tali agent CLI")
 run_app = typer.Typer(help="Manage task runs")
 app.add_typer(run_app, name="run")
 patch_app = typer.Typer(help="Manage patch proposals")
 app.add_typer(patch_app, name="patches")
+
+
+def _bootstrap_first_agent(start_chat: bool = True) -> None:
+    root = Path.home() / ".tali"
+    if not _list_agent_dirs(root):
+        typer.echo("No agents found. Creating your first agent.")
+        create_agent()
+    if start_chat:
+        chat()
+
+
+@app.callback(invoke_without_command=True)
+def main(ctx: typer.Context) -> None:
+    if ctx.invoked_subcommand is not None:
+        return
+    _bootstrap_first_agent(start_chat=True)
 
 
 def _init_db(db_path: Path) -> Database:
@@ -75,12 +93,26 @@ def _resolve_paths() -> tuple[Paths, AppConfig | None]:
     return paths, config
 
 
+def _list_agent_dirs(root: Path) -> list[Path]:
+    if not root.exists():
+        return []
+    agent_dirs: list[Path] = []
+    for path in root.iterdir():
+        if not path.is_dir():
+            continue
+        if path.name == "shared":
+            continue
+        if (path / "config.json").exists():
+            agent_dirs.append(path)
+    return agent_dirs
+
+
 def _load_or_raise_config(paths: Paths, existing: AppConfig | None = None) -> AppConfig:
     if existing:
         config = existing
     else:
         if not paths.config_path.exists():
-            typer.echo("Config not found. Run `agent setup` to configure LLMs.")
+            typer.echo("Config not found. Run `tali create-agent` to configure this agent.")
             raise typer.Exit(code=1)
         config = load_config(paths.config_path)
     if not config.agent_name or not config.agent_id or config.agent_name != paths.agent_name:
@@ -88,6 +120,7 @@ def _load_or_raise_config(paths: Paths, existing: AppConfig | None = None) -> Ap
             agent_id=config.agent_id or str(uuid4()),
             agent_name=paths.agent_name,
             created_at=config.created_at or datetime.utcnow().isoformat(),
+            role_description=config.role_description or "",
             capabilities=config.capabilities or [],
             llm=config.llm,
             embeddings=config.embeddings,
@@ -103,6 +136,7 @@ def _load_or_raise_config(paths: Paths, existing: AppConfig | None = None) -> Ap
             agent_id=config.agent_id,
             agent_name=config.agent_name,
             created_at=config.created_at,
+            role_description=config.role_description,
             capabilities=config.capabilities,
             llm=config.llm or shared.llm,
             embeddings=config.embeddings or shared.embeddings,
@@ -110,15 +144,15 @@ def _load_or_raise_config(paths: Paths, existing: AppConfig | None = None) -> Ap
             task_runner=config.task_runner,
         )
     if not config.llm or not config.embeddings or not config.tools:
-        typer.echo("Shared config missing; run `tali setup` to configure shared settings.")
+        typer.echo("Missing LLM, embeddings, or tool settings. Run `tali create-agent`.")
         raise typer.Exit(code=1)
     return config
 
 
 def _build_llm_client(settings: LLMSettings):
     if settings.provider == "openai":
-        if not settings.api_key:
-            typer.echo("OpenAI API key is required.")
+        if not settings.api_key and not _is_local_base_url(settings.base_url):
+            typer.echo("OpenAI API key is required for non-local endpoints.")
             raise typer.Exit(code=1)
         return OpenAIClient(base_url=settings.base_url, api_key=settings.api_key, model=settings.model)
     if settings.provider == "ollama":
@@ -129,8 +163,8 @@ def _build_llm_client(settings: LLMSettings):
 
 def _build_embedder(settings: EmbeddingSettings):
     if settings.provider == "openai":
-        if not settings.api_key:
-            typer.echo("OpenAI API key is required for embeddings.")
+        if not settings.api_key and not _is_local_base_url(settings.base_url):
+            typer.echo("OpenAI API key is required for embeddings on non-local endpoints.")
             raise typer.Exit(code=1)
         return OpenAIEmbeddingClient(
             base_url=settings.base_url, api_key=settings.api_key, model=settings.model
@@ -146,6 +180,14 @@ def _ensure_dependencies() -> None:
         import hnswlib  # noqa: F401
     except ImportError:
         subprocess.run(["python", "-m", "pip", "install", "hnswlib"], check=True)
+
+
+def _is_local_base_url(base_url: str | None) -> bool:
+    if not base_url:
+        return False
+    parsed = urlparse(base_url)
+    host = parsed.hostname or ""
+    return host in {"localhost", "127.0.0.1", "::1"}
 
 
 def _list_ollama_models() -> list[str]:
@@ -217,6 +259,184 @@ def _pull_ollama_model(model: str) -> None:
         raise typer.Exit(code=code)
 
 
+def _prompt_unique_agent_name(root: Path) -> str:
+    agent_name = typer.prompt("Choose a name for this agent")
+    while True:
+        if not validate_agent_name(agent_name):
+            agent_name = typer.prompt(
+                "Name must be lowercase [a-z0-9-_], 2-32 chars. Try again"
+            )
+            continue
+        if (root / agent_name).exists():
+            agent_name = typer.prompt("That name exists. Choose another")
+            continue
+        return agent_name
+
+
+def _prompt_role_description() -> str:
+    roles = [
+        ("assistant", "General-purpose assistant."),
+        ("developer", "Software engineer focused on implementation and debugging."),
+        ("researcher", "Research-focused agent for synthesis and analysis."),
+        ("ops", "Operations-focused agent for reliability and tooling."),
+        ("custom", "Write a custom role description."),
+    ]
+    typer.echo("Role presets:")
+    for idx, (name, description) in enumerate(roles, start=1):
+        typer.echo(f"  {idx}. {name} - {description}")
+    choice = typer.prompt("Select a role (number or name)", default="1")
+    if choice.isdigit():
+        index = int(choice)
+        if 1 <= index <= len(roles):
+            name, description = roles[index - 1]
+            if name == "custom":
+                return typer.prompt("Role description")
+            return f"{name}: {description}"
+    normalized = choice.strip().lower()
+    for name, description in roles:
+        if normalized == name:
+            if name == "custom":
+                return typer.prompt("Role description")
+            return f"{name}: {description}"
+    return choice
+
+
+def _prompt_openai_local_model(models_dir: Path) -> str:
+    catalog = list_catalog_models()
+    if not catalog:
+        return typer.prompt("LLM model")
+    typer.echo("Curated local models (GGUF):")
+    for idx, entry in enumerate(catalog, start=1):
+        typer.echo(f"  {idx}. {entry.label} ({entry.repo_id})")
+    choice = typer.prompt("Select a model (number or 'custom')", default="1")
+    if choice.isdigit():
+        index = int(choice)
+        if 1 <= index <= len(catalog):
+            entry = catalog[index - 1]
+            models_dir.mkdir(parents=True, exist_ok=True)
+            typer.echo(f"Downloading {entry.label} to {models_dir} ...")
+            target_path = download_catalog_model(entry.repo_id, entry.pattern, models_dir)
+            typer.echo(f"Downloaded model file: {target_path}")
+            return target_path.name
+    if choice.strip().lower() in {"custom", "other"}:
+        return typer.prompt("LLM model")
+    return choice
+
+
+def _ensure_agent_dirs(paths: Paths) -> None:
+    paths.agent_home.mkdir(parents=True, exist_ok=True)
+    paths.vector_dir.mkdir(parents=True, exist_ok=True)
+    paths.logs_dir.mkdir(parents=True, exist_ok=True)
+    paths.snapshots_dir.mkdir(parents=True, exist_ok=True)
+    paths.sleep_dir.mkdir(parents=True, exist_ok=True)
+    paths.runs_dir.mkdir(parents=True, exist_ok=True)
+    paths.patches_dir.mkdir(parents=True, exist_ok=True)
+    paths.inbox_dir.mkdir(parents=True, exist_ok=True)
+    paths.outbox_dir.mkdir(parents=True, exist_ok=True)
+    paths.shared_home.mkdir(parents=True, exist_ok=True)
+    (paths.shared_home / "locks").mkdir(parents=True, exist_ok=True)
+    paths.models_dir.mkdir(parents=True, exist_ok=True)
+
+
+@app.command("create-agent")
+def create_agent() -> None:
+    """Create a new agent with role and LLM settings."""
+    root = Path.home() / ".tali"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "shared").mkdir(parents=True, exist_ok=True)
+    agent_name = _prompt_unique_agent_name(root)
+    role_description = _prompt_role_description()
+    paths = load_paths(root, agent_name)
+    provider = typer.prompt("LLM provider (openai/ollama)", default="openai")
+    if provider not in {"openai", "ollama"}:
+        typer.echo("Provider must be 'openai' or 'ollama'.")
+        raise typer.Exit(code=1)
+    if provider == "openai":
+        base_url = typer.prompt("LLM base URL", default="http://localhost:8000/v1")
+        if _is_local_base_url(base_url):
+            model = _prompt_openai_local_model(paths.models_dir)
+        else:
+            model = typer.prompt("LLM model", default="gpt-4o-mini")
+    else:
+        model = _prompt_ollama_model("LLM model", default="llama3")
+        base_url = typer.prompt("LLM base URL", default="http://localhost:11434")
+    api_key = None
+    if provider == "openai":
+        if _is_local_base_url(base_url):
+            api_key = typer.prompt(
+                "OpenAI API key (leave blank for local server)",
+                default="",
+                show_default=False,
+                hide_input=True,
+            )
+            if api_key == "":
+                api_key = None
+        else:
+            api_key = typer.prompt("OpenAI API key", hide_input=True)
+    else:
+        _prompt_ollama_download(model)
+
+    embed_provider = typer.prompt("Embedding provider (openai/ollama)", default=provider)
+    if embed_provider not in {"openai", "ollama"}:
+        typer.echo("Embedding provider must be 'openai' or 'ollama'.")
+        raise typer.Exit(code=1)
+    if embed_provider == "openai":
+        embed_base_url = typer.prompt(
+            "Embedding base URL",
+            default=base_url if embed_provider == provider else "http://localhost:8000/v1",
+        )
+        embed_default_model = (
+            "nomic-embed-text" if _is_local_base_url(embed_base_url) else "text-embedding-3-small"
+        )
+        embed_model = typer.prompt("Embedding model", default=embed_default_model)
+    else:
+        embed_model = _prompt_ollama_model("Embedding model", default="nomic-embed-text")
+        embed_base_url = typer.prompt(
+            "Embedding base URL",
+            default=base_url if embed_provider == provider else "http://localhost:11434",
+        )
+    embed_api_key = None
+    if embed_provider == "openai":
+        if _is_local_base_url(embed_base_url):
+            embed_api_key = typer.prompt(
+                "OpenAI API key for embeddings (leave blank for local server)",
+                default="",
+                show_default=False,
+                hide_input=True,
+            )
+            if embed_api_key == "":
+                embed_api_key = None
+        else:
+            embed_api_key = typer.prompt("OpenAI API key for embeddings", hide_input=True)
+    else:
+        _prompt_ollama_download(embed_model)
+    embed_dim = typer.prompt("Embedding dimension", default="1536")
+    typer.echo(
+        "File access is scoped by tools.fs_root (default: your user profile). "
+        "You can change it to narrow or expand the agent's file access for security."
+    )
+    config = AppConfig(
+        agent_id=str(uuid4()),
+        agent_name=agent_name,
+        created_at=datetime.utcnow().isoformat(),
+        role_description=role_description,
+        capabilities=[],
+        llm=LLMSettings(provider=provider, model=model, base_url=base_url, api_key=api_key),
+        embeddings=EmbeddingSettings(
+            provider=embed_provider,
+            model=embed_model,
+            base_url=embed_base_url,
+            api_key=embed_api_key,
+            dim=int(embed_dim),
+        ),
+        tools=ToolSettings(fs_root=str(Path.home())),
+        task_runner=None,
+    )
+    save_config(paths.config_path, config)
+    _ensure_agent_dirs(paths)
+    typer.echo(f"Agent created: {paths.agent_home}")
+
+
 @app.command()
 def chat(
     message: Optional[str] = typer.Argument(None, help="Message to send to the agent."),
@@ -284,6 +504,7 @@ def chat(
     agent_context = "\n".join(
         [
             f"Agent name: {config.agent_name}",
+            f"Role: {config.role_description or 'assistant'}",
             f"Agent home: {paths.agent_home}",
             f"Config path: {paths.config_path}",
             f"LLM model: {config.llm.model}",
@@ -872,8 +1093,8 @@ def delete_agent(agent_name: str = typer.Argument(..., help="Agent name to delet
     shutil.rmtree(agent_home)
     remaining = [p for p in root.iterdir() if p.is_dir() and p.name != "shared" and (p / "config.json").exists()]
     if not remaining:
-        typer.echo("No agents remain. Launching setup to create a new agent.")
-        setup()
+        typer.echo("No agents remain. Launching agent bootstrap.")
+        _bootstrap_first_agent(start_chat=True)
 
 
 @patch_app.command("list")
@@ -1171,20 +1392,30 @@ def setup() -> None:
     paths = load_paths(root, agent_name)
     typer.echo("Setting up Tali configuration.")
     _ensure_dependencies()
-    provider = typer.prompt("LLM provider (openai/ollama)", default="ollama")
+    provider = typer.prompt("LLM provider (openai/ollama)", default="openai")
     if provider not in {"openai", "ollama"}:
         typer.echo("Provider must be 'openai' or 'ollama'.")
         raise typer.Exit(code=1)
     if provider == "openai":
-        model = typer.prompt("LLM model", default="gpt-4o-mini")
+        base_url = typer.prompt("LLM base URL", default="http://localhost:8000/v1")
+        default_model = "llama3" if _is_local_base_url(base_url) else "gpt-4o-mini"
+        model = typer.prompt("LLM model", default=default_model)
     else:
         model = _prompt_ollama_model("LLM model", default="llama3")
-    base_url = typer.prompt(
-        "LLM base URL", default="https://api.openai.com/v1" if provider == "openai" else "http://localhost:11434"
-    )
+        base_url = typer.prompt("LLM base URL", default="http://localhost:11434")
     api_key = None
     if provider == "openai":
-        api_key = typer.prompt("OpenAI API key", hide_input=True)
+        if _is_local_base_url(base_url):
+            api_key = typer.prompt(
+                "OpenAI API key (leave blank for local server)",
+                default="",
+                show_default=False,
+                hide_input=True,
+            )
+            if api_key == "":
+                api_key = None
+        else:
+            api_key = typer.prompt("OpenAI API key", hide_input=True)
     else:
         _prompt_ollama_download(model)
 
@@ -1193,15 +1424,33 @@ def setup() -> None:
         typer.echo("Embedding provider must be 'openai' or 'ollama'.")
         raise typer.Exit(code=1)
     if embed_provider == "openai":
-        embed_model = typer.prompt("Embedding model", default="text-embedding-3-small")
+        embed_base_url = typer.prompt(
+            "Embedding base URL",
+            default=base_url if embed_provider == provider else "http://localhost:8000/v1",
+        )
+        embed_default_model = (
+            "nomic-embed-text" if _is_local_base_url(embed_base_url) else "text-embedding-3-small"
+        )
+        embed_model = typer.prompt("Embedding model", default=embed_default_model)
     else:
         embed_model = _prompt_ollama_model("Embedding model", default="nomic-embed-text")
-    embed_base_url = typer.prompt(
-        "Embedding base URL", default=base_url if embed_provider == provider else "http://localhost:11434"
-    )
+        embed_base_url = typer.prompt(
+            "Embedding base URL",
+            default=base_url if embed_provider == provider else "http://localhost:11434",
+        )
     embed_api_key = None
     if embed_provider == "openai":
-        embed_api_key = typer.prompt("OpenAI API key for embeddings", hide_input=True)
+        if _is_local_base_url(embed_base_url):
+            embed_api_key = typer.prompt(
+                "OpenAI API key for embeddings (leave blank for local server)",
+                default="",
+                show_default=False,
+                hide_input=True,
+            )
+            if embed_api_key == "":
+                embed_api_key = None
+        else:
+            embed_api_key = typer.prompt("OpenAI API key for embeddings", hide_input=True)
     else:
         _prompt_ollama_download(embed_model)
     embed_dim = typer.prompt("Embedding dimension", default="1536")
@@ -1217,6 +1466,7 @@ def setup() -> None:
         agent_id=agent_id,
         agent_name=agent_name,
         created_at=created_at,
+        role_description=existing_config.role_description if existing_config else "assistant",
         capabilities=capabilities,
         llm=None,
         embeddings=None,
