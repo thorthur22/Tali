@@ -60,7 +60,7 @@ from tali.idle import IdleScheduler
 from tali.knowledge_sources import KnowledgeSourceRegistry, LocalFileSource
 from tali.questions import mark_question_asked, resolve_answered_question, select_question_to_ask
 from tali.patches import apply_patch, reverse_patch, run_patch_tests
-from tali.worktrees import ensure_agent_worktree, resolve_main_repo_root
+from tali.worktrees import ensure_agent_worktree, resolve_main_repo_root, remove_agent_worktree
 from tali.tools.registry import build_default_registry
 from tali.tools.policy import ToolPolicy
 from tali.tools.runner import ToolRunner
@@ -718,7 +718,7 @@ def create_agent() -> None:
             else "http://localhost:8000/v1",
         )
         embed_default_model = (
-            "nomic-embed-text" if _is_local_base_url(embed_base_url) else "text-embedding-3-small"
+            "nomic-embed-text:latest" if _is_local_base_url(embed_base_url) else "text-embedding-3-small"
         )
         embed_model = typer.prompt("Embedding model", default=embed_default_model)
     else:
@@ -1684,6 +1684,12 @@ def delete_agent(agent_name: str = typer.Argument(..., help="Agent name to delet
     if not agent_home.exists():
         typer.echo("Agent not found.")
         raise typer.Exit(code=1)
+    repo_root = resolve_main_repo_root(Path(__file__).resolve())
+    if repo_root is not None:
+        paths = load_paths(root, agent_name)
+        status = remove_agent_worktree(paths, repo_root)
+        if status.message:
+            typer.echo(status.message)
     registry = Registry(root / "shared" / "registry.json")
     registry.remove(agent_name)
     typer.echo(f"Deleting agent data at {agent_home} ...")

@@ -648,6 +648,7 @@ class TaskRunner:
         repeated_tool_signatures: dict[str, int] = {}
         stuck_replans = 0
         action_replans = 0
+        invalid_tool_replans = 0
         stuck_context: str | None = None
         tool_records: list[ToolRecord] = []
         tool_results: list[ToolResult] = self._hydrate_task_state(task_row, working_memory)
@@ -721,6 +722,19 @@ class TaskRunner:
                     )
                     continue
             if action == "tool_call":
+                if plan.tool_name and self.tool_runner.registry.get(plan.tool_name) is None:
+                    if invalid_tool_replans < 2:
+                        invalid_tool_replans += 1
+                        stuck_context = (
+                            f"Unknown tool '{plan.tool_name}'. "
+                            "Choose a valid tool from Available tools."
+                        )
+                        self._log_task_event(
+                            task_id,
+                            "note",
+                            {"reason": "unknown_tool", "tool": plan.tool_name},
+                        )
+                        continue
                 if plan.tool_name == "fs.list" and plan.tool_args is None:
                     plan = ActionPlan(
                         next_action_type=plan.next_action_type,

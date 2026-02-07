@@ -88,6 +88,23 @@ def sync_agent_worktree(code_dir: Path, base_ref: str) -> WorktreeStatus:
     return WorktreeStatus(False, conflicted, message)
 
 
+def remove_agent_worktree(paths: Paths, main_repo: Path) -> WorktreeStatus:
+    code_dir = paths.code_dir
+    if not code_dir.exists():
+        return WorktreeStatus(True, False, None)
+    if not shutil.which("git"):
+        return WorktreeStatus(False, False, "Git is required to remove agent worktrees.")
+    result = subprocess.run(
+        ["git", "-C", str(main_repo), "worktree", "remove", "--force", str(code_dir)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        message = (result.stderr or result.stdout or "git worktree remove failed").strip()
+        return WorktreeStatus(False, False, message)
+    return WorktreeStatus(True, False, None)
+
+
 def _select_base_ref(repo: Path) -> str:
     if _ref_exists(repo, "refs/heads/main"):
         return "main"

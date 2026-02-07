@@ -174,6 +174,7 @@ def build_action_plan_prompt(
         "If stuck signals indicate repeated tool calls, pick a different strategy or tool before asking the user.",
         "Do NOT ask the user for info already answered in Clarifications.",
         "If you reference memory in message, cite it with [fact:ID], [commitment:ID], [preference:KEY], or [episode:ID].",
+        "Only use tool_name values that appear in Available tools; never invent tools.",
         "For fs.list, omit the path to list the root; never pass an empty string path.",
         "Avoid shell.run unless using allowed read-only commands (git status/diff/log, ls/dir, cat/type).",
         "To find the Desktop, use fs.list with {} to list the root and locate 'Desktop'. If no Desktop entry exists, ask the user for a path.",
