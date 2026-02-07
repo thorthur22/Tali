@@ -174,9 +174,9 @@ def build_action_plan_prompt(
         "If stuck signals indicate repeated tool calls, pick a different strategy or tool before asking the user.",
         "Do NOT ask the user for info already answered in Clarifications.",
         "If you reference memory in message, cite it with [fact:ID], [commitment:ID], [preference:KEY], or [episode:ID].",
-        "For fs.list, omit the path to list fs_root; never pass an empty string path.",
+        "For fs.list, omit the path to list the root; never pass an empty string path.",
         "Avoid shell.run unless using allowed read-only commands (git status/diff/log, ls/dir, cat/type).",
-        "To find the Desktop, prefer fs.list on fs_root and locate 'Desktop'. If no Desktop entry exists, ask the user for a path.",
+        "To find the Desktop, use fs.list with {} to list the root and locate 'Desktop'. If no Desktop entry exists, ask the user for a path.",
         "Use the OS info from agent context to avoid OS-specific assumptions.",
         "JSON schema:",
         "{",
@@ -283,6 +283,9 @@ def parse_action_plan(text: str) -> tuple[ActionPlan | None, str | None]:
         return None, "tool_name must be string"
     if tool_args is not None and not isinstance(tool_args, dict):
         return None, "tool_args must be object"
+    if tool_name == "fs_root":
+        tool_name = "fs.list"
+        tool_args = {}
     if tool_purpose is not None and not isinstance(tool_purpose, str):
         return None, "tool_purpose must be string"
     if outputs_json is not None and not isinstance(outputs_json, dict):
