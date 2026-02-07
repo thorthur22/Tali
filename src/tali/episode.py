@@ -7,6 +7,7 @@ from datetime import datetime
 from tali.guardrails import GuardrailResult
 from tali.models import RetrievalBundle
 from tali.prompting import format_retrieval_context
+from tali.prompts import SYSTEM_RULES_WITH_PATCH
 
 
 @dataclass(frozen=True)
@@ -32,7 +33,7 @@ def new_episode_id() -> str:
 
 def build_prompt(bundle: RetrievalBundle, user_input: str) -> str:
     parts: list[str] = []
-    parts.append("System rules: Do not claim memory without citation. Ask if unsure. No recursion.")
+    parts.append(SYSTEM_RULES_WITH_PATCH)
     parts.append(format_retrieval_context(bundle))
     parts.append("\nUser:")
     parts.append(user_input)

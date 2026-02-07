@@ -4,6 +4,8 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from tali.prompts import HOLISTIC_PROMPT_PATCH
+
 
 @dataclass(frozen=True)
 class TaskSpec:
@@ -47,6 +49,7 @@ def build_decomposition_prompt(
         [
             "You are an execution planner. Return STRICT JSON ONLY. No reasoning.",
             "You are planning for the Tali agent, which executes tools on your behalf.",
+            HOLISTIC_PROMPT_PATCH,
             "Do NOT claim you lack tool access; request tools when needed.",
             "Decompose the user request into specific, actionable, verifiable tasks.",
             "Prefer 3-12 tasks; if the request is tiny, allow 1-3 tasks.",
@@ -140,12 +143,20 @@ def build_action_plan_prompt(
     recent_tool_outputs: list[str],
     agent_context: str,
     memory_context: str,
+    working_memory_summary: str,
     run_summary: str | None,
     stuck_context: str | None,
     skill_context: str | None,
 ) -> str:
+    clarifications = ""
+    if run_summary:
+        for line in run_summary.splitlines():
+            if line.strip().lower().startswith("clarifications:"):
+                clarifications = line.split(":", 1)[1].strip()
+                break
     parts = [
         "You are the task action planner. Return STRICT JSON ONLY. No reasoning.",
+        HOLISTIC_PROMPT_PATCH,
         "You are planning for the Tali agent, which executes tools on your behalf.",
         "Do NOT claim you lack tool access; request tools when needed.",
         "Choose the single next action for this task.",
@@ -158,7 +169,10 @@ def build_action_plan_prompt(
         "When work requires files, shell, web, or python, choose tool_call.",
         "If storing outputs, provide outputs_json as an object.",
         "Use recent tool outputs to decide next steps; do NOT repeat a tool call if the output already provides the needed info.",
+        "Use last_observations + environment_facts to select the next action.",
+        "Do not request tools that are blocked as duplicates.",
         "If stuck signals indicate repeated tool calls, pick a different strategy or tool before asking the user.",
+        "Do NOT ask the user for info already answered in Clarifications.",
         "If you reference memory in message, cite it with [fact:ID], [commitment:ID], [preference:KEY], or [episode:ID].",
         "For fs.list, omit the path to list fs_root; never pass an empty string path.",
         "Avoid shell.run unless using allowed read-only commands (git status/diff/log, ls/dir, cat/type).",
@@ -192,14 +206,51 @@ def build_action_plan_prompt(
         tool_descriptions,
         "Memory context:",
         memory_context or "- None",
+        working_memory_summary or "- None",
         "Run summary:",
         run_summary or "- None",
+        "Clarifications:",
+        clarifications or "- None",
         "Stuck signals:",
         stuck_context or "- None",
         "Skill details:",
         skill_context or "- None",
         "Agent context:",
         agent_context,
+    ]
+    return "\n".join(parts)
+
+
+def build_response_prompt(
+    user_prompt: str,
+    memory_context: str,
+    working_memory_summary: str,
+    agent_context: str,
+    planner_message: str | None = None,
+    recent_tool_summaries: list[str] | None = None,
+    recent_tool_outputs: list[str] | None = None,
+    run_summary: str | None = None,
+) -> str:
+    parts = [
+        "You are the response model. Be concise, direct, and helpful.",
+        HOLISTIC_PROMPT_PATCH,
+        "Do not describe internal planning or tools unless asked.",
+        "If you reference memory, cite it with [fact:ID], [commitment:ID], [preference:KEY], or [episode:ID].",
+        "Memory context:",
+        memory_context or "- None",
+        working_memory_summary or "- None",
+        "Run summary:",
+        run_summary or "- None",
+        "Recent tool results:",
+        "\n".join(recent_tool_summaries or []) or "- None",
+        "Recent tool outputs:",
+        "\n".join(recent_tool_outputs or []) or "- None",
+        "Planner notes:",
+        planner_message or "- None",
+        "Agent context:",
+        agent_context,
+        "User request:",
+        user_prompt,
     ]
     return "\n".join(parts)
 
@@ -267,6 +318,7 @@ def build_completion_review_prompt(
     return "\n".join(
         [
             "You are the completion reviewer. Return STRICT JSON ONLY. No reasoning.",
+            HOLISTIC_PROMPT_PATCH,
             "Validate whether the tasks fully satisfy the user request.",
             "If you reference memory in user_message, cite it with [fact:ID], [commitment:ID], [preference:KEY], or [episode:ID].",
             "JSON schema:",

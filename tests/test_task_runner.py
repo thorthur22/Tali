@@ -11,6 +11,8 @@ from tali.guardrails import Guardrails
 from tali.llm import LLMResponse
 from tali.retrieval import Retriever
 from tali.task_runner import TaskRunner, TaskRunnerSettings
+from tali.tools.protocol import ToolResult
+from tali.working_memory import WorkingMemory, summarize_tool_result
 
 
 class FakeLLM:
@@ -29,8 +31,21 @@ class FakeLLM:
 
 
 class FakeToolRunner:
+    def __init__(self, results_by_call=None) -> None:
+        self.results_by_call = results_by_call or []
+        self.calls = 0
+        self.tool_calls = []
+
     def run(self, tool_calls, prompt_fn):
-        return [], []
+        self.tool_calls.extend(tool_calls)
+        if callable(self.results_by_call):
+            return self.results_by_call(tool_calls)
+        if self.calls < len(self.results_by_call):
+            results = self.results_by_call[self.calls]
+        else:
+            results = []
+        self.calls += 1
+        return results, []
 
 
 class TaskRunnerTests(unittest.TestCase):
@@ -273,6 +288,136 @@ class TaskRunnerTests(unittest.TestCase):
         skill = self.db.fetch_skill_by_name("TestSkill")
         self.assertIsNotNone(skill)
         self.assertEqual(skill["success_count"], 1)
+
+    def test_duplicate_tool_call_blocked(self) -> None:
+        decomposition = {
+            "tasks": [
+                {
+                    "title": "Inspect",
+                    "description": "List files.",
+                    "requires_tools": True,
+                    "verification": "Listed.",
+                    "dependencies": [],
+                }
+            ]
+        }
+        tool_call = {
+            "next_action_type": "tool_call",
+            "tool_name": "fs.list",
+            "tool_args": {"path": "C:\\X"},
+        }
+        action_done = {"next_action_type": "mark_done", "outputs_json": {"ok": True}}
+        review = {
+            "overall_status": "complete",
+            "checks": [{"task_ordinal": 0, "status": "ok", "note": ""}],
+            "missing_items": [],
+            "assumptions": [],
+            "user_message": "All set.",
+        }
+        llm = FakeLLM(
+            [
+                json.dumps(decomposition),
+                json.dumps(tool_call),
+                json.dumps(tool_call),
+                json.dumps(action_done),
+                json.dumps(review),
+            ]
+        )
+        result = ToolResult(
+            id="tc_1",
+            name="fs.list",
+            status="ok",
+            started_at="",
+            ended_at="",
+            result_ref="tool_call:tc_1",
+            result_summary="Listed C:\\X",
+            result_raw="Desktop\nfile.txt",
+        )
+        tool_runner = FakeToolRunner(results_by_call=[[result]])
+        runner = TaskRunner(
+            db=self.db,
+            llm=llm,
+            retriever=self.retriever,
+            guardrails=self.guardrails,
+            tool_runner=tool_runner,
+            tool_descriptions="none",
+        )
+        runner.run_turn("List files", prompt_fn=lambda _: "")
+        self.assertEqual(len(tool_runner.tool_calls), 1)
+
+    def test_stuck_progress_forces_replan(self) -> None:
+        decomposition = {
+            "tasks": [
+                {
+                    "title": "Inspect twice",
+                    "description": "Look around.",
+                    "requires_tools": True,
+                    "verification": "Done.",
+                    "dependencies": [],
+                }
+            ]
+        }
+        tool_call = {
+            "next_action_type": "tool_call",
+            "tool_name": "fs.list",
+            "tool_args": {"path": "C:\\X"},
+        }
+        action_done = {"next_action_type": "mark_done", "outputs_json": {"ok": True}}
+        review = {
+            "overall_status": "complete",
+            "checks": [{"task_ordinal": 0, "status": "ok", "note": ""}],
+            "missing_items": [],
+            "assumptions": [],
+            "user_message": "All set.",
+        }
+        llm = FakeLLM(
+            [
+                json.dumps(decomposition),
+                json.dumps(tool_call),
+                json.dumps(tool_call),
+                json.dumps(action_done),
+                json.dumps(review),
+            ]
+        )
+        result = ToolResult(
+            id="tc_1",
+            name="fs.list",
+            status="ok",
+            started_at="",
+            ended_at="",
+            result_ref="tool_call:tc_1",
+            result_summary="",
+            result_raw="",
+        )
+        tool_runner = FakeToolRunner(results_by_call=[[result], [result]])
+        runner = TaskRunner(
+            db=self.db,
+            llm=llm,
+            retriever=self.retriever,
+            guardrails=self.guardrails,
+            tool_runner=tool_runner,
+            tool_descriptions="none",
+        )
+        runner.run_turn("Inspect", prompt_fn=lambda _: "")
+        prompt_blob = "\n".join(llm.prompts)
+        self.assertIn("Stuck detected: no progress in 2 tool calls", prompt_blob)
+
+    def test_durable_facts_stored(self) -> None:
+        memory = WorkingMemory(user_goal="Test")
+        result = ToolResult(
+            id="tc_1",
+            name="fs.list",
+            status="ok",
+            started_at="",
+            ended_at="",
+            result_ref="tool_call:tc_1",
+            result_summary="Listed C:\\X\\Desktop",
+            result_raw="file.txt\nDesktop",
+        )
+        observations, durable = summarize_tool_result("fs.list", {"path": "C:\\X"}, result)
+        memory.note_observations(observations, durable)
+        self.assertIn("listed_paths", memory.environment_facts)
+        self.assertIn("C:\\X\\Desktop", memory.environment_facts["listed_paths"])
 
     def _last_run_id(self) -> str:
         with self.db.connect() as connection:

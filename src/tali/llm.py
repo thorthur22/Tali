@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Protocol
 
 import httpx
+
+
+@lru_cache(maxsize=1)
+def _shared_http_client() -> httpx.Client:
+    return httpx.Client()
 
 
 @dataclass(frozen=True)
@@ -32,10 +38,10 @@ class OpenAIClient:
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.2,
         }
-        with httpx.Client(timeout=self.timeout_s) as client:
-            response = client.post(url, headers=headers, json=payload)
-            response.raise_for_status()
-            data = response.json()
+        client = _shared_http_client()
+        response = client.post(url, headers=headers, json=payload, timeout=self.timeout_s)
+        response.raise_for_status()
+        data = response.json()
         content = data["choices"][0]["message"]["content"]
         return LLMResponse(content=content, model=self.model)
 
@@ -53,9 +59,9 @@ class OllamaClient:
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
         }
-        with httpx.Client(timeout=self.timeout_s) as client:
-            response = client.post(url, json=payload)
-            response.raise_for_status()
-            data = response.json()
+        client = _shared_http_client()
+        response = client.post(url, json=payload, timeout=self.timeout_s)
+        response.raise_for_status()
+        data = response.json()
         content = data["message"]["content"]
         return LLMResponse(content=content, model=self.model)

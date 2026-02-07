@@ -77,6 +77,8 @@ class RetrievalConfig:
     max_preferences: int = 2
     max_commitments: int = 50
     token_budget: int = 1500
+    vector_k: int = 12
+    vector_sync_min_interval_s: float = 30.0
 
 
 @dataclass(frozen=True)
@@ -138,7 +140,8 @@ class AppConfig:
     created_at: str
     role_description: str
     capabilities: list[str]
-    llm: LLMSettings | None
+    planner_llm: LLMSettings | None
+    responder_llm: LLMSettings | None
     embeddings: EmbeddingSettings | None
     tools: ToolSettings | None
     task_runner: TaskRunnerConfig | None
@@ -146,9 +149,11 @@ class AppConfig:
 
 @dataclass(frozen=True)
 class SharedSettings:
-    llm: LLMSettings
+    planner_llm: LLMSettings
+    responder_llm: LLMSettings
     embeddings: EmbeddingSettings
     tools: ToolSettings
+    task_runner: TaskRunnerConfig | None = None
 
 
 def load_paths(root_dir: Path, agent_name: str) -> Paths:
@@ -158,7 +163,8 @@ def load_paths(root_dir: Path, agent_name: str) -> Paths:
 def load_config(path: Path) -> AppConfig:
     payload = json.loads(path.read_text())
     agent = payload.get("agent", {})
-    llm = payload.get("llm", {})
+    planner_llm = payload.get("planner_llm", {})
+    responder_llm = payload.get("responder_llm", {})
     embeddings = payload.get("embeddings", {})
     tools = payload.get("tools", {})
     task_runner = payload.get("task_runner", {})
@@ -168,13 +174,21 @@ def load_config(path: Path) -> AppConfig:
         created_at=agent.get("created_at", ""),
         role_description=str(agent.get("role_description", "")),
         capabilities=list(agent.get("capabilities", [])),
-        llm=LLMSettings(
-            provider=llm["provider"],
-            model=llm["model"],
-            base_url=llm["base_url"],
-            api_key=llm.get("api_key"),
+        planner_llm=LLMSettings(
+            provider=planner_llm["provider"],
+            model=planner_llm["model"],
+            base_url=planner_llm["base_url"],
+            api_key=planner_llm.get("api_key"),
         )
-        if llm
+        if planner_llm
+        else None,
+        responder_llm=LLMSettings(
+            provider=responder_llm["provider"],
+            model=responder_llm["model"],
+            base_url=responder_llm["base_url"],
+            api_key=responder_llm.get("api_key"),
+        )
+        if responder_llm
         else None,
         embeddings=EmbeddingSettings(
             provider=embeddings["provider"],
@@ -220,15 +234,25 @@ def load_shared_settings(path: Path) -> SharedSettings | None:
     if not path.exists():
         return None
     payload = json.loads(path.read_text())
-    llm = payload.get("llm", {})
+    planner_llm = payload.get("planner_llm")
+    responder_llm = payload.get("responder_llm")
+    if not planner_llm or not responder_llm:
+        return None
     embeddings = payload.get("embeddings", {})
     tools = payload.get("tools", {})
+    task_runner = payload.get("task_runner", {})
     return SharedSettings(
-        llm=LLMSettings(
-            provider=llm["provider"],
-            model=llm["model"],
-            base_url=llm["base_url"],
-            api_key=llm.get("api_key"),
+        planner_llm=LLMSettings(
+            provider=planner_llm["provider"],
+            model=planner_llm["model"],
+            base_url=planner_llm["base_url"],
+            api_key=planner_llm.get("api_key"),
+        ),
+        responder_llm=LLMSettings(
+            provider=responder_llm["provider"],
+            model=responder_llm["model"],
+            base_url=responder_llm["base_url"],
+            api_key=responder_llm.get("api_key"),
         ),
         embeddings=EmbeddingSettings(
             provider=embeddings["provider"],
@@ -252,6 +276,17 @@ def load_shared_settings(path: Path) -> SharedSettings | None:
             max_calls_per_tool=int(tools.get("max_calls_per_tool", 2)),
             tool_result_max_bytes=int(tools.get("tool_result_max_bytes", 10000)),
         ),
+        task_runner=TaskRunnerConfig(
+            max_tasks_per_turn=int(task_runner.get("max_tasks_per_turn", 5)),
+            max_llm_calls_per_task=int(task_runner.get("max_llm_calls_per_task", 3)),
+            max_tool_calls_per_task=int(task_runner.get("max_tool_calls_per_task", 5)),
+            max_total_llm_calls_per_run_per_turn=int(
+                task_runner.get("max_total_llm_calls_per_run_per_turn", 10)
+            ),
+            max_total_steps_per_turn=int(task_runner.get("max_total_steps_per_turn", 30)),
+        )
+        if task_runner
+        else None,
     )
 
 
@@ -266,12 +301,19 @@ def save_config(path: Path, config: AppConfig) -> None:
             "capabilities": config.capabilities,
         }
     }
-    if config.llm:
-        payload["llm"] = {
-            "provider": config.llm.provider,
-            "model": config.llm.model,
-            "base_url": config.llm.base_url,
-            "api_key": config.llm.api_key,
+    if config.planner_llm:
+        payload["planner_llm"] = {
+            "provider": config.planner_llm.provider,
+            "model": config.planner_llm.model,
+            "base_url": config.planner_llm.base_url,
+            "api_key": config.planner_llm.api_key,
+        }
+    if config.responder_llm:
+        payload["responder_llm"] = {
+            "provider": config.responder_llm.provider,
+            "model": config.responder_llm.model,
+            "base_url": config.responder_llm.base_url,
+            "api_key": config.responder_llm.api_key,
         }
     if config.embeddings:
         payload["embeddings"] = {
@@ -311,11 +353,17 @@ def save_config(path: Path, config: AppConfig) -> None:
 def save_shared_settings(path: Path, settings: SharedSettings) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "llm": {
-            "provider": settings.llm.provider,
-            "model": settings.llm.model,
-            "base_url": settings.llm.base_url,
-            "api_key": settings.llm.api_key,
+        "planner_llm": {
+            "provider": settings.planner_llm.provider,
+            "model": settings.planner_llm.model,
+            "base_url": settings.planner_llm.base_url,
+            "api_key": settings.planner_llm.api_key,
+        },
+        "responder_llm": {
+            "provider": settings.responder_llm.provider,
+            "model": settings.responder_llm.model,
+            "base_url": settings.responder_llm.base_url,
+            "api_key": settings.responder_llm.api_key,
         },
         "embeddings": {
             "provider": settings.embeddings.provider,
@@ -339,5 +387,13 @@ def save_shared_settings(path: Path, settings: SharedSettings) -> None:
             "max_calls_per_tool": settings.tools.max_calls_per_tool,
             "tool_result_max_bytes": settings.tools.tool_result_max_bytes,
         },
+    }
+    task_runner = settings.task_runner or TaskRunnerConfig()
+    payload["task_runner"] = {
+        "max_tasks_per_turn": task_runner.max_tasks_per_turn,
+        "max_llm_calls_per_task": task_runner.max_llm_calls_per_task,
+        "max_tool_calls_per_task": task_runner.max_tool_calls_per_task,
+        "max_total_llm_calls_per_run_per_turn": task_runner.max_total_llm_calls_per_run_per_turn,
+        "max_total_steps_per_turn": task_runner.max_total_steps_per_turn,
     }
     path.write_text(json.dumps(payload, indent=2))

@@ -11,7 +11,8 @@ bash ./quickstart.sh
 ```
 
 The quickstart script creates a virtualenv, installs Tali, and tells you to run
-`tali` to bootstrap your first agent.
+`tali` to bootstrap your first agent and enter the Tali shell. Commands are
+entered without the `tali` prefix once you're inside the shell.
 
 ### Manual setup (optional)
 
@@ -23,8 +24,8 @@ pip install -e .
 # Bootstrap your first agent (includes guided setup)
 tali
 
-# Or create additional agents later
-tali create-agent
+# Or create additional agents later (inside the Tali shell)
+agent create
 ```
 
 The setup flow writes `~/.tali/<agent_name>/config.json` with the LLM and embedding provider settings.
@@ -63,14 +64,7 @@ and registry live under `~/.tali/shared/`.
 
 Sleep runs automatically in chat when thresholds are met (episode count, idle
 time, or periodic timer). It snapshots before applying safe updates, stages
-uncertain items, and resolves them opportunistically.
-
-You can still inspect status or apply a JSON file manually:
-
-```bash
-tali sleep
-tali sleep --apply data/sleep/<sleep_output.json>
-```
+uncertain items, and resolves them opportunistically without any CLI commands.
 
 ## Memory pipeline
 
@@ -89,9 +83,9 @@ When responses reference memory, the agent includes explicit citations like
 Create a snapshot, inspect differences, or rollback data:
 
 ```bash
-tali snapshot
-tali diff
-tali rollback
+snapshot
+diff
+rollback
 ```
 
 ## Idle self-improvement
@@ -131,12 +125,12 @@ Idle jobs may draft patch proposals, but they are never auto-applied. Proposals
 must be tested and explicitly applied or rejected.
 
 ```bash
-tali patches list
-tali patches show <id>
-tali patches test <id>
-tali patches apply <id>
-tali patches reject <id>
-tali patches rollback <id>
+patches list
+patches show <id>
+patches test <id>
+patches apply <id>
+patches reject <id>
+patches rollback <id>
 ```
 
 ## Logs and run browser
@@ -145,10 +139,10 @@ Structured logs are written under `~/.tali/<agent>/logs/` for each run.
 Quick commands:
 
 ```bash
-tali logs --limit 20
-tali dashboard --duration 30
-tali run list
-tali run timeline <run_id>
+logs --limit 20
+dashboard --duration 30
+run list
+run timeline <run_id>
 ```
 
 ## A2A (agent-to-agent)
@@ -156,11 +150,11 @@ tali run timeline <run_id>
 Agents coordinate using a shared local message bus and registry.
 
 ```bash
-tali name
-tali list
-tali send --to ops --topic task --json '{...}'
-tali inbox
-tali swarm "Coordinate a multi-step task"
+name
+list
+send --to ops --topic task --json '{...}'
+inbox
+swarm "Coordinate a multi-step task"
 ```
 
 All A2A messages are stored as message logs and tagged as `RECEIVED_AGENT`.

@@ -6,6 +6,7 @@ from typing import Any
 
 from tali.models import RetrievalBundle
 from tali.prompting import format_retrieval_context
+from tali.prompts import SYSTEM_RULES_WITH_PATCH
 
 
 @dataclass(frozen=True)
@@ -126,7 +127,7 @@ def format_tool_results(tool_results: list[ToolResult]) -> str:
 
 def build_phase1_prompt(bundle: RetrievalBundle, user_input: str, tool_descriptions: str) -> str:
     parts: list[str] = []
-    parts.append("System rules: Do not claim memory without citation. Ask if unsure. No recursion.")
+    parts.append(SYSTEM_RULES_WITH_PATCH)
     parts.append(format_retrieval_context(bundle))
     parts.append("\nUser:")
     parts.append(user_input)
@@ -139,7 +140,7 @@ def build_phase2_prompt(
     bundle: RetrievalBundle, user_input: str, tool_results: list[ToolResult], raw_tool_results: str
 ) -> str:
     parts: list[str] = []
-    parts.append("System rules: Do not claim memory without citation. Ask if unsure. No recursion.")
+    parts.append(SYSTEM_RULES_WITH_PATCH)
     parts.append("\n[Tool Results]")
     parts.append("Use tool results only if status=ok. Treat them as ground truth evidence.")
     parts.append("If a tool ran successfully, do NOT claim you lack tool access.")

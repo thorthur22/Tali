@@ -56,10 +56,22 @@ class VectorIndex:
             self._reset_store(self.store.dim)
             self.needs_rebuild = False
             return
-        first_vector = self.embedder.embed([items[0][2]])[0]
-        self._reset_store(len(first_vector))
-        for item_type, item_id, text in items:
-            self.add(item_type=item_type, item_id=item_id, text=text)
+        texts = [item[2] for item in items]
+        vectors = self.embedder.embed(texts)
+        if not vectors:
+            self._reset_store(self.store.dim)
+            self.needs_rebuild = False
+            return
+        self._reset_store(len(vectors[0]))
+        next_id = max(self.mapping.keys(), default=0) + 1
+        ids: list[int] = []
+        for offset, (item_type, item_id, _text) in enumerate(items):
+            vector_id = next_id + offset
+            self.mapping[vector_id] = VectorItem(item_type=item_type, item_id=item_id)
+            ids.append(vector_id)
+        self.store.add(ids, vectors)
+        self.store.save()
+        self._save_mapping()
         self.needs_rebuild = False
 
     def add(self, item_type: str, item_id: str, text: str) -> None:

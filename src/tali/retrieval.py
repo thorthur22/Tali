@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import time
 from typing import Iterable
 
 from tali.config import RetrievalConfig
@@ -35,6 +36,7 @@ class Retriever:
         self.db = db
         self.config = config or RetrievalConfig()
         self.vector_index = vector_index
+        self._last_vector_sync_at: float | None = None
 
     def retrieve(self, user_input: str) -> RetrievalContext:
         self._sync_vector_index()
@@ -96,9 +98,11 @@ class Retriever:
                 continue
             filtered_rows.append(row)
         rows = filtered_rows
+        vector_rank = {item_id: idx for idx, item_id in enumerate(vector_fact_ids)}
         ranked = sorted(
             rows,
             key=lambda row: (
+                vector_rank.get(row["id"], len(vector_rank) + 1),
                 -PROVENANCE_PRIORITY.get(row["provenance_type"], 0),
                 -row["confidence"],
                 -_timestamp_score(row["last_confirmed"] or row["created_at"]),
@@ -124,6 +128,14 @@ class Retriever:
             rows = self.db.search_episodes(user_input, self.config.max_episodes)
         if not rows:
             rows = self.db.fetch_recent_episodes(self.config.max_episodes)
+        vector_rank = {item_id: idx for idx, item_id in enumerate(vector_episode_ids)}
+        rows = sorted(
+            rows,
+            key=lambda row: (
+                vector_rank.get(row["id"], len(vector_rank) + 1),
+                -_timestamp_score(row["timestamp"]),
+            ),
+        )
         return [
             EpisodeSummary(
                 id=row["id"],
@@ -156,11 +168,18 @@ class Retriever:
     def _vector_hits(self, user_input: str) -> list[VectorItem]:
         if not self.vector_index:
             return []
-        return self.vector_index.search(user_input, k=5)
+        return self.vector_index.search(user_input, k=self.config.vector_k)
 
     def _sync_vector_index(self) -> None:
         if not self.vector_index:
             return
+        now = time.monotonic()
+        if (
+            self._last_vector_sync_at is not None
+            and now - self._last_vector_sync_at < self.config.vector_sync_min_interval_s
+        ):
+            return
+        self._last_vector_sync_at = now
         mapping_items = list(self.vector_index.mapping.values())
         if not mapping_items and not self.vector_index.needs_rebuild:
             return

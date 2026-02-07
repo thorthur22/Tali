@@ -4,6 +4,7 @@ import json
 import platform
 import subprocess
 import re
+import shlex
 import shutil
 import time
 from urllib.parse import urlparse
@@ -41,7 +42,6 @@ from tali.config import (
 from tali.agent_identity import resolve_agent, validate_agent_name
 from tali.a2a import A2AClient, A2APoller, AgentProfile
 from tali.a2a_registry import AgentRecord, Registry
-from tali.consolidation import apply_sleep_output
 from tali.db import Database
 from tali.episode import build_episode, build_prompt
 from tali.embeddings import OllamaEmbeddingClient, OpenAIEmbeddingClient
@@ -50,7 +50,6 @@ from tali.memory_ingest import stage_episode_fact
 from tali.llm import OllamaClient, OpenAIClient
 from tali.retrieval import Retriever
 from tali.self_care import SleepScheduler, resolve_staged_items
-from tali.sleep import load_sleep_output, run_sleep
 from tali.snapshots import create_snapshot, diff_snapshot, list_snapshots, rollback_snapshot
 from tali.vector_index import VectorIndex
 from tali.approvals import ApprovalManager
@@ -67,10 +66,12 @@ from tali.model_catalog import list_models as list_catalog_models, download_mode
 from tali.run_logs import append_run_log, read_recent_logs, latest_metrics_for_run
 
 app = typer.Typer(help="Tali agent CLI")
+agent_app = typer.Typer(help="Manage agents")
+app.add_typer(agent_app, name="agent")
 run_app = typer.Typer(help="Manage task runs")
-app.add_typer(run_app, name="run")
+agent_app.add_typer(run_app, name="run")
 patch_app = typer.Typer(help="Manage patch proposals")
-app.add_typer(patch_app, name="patches")
+agent_app.add_typer(patch_app, name="patches")
 
 
 def _bootstrap_first_agent(start_chat: bool = True) -> None:
@@ -82,11 +83,57 @@ def _bootstrap_first_agent(start_chat: bool = True) -> None:
         chat()
 
 
+def _management_shell() -> None:
+    console = Console()
+    root = Path.home() / ".tali"
+    agent_dirs = _list_agent_dirs(root)
+    console.print(
+        "[bold magenta]T A L I[/bold magenta]  "
+        "[dim]multi-agent manager[/dim]"
+    )
+    console.print("[dim]Type commands without the 'tali' prefix. (exit to quit)[/dim]")
+    console.print("")
+    console.print("[bold]Common commands[/bold]")
+    console.print("  agent list                 list agents")
+    console.print("  agent create               create a new agent")
+    console.print("  agent chat <name>          enter chat with an agent")
+    console.print("  agent delete <name>        delete an agent")
+    console.print("  agent run status           show active run status")
+    console.print("  agent patches list         list patch proposals")
+    console.print("  models list                list available models")
+    console.print("")
+    if agent_dirs:
+        console.print("[bold]Recommended next:[/bold] run `agent list` then `agent chat <name>`")
+    else:
+        console.print("[bold]Recommended next:[/bold] run `agent create` to get started")
+    console.print("")
+    while True:
+        try:
+            raw = console.input("[bold cyan]tali>[/bold cyan] ")
+        except (EOFError, KeyboardInterrupt):
+            break
+        line = raw.strip()
+        if not line:
+            continue
+        if line.lower() in {"exit", "quit"}:
+            break
+        args = shlex.split(line)
+        if args and args[0].lower() == "tali":
+            args = args[1:]
+        if not args:
+            continue
+        try:
+            app(prog_name="tali", args=args)
+        except SystemExit:
+            continue
+
+
 @app.callback(invoke_without_command=True)
 def main(ctx: typer.Context) -> None:
     if ctx.invoked_subcommand is not None:
         return
-    _bootstrap_first_agent(start_chat=True)
+    _bootstrap_first_agent(start_chat=False)
+    _management_shell()
 
 
 def _init_db(db_path: Path) -> Database:
@@ -120,7 +167,7 @@ def _load_or_raise_config(paths: Paths, existing: AppConfig | None = None) -> Ap
         config = existing
     else:
         if not paths.config_path.exists():
-            typer.echo("Config not found. Run `tali create-agent` to configure this agent.")
+            typer.echo("Config not found. Run `agent create` to configure this agent.")
             raise typer.Exit(code=1)
         config = load_config(paths.config_path)
     if not config.agent_name or not config.agent_id or config.agent_name != paths.agent_name:
@@ -130,7 +177,8 @@ def _load_or_raise_config(paths: Paths, existing: AppConfig | None = None) -> Ap
             created_at=config.created_at or datetime.utcnow().isoformat(),
             role_description=config.role_description or "",
             capabilities=config.capabilities or [],
-            llm=config.llm,
+            planner_llm=config.planner_llm,
+            responder_llm=config.responder_llm,
             embeddings=config.embeddings,
             tools=config.tools,
             task_runner=config.task_runner,
@@ -139,20 +187,33 @@ def _load_or_raise_config(paths: Paths, existing: AppConfig | None = None) -> Ap
         config = updated
     shared_path = paths.shared_home / "config.json"
     shared = load_shared_settings(shared_path)
+    planner_llm = config.planner_llm
+    responder_llm = config.responder_llm
+    embeddings = config.embeddings
+    tools = config.tools
+    task_runner = config.task_runner
     if shared:
-        config = AppConfig(
-            agent_id=config.agent_id,
-            agent_name=config.agent_name,
-            created_at=config.created_at,
-            role_description=config.role_description,
-            capabilities=config.capabilities,
-            llm=config.llm or shared.llm,
-            embeddings=config.embeddings or shared.embeddings,
-            tools=config.tools or shared.tools,
-            task_runner=config.task_runner,
+        planner_llm = planner_llm or shared.planner_llm
+        responder_llm = responder_llm or shared.responder_llm
+        embeddings = embeddings or shared.embeddings
+        tools = tools or shared.tools
+        task_runner = task_runner or shared.task_runner
+    config = AppConfig(
+        agent_id=config.agent_id,
+        agent_name=config.agent_name,
+        created_at=config.created_at,
+        role_description=config.role_description,
+        capabilities=config.capabilities,
+        planner_llm=planner_llm,
+        responder_llm=responder_llm,
+        embeddings=embeddings,
+        tools=tools,
+        task_runner=task_runner,
+    )
+    if not config.planner_llm or not config.responder_llm or not config.embeddings or not config.tools:
+        typer.echo(
+            "Missing planner/responder LLM, embeddings, or tool settings. Run `agent create`."
         )
-    if not config.llm or not config.embeddings or not config.tools:
-        typer.echo("Missing LLM, embeddings, or tool settings. Run `tali create-agent`.")
         raise typer.Exit(code=1)
     return config
 
@@ -260,6 +321,143 @@ def _prompt_ollama_download(model: str) -> None:
         _pull_ollama_model(model)
 
 
+def _format_agent_label(agent_name: str) -> str:
+    parts = [part for part in re.split(r"[^a-zA-Z0-9]+", agent_name) if part]
+    if not parts:
+        return "Agent"
+    formatted: list[str] = []
+    for part in parts:
+        if part.isdigit():
+            formatted.append(part)
+        else:
+            formatted.append(part[:1].upper() + part[1:].lower())
+    return "".join(formatted)
+
+
+def _prompt_llm_settings(
+    label: str,
+    default_provider: str,
+    default_base_url: str,
+    default_model: str,
+    models_dir: Path,
+) -> LLMSettings:
+    provider = typer.prompt(f"{label} provider (openai/ollama)", default=default_provider)
+    if provider not in {"openai", "ollama"}:
+        typer.echo("Provider must be 'openai' or 'ollama'.")
+        raise typer.Exit(code=1)
+    if provider == "openai":
+        base_url, auth_method = _prompt_openai_endpoint(label, default_base_url)
+        if auth_method == "local":
+            model = _prompt_openai_local_model(models_dir)
+            api_key = typer.prompt(
+                f"{label} OpenAI API key (leave blank for local server)",
+                default="",
+                show_default=False,
+                hide_input=True,
+            )
+            if api_key == "":
+                api_key = None
+        else:
+            model_default = "gpt-5-codex" if auth_method == "codex" else default_model
+            model = typer.prompt(f"{label} model", default=model_default)
+            if auth_method == "codex":
+                api_key = _ensure_codex_access_token(label, force_login=False)
+            else:
+                api_key = typer.prompt(f"{label} OpenAI API key", hide_input=True)
+        return LLMSettings(provider=provider, model=model, base_url=base_url, api_key=api_key)
+    model = _prompt_ollama_model(f"{label} model", default=default_model)
+    base_url = typer.prompt(f"{label} base URL", default="http://localhost:11434")
+    _prompt_ollama_download(model)
+    return LLMSettings(provider=provider, model=model, base_url=base_url, api_key=None)
+
+
+def _prompt_openai_endpoint(label: str, default_base_url: str) -> tuple[str, str]:
+    typer.echo("OpenAI connection options:")
+    typer.echo("  1. Local server (localhost) - use local OpenAI-compatible server.")
+    typer.echo("  2. OpenAI API key - standard API access with your key.")
+    typer.echo("  3. OpenAI Codex login - use ChatGPT web login token from `codex login`.")
+    choice = typer.prompt(f"{label} OpenAI setup (1/2/3)", default="2")
+    local_default = (
+        default_base_url if _is_local_base_url(default_base_url) else "http://localhost:8000/v1"
+    )
+    if choice.strip() == "1":
+        base_url = typer.prompt(f"{label} base URL", default=local_default)
+        return base_url, "local"
+    if choice.strip() == "2":
+        base_url = typer.prompt(
+            f"{label} base URL", default="https://api.openai.com/v1"
+        )
+        return base_url, "api_key"
+    if choice.strip() == "3":
+        base_url = typer.prompt(
+            f"{label} base URL", default="https://api.openai.com/v1"
+        )
+        return base_url, "codex"
+    typer.echo("Select 1, 2, or 3.")
+    raise typer.Exit(code=1)
+
+
+def _ensure_codex_access_token(label: str, force_login: bool = False) -> str:
+    token = _load_codex_access_token()
+    if token and not force_login:
+        return token
+    if token and force_login:
+        if not typer.confirm(
+            f"{label} already has a Codex token. Re-run ChatGPT login anyway?",
+            default=False,
+        ):
+            return token
+    if not shutil.which("codex"):
+        typer.echo(
+            f"{label} Codex auth not found and `codex` CLI is missing. Install Codex CLI and run `codex login`."
+        )
+        raise typer.Exit(code=1)
+    typer.echo(f"{label} Codex login starting (browser-based ChatGPT login).")
+    try:
+        subprocess.run(["codex", "login"], check=True)
+    except FileNotFoundError:
+        typer.echo(
+            "Could not find the `codex` CLI. Install it or ensure it's on PATH."
+        )
+        raise typer.Exit(code=1)
+    except subprocess.CalledProcessError as exc:
+        typer.echo(f"Codex login failed: {exc}")
+        raise typer.Exit(code=1) from exc
+    token = _load_codex_access_token()
+    if token:
+        return token
+    typer.echo("Codex login completed but access token was not found.")
+    raise typer.Exit(code=1)
+
+
+def _load_codex_access_token() -> str | None:
+    auth_path = Path.home() / ".codex" / "auth.json"
+    if not auth_path.exists():
+        return None
+    try:
+        payload = json.loads(auth_path.read_text())
+    except json.JSONDecodeError:
+        return None
+    return _find_access_token(payload)
+
+
+def _find_access_token(payload: object) -> str | None:
+    if isinstance(payload, dict):
+        token = payload.get("access_token")
+        if isinstance(token, str) and token.strip():
+            return token
+        for value in payload.values():
+            found = _find_access_token(value)
+            if found:
+                return found
+    elif isinstance(payload, list):
+        for item in payload:
+            found = _find_access_token(item)
+            if found:
+                return found
+    return None
+
+
 def _pull_ollama_model(model: str) -> None:
     typer.echo(f"Downloading Ollama model: {model}")
     try:
@@ -352,7 +550,6 @@ def _ensure_agent_dirs(paths: Paths) -> None:
     paths.snapshots_dir.mkdir(parents=True, exist_ok=True)
     paths.sleep_dir.mkdir(parents=True, exist_ok=True)
     paths.runs_dir.mkdir(parents=True, exist_ok=True)
-    paths.patches_dir.mkdir(parents=True, exist_ok=True)
     paths.inbox_dir.mkdir(parents=True, exist_ok=True)
     paths.outbox_dir.mkdir(parents=True, exist_ok=True)
     paths.shared_home.mkdir(parents=True, exist_ok=True)
@@ -360,7 +557,7 @@ def _ensure_agent_dirs(paths: Paths) -> None:
     paths.models_dir.mkdir(parents=True, exist_ok=True)
 
 
-@app.command("create-agent")
+@agent_app.command("create")
 def create_agent() -> None:
     """Create a new agent with role and LLM settings."""
     root = Path.home() / ".tali"
@@ -369,43 +566,74 @@ def create_agent() -> None:
     agent_name = _prompt_unique_agent_name(root)
     role_description = _prompt_role_description()
     paths = load_paths(root, agent_name)
-    provider = typer.prompt("LLM provider (openai/ollama)", default="openai")
-    if provider not in {"openai", "ollama"}:
+    planner_provider = typer.prompt("Planner LLM provider (openai/ollama)", default="openai")
+    if planner_provider not in {"openai", "ollama"}:
         typer.echo("Provider must be 'openai' or 'ollama'.")
         raise typer.Exit(code=1)
-    if provider == "openai":
-        base_url = typer.prompt("LLM base URL", default="http://localhost:8000/v1")
-        if _is_local_base_url(base_url):
-            model = _prompt_openai_local_model(paths.models_dir)
+    if planner_provider == "openai":
+        planner_base_url, planner_auth = _prompt_openai_endpoint(
+            "Planner", "http://localhost:8000/v1"
+        )
+        if planner_auth == "local":
+            planner_model = _prompt_openai_local_model(paths.models_dir)
         else:
-            model = typer.prompt("LLM model", default="gpt-4o-mini")
+            planner_default_model = (
+                "gpt-5-codex" if planner_auth == "codex" else "gpt-4o-mini"
+            )
+            planner_model = typer.prompt("Planner LLM model", default=planner_default_model)
     else:
-        model = _prompt_ollama_model("LLM model", default="llama3")
-        base_url = typer.prompt("LLM base URL", default="http://localhost:11434")
-    api_key = None
-    if provider == "openai":
-        if _is_local_base_url(base_url):
-            api_key = typer.prompt(
-                "OpenAI API key (leave blank for local server)",
+        planner_model = _prompt_ollama_model("Planner LLM model", default="llama3")
+        planner_base_url = typer.prompt(
+            "Planner LLM base URL", default="http://localhost:11434"
+        )
+    planner_api_key = None
+    if planner_provider == "openai":
+        if planner_auth == "local":
+            planner_api_key = typer.prompt(
+                "Planner OpenAI API key (leave blank for local server)",
                 default="",
                 show_default=False,
                 hide_input=True,
             )
-            if api_key == "":
-                api_key = None
+            if planner_api_key == "":
+                planner_api_key = None
         else:
-            api_key = typer.prompt("OpenAI API key", hide_input=True)
+            if planner_auth == "codex":
+                planner_api_key = _ensure_codex_access_token("Planner", force_login=False)
+            else:
+                planner_api_key = typer.prompt("Planner OpenAI API key", hide_input=True)
     else:
-        _prompt_ollama_download(model)
+        _prompt_ollama_download(planner_model)
 
-    embed_provider = typer.prompt("Embedding provider (openai/ollama)", default=provider)
+    planner_llm = LLMSettings(
+        provider=planner_provider,
+        model=planner_model,
+        base_url=planner_base_url,
+        api_key=planner_api_key,
+    )
+    if typer.confirm("Use the same LLM settings for the responder?", default=True):
+        responder_llm = planner_llm
+    else:
+        responder_llm = _prompt_llm_settings(
+            "Responder LLM",
+            default_provider=planner_provider,
+            default_base_url=planner_base_url,
+            default_model=planner_model,
+            models_dir=paths.models_dir,
+        )
+
+    embed_provider = typer.prompt(
+        "Embedding provider (openai/ollama)", default=planner_provider
+    )
     if embed_provider not in {"openai", "ollama"}:
         typer.echo("Embedding provider must be 'openai' or 'ollama'.")
         raise typer.Exit(code=1)
     if embed_provider == "openai":
         embed_base_url = typer.prompt(
             "Embedding base URL",
-            default=base_url if embed_provider == provider else "http://localhost:8000/v1",
+            default=planner_base_url
+            if embed_provider == planner_provider
+            else "http://localhost:8000/v1",
         )
         embed_default_model = (
             "nomic-embed-text" if _is_local_base_url(embed_base_url) else "text-embedding-3-small"
@@ -415,7 +643,9 @@ def create_agent() -> None:
         embed_model = _prompt_ollama_model("Embedding model", default="nomic-embed-text")
         embed_base_url = typer.prompt(
             "Embedding base URL",
-            default=base_url if embed_provider == provider else "http://localhost:11434",
+            default=planner_base_url
+            if embed_provider == planner_provider
+            else "http://localhost:11434",
         )
     embed_api_key = None
     if embed_provider == "openai":
@@ -443,7 +673,8 @@ def create_agent() -> None:
         created_at=datetime.utcnow().isoformat(),
         role_description=role_description,
         capabilities=[],
-        llm=LLMSettings(provider=provider, model=model, base_url=base_url, api_key=api_key),
+        planner_llm=planner_llm,
+        responder_llm=responder_llm,
         embeddings=EmbeddingSettings(
             provider=embed_provider,
             model=embed_model,
@@ -452,14 +683,14 @@ def create_agent() -> None:
             dim=int(embed_dim),
         ),
         tools=ToolSettings(fs_root=str(Path.home())),
-        task_runner=None,
+        task_runner=TaskRunnerConfig(),
     )
     save_config(paths.config_path, config)
     _ensure_agent_dirs(paths)
     typer.echo(f"Agent created: {paths.agent_home}")
 
 
-@app.command()
+@agent_app.command("chat")
 def chat(
     message: Optional[str] = typer.Argument(None, help="Message to send to the agent."),
     verbose_tools: bool = typer.Option(False, "--verbose-tools", help="Show full tool output."),
@@ -472,7 +703,17 @@ def chat(
     _ensure_dependencies()
     config = _load_or_raise_config(paths, existing_config)
     db = _init_db(paths.db_path)
-    llm = _build_llm_client(config.llm)
+    planner_settings = config.planner_llm
+    responder_settings = config.responder_llm
+    if not planner_settings or not responder_settings:
+        typer.echo("Missing planner/responder LLM settings. Run `agent create`.")
+        raise typer.Exit(code=1)
+    planner_llm = _build_llm_client(planner_settings)
+    responder_llm = (
+        planner_llm
+        if responder_settings == planner_settings
+        else _build_llm_client(responder_settings)
+    )
     embedder = _build_embedder(config.embeddings)
     vector_index = VectorIndex(paths.vector_dir / "memory.index", config.embeddings.dim, embedder)
     retriever = Retriever(db, RetrievalConfig(), vector_index=vector_index)
@@ -480,20 +721,23 @@ def chat(
     hooks_dir = Path(__file__).resolve().parent / "hooks"
     hook_manager = HookManager(db=db, hooks_dir=hooks_dir)
     hook_manager.load_hooks()
-    scheduler = SleepScheduler(paths.data_dir, db, llm, vector_index, hook_manager=hook_manager)
+    scheduler = SleepScheduler(
+        paths.data_dir, db, planner_llm, vector_index, hook_manager=hook_manager
+    )
     scheduler.start()
     sources = KnowledgeSourceRegistry()
     sources.register(LocalFileSource(paths.agent_home))
     idle_scheduler = IdleScheduler(
         paths.data_dir,
         db,
-        llm,
+        planner_llm,
         sources,
         hook_manager=hook_manager,
         status_fn=lambda msg: console.print(f"[dim]{escape(msg)}[/dim]"),
     )
     idle_scheduler.start()
     console = Console()
+    agent_label = _format_agent_label(config.agent_name)
     tool_settings = config.tools if isinstance(config.tools, ToolSettings) else ToolSettings()
     if tool_settings.approval_mode not in {"prompt", "auto_approve_safe", "deny"}:
         tool_settings = replace(tool_settings, approval_mode="prompt")
@@ -532,11 +776,13 @@ def chat(
             f"Role: {config.role_description or 'assistant'}",
             f"Agent home: {paths.agent_home}",
             f"Config path: {paths.config_path}",
-            f"LLM model: {config.llm.model}",
+            f"Background model: {planner_settings.model}",
+            f"Planner model: {planner_settings.model}",
+            f"Responder model: {responder_settings.model}",
             f"Tool fs_root: {tool_settings.fs_root}",
             f"OS: {platform.system()} {platform.release()}",
             "The agent is distinct from the LLM model.",
-            "You are the LLM planner; the Tali agent executes tool calls you request.",
+            f"You are the LLM planner; the {agent_label} agent executes tool calls you request.",
             "Use config.json (not config.txt).",
             "Do not use tools for greetings or small talk.",
         ]
@@ -559,7 +805,9 @@ def chat(
     )
     task_runner = TaskRunner(
         db=db,
-        llm=llm,
+        llm=planner_llm,
+        planner_llm=planner_llm,
+        responder_llm=responder_llm,
         retriever=retriever,
         guardrails=guardrails,
         tool_runner=runner,
@@ -688,6 +936,57 @@ def chat(
         ]
         return any(keyword in lowered for keyword in keywords)
 
+    def _is_short_confirmation(text: str) -> bool:
+        normalized = text.strip().lower()
+        return normalized in {
+            "yes",
+            "y",
+            "yep",
+            "yeah",
+            "sure",
+            "correct",
+            "no",
+            "n",
+            "nope",
+            "nah",
+            "negative",
+        }
+
+    def _is_related_to_text(user_input: str, topic: str) -> bool:
+        if not topic or not user_input.strip():
+            return False
+        prompt = "\n".join(
+            [
+                "Determine if the user message is related to the topic.",
+                "Return only YES or NO.",
+                f"Topic: {topic}",
+                f"User message: {user_input}",
+            ]
+        )
+        try:
+            response = responder_llm.generate(prompt).content.strip().lower()
+        except Exception:
+            return False
+        return response.startswith("y")
+
+    def _should_attempt_staged_resolution(user_input: str) -> bool:
+        row = db.fetch_next_staged_item(datetime.utcnow().isoformat())
+        if not row:
+            return False
+        try:
+            payload = json.loads(row["payload"])
+        except json.JSONDecodeError:
+            return False
+        if payload.get("awaiting_confirmation") or payload.get("awaiting_clarification"):
+            return True
+        if row["kind"] == "fact":
+            topic = str(payload.get("statement") or "").strip()
+        elif row["kind"] == "commitment":
+            topic = str(payload.get("description") or "").strip()
+        else:
+            return False
+        return _is_related_to_text(user_input, topic)
+
     def run_turn(user_input: str) -> None:
         scheduler.update_activity()
         idle_scheduler.update_activity()
@@ -696,11 +995,26 @@ def chat(
             console.print(f"[dim]{escape(msg)}[/dim]")
         pending_question_row = db.fetch_last_asked_question()
         has_pending_question = bool(pending_question_row and pending_question_row["status"] == "asked")
+        related_to_pending_question = True
+        if pending_question_row:
+            if _is_short_confirmation(user_input):
+                related_to_pending_question = True
+            else:
+                related_to_pending_question = _is_related_to_text(
+                    user_input, str(pending_question_row["question"])
+                )
         def _run_task_runner_turn() -> None:
-            with console.status(
-                "[bold yellow]Working... (planning tasks and tool calls)[/bold yellow]"
-            ):
-                result = task_runner.run_turn(user_input, prompt_fn=console.input, show_plans=show_plans)
+            if tool_settings.approval_mode == "prompt":
+                result = task_runner.run_turn(
+                    user_input, prompt_fn=console.input, show_plans=show_plans
+                )
+            else:
+                with console.status(
+                    "[bold yellow]Working... (planning tasks and tool calls)[/bold yellow]"
+                ):
+                    result = task_runner.run_turn(
+                        user_input, prompt_fn=console.input, show_plans=show_plans
+                    )
             tool_calls_log: list[dict[str, str]] = []
             for record in result.tool_records:
                 tool_calls_log.append(
@@ -754,7 +1068,7 @@ def chat(
             console.print(
                 f"[dim]Metrics: llm_calls={result.llm_calls} steps={result.steps} tool_calls={result.tool_calls}[/dim]"
             )
-            if has_pending_question:
+            if has_pending_question and related_to_pending_question:
                 answer_payload = resolve_answered_question(
                     db, user_input, dict(pending_question_row), source_ref=episode.id
                 )
@@ -790,12 +1104,12 @@ def chat(
                 text=f"{episode.user_input}\n{episode.agent_output}",
             )
             console.print(
-                f"[bold green]Tali[/bold green]: {escape(episode.agent_output)}"
+                f"[bold green]{agent_label}[/bold green]: {escape(episode.agent_output)}"
             )
             hook_messages = hook_manager.run("on_turn_end", {"episode_id": episode.id, "run_id": result.run_id})
             for msg in hook_messages:
                 console.print(f"[dim]{escape(msg)}[/dim]")
-        resolution = resolve_staged_items(db, user_input)
+        resolution = resolve_staged_items(db, user_input) if _should_attempt_staged_resolution(user_input) else None
         if resolution and resolution.applied_fact_id:
             facts = db.fetch_facts_by_ids([resolution.applied_fact_id])
             if facts:
@@ -825,7 +1139,7 @@ def chat(
                 text=f"{episode.user_input}\n{episode.agent_output}",
             )
             console.print(
-                f"[bold green]Tali[/bold green]: {escape(episode.agent_output)}"
+                f"[bold green]{agent_label}[/bold green]: {escape(episode.agent_output)}"
             )
             return
         active_run = db.fetch_active_run()
@@ -864,38 +1178,39 @@ def chat(
                 text=f"{episode.user_input}\n{episode.agent_output}",
             )
             console.print(
-                f"[bold green]Tali[/bold green]: {escape(episode.agent_output)}"
+                f"[bold green]{agent_label}[/bold green]: {escape(episode.agent_output)}"
             )
             return
         if not has_pending_question:
             decision = select_question_to_ask(db, user_input)
             if decision:
-                mark_question_asked(db, decision.question_id, decision.attempts)
-                episode = build_episode(
-                    user_input=user_input,
-                    guardrail=guardrails.enforce(decision.question, retriever.retrieve(user_input).bundle),
-                    tool_calls=[],
-                    outcome="clarification",
-                    quarantine=0,
-                )
-                db.insert_episode(
-                    episode_id=episode.id,
-                    user_input=episode.user_input,
-                    agent_output=episode.agent_output,
-                    tool_calls=episode.tool_calls,
-                    outcome=episode.outcome,
-                    quarantine=episode.quarantine,
-                )
-                stage_episode_fact(db, episode.id, episode.user_input, episode.outcome)
-                vector_index.add(
-                    item_type="episode",
-                    item_id=episode.id,
-                    text=f"{episode.user_input}\n{episode.agent_output}",
-                )
-                console.print(
-                    f"[bold green]Tali[/bold green]: {escape(episode.agent_output)}"
-                )
-                return
+                if _is_related_to_text(user_input, decision.question):
+                    mark_question_asked(db, decision.question_id, decision.attempts)
+                    episode = build_episode(
+                        user_input=user_input,
+                        guardrail=guardrails.enforce(decision.question, retriever.retrieve(user_input).bundle),
+                        tool_calls=[],
+                        outcome="clarification",
+                        quarantine=0,
+                    )
+                    db.insert_episode(
+                        episode_id=episode.id,
+                        user_input=episode.user_input,
+                        agent_output=episode.agent_output,
+                        tool_calls=episode.tool_calls,
+                        outcome=episode.outcome,
+                        quarantine=episode.quarantine,
+                    )
+                    stage_episode_fact(db, episode.id, episode.user_input, episode.outcome)
+                    vector_index.add(
+                        item_type="episode",
+                        item_id=episode.id,
+                        text=f"{episode.user_input}\n{episode.agent_output}",
+                    )
+                    console.print(
+                        f"[bold green]{agent_label}[/bold green]: {escape(episode.agent_output)}"
+                    )
+                    return
         _run_task_runner_turn()
 
     if message:
@@ -906,7 +1221,7 @@ def chat(
         registry.heartbeat(config.agent_id, status="inactive")
         return
 
-    console.print("[dim]Tali chat (type 'exit' to quit)[/dim]")
+    console.print(f"[dim]{agent_label} chat (type 'exit' to quit)[/dim]")
     while True:
         user_input = console.input("[bold cyan]You[/bold cyan]: ")
         if user_input.strip().lower() in {"exit", "quit"}:
@@ -1030,7 +1345,7 @@ def run_timeline(run_id: str = typer.Argument(..., help="Run ID to display timel
     typer.echo(json.dumps(payload, indent=2))
 
 
-@app.command("logs")
+@agent_app.command("logs")
 def logs(
     limit: int = typer.Option(10, "--limit", help="Max log entries to show."),
     run_id: Optional[str] = typer.Option(None, "--run-id", help="Filter by run ID."),
@@ -1098,7 +1413,7 @@ def _render_dashboard(db: Database, paths: Paths) -> Layout:
     return layout
 
 
-@app.command("dashboard")
+@agent_app.command("dashboard")
 def dashboard(
     refresh_s: float = typer.Option(1.5, "--refresh", help="Refresh interval (seconds)."),
     duration_s: int = typer.Option(30, "--duration", help="How long to run (seconds). 0 = once."),
@@ -1117,7 +1432,7 @@ def dashboard(
             time.sleep(refresh_s)
 
 
-@app.command("name")
+@agent_app.command("name")
 def agent_name() -> None:
     """Show current agent identity."""
     paths, existing = _resolve_paths()
@@ -1130,15 +1445,21 @@ def agent_name() -> None:
     )
 
 
-@app.command("list")
+@agent_app.command("list")
 def agent_list() -> None:
     """List known local agents."""
-    paths, _ = _resolve_paths()
-    registry = Registry(paths.shared_home / "registry.json")
-    typer.echo(json.dumps(registry.list_agents(), indent=2))
+    root = Path.home() / ".tali"
+    registry = Registry(root / "shared" / "registry.json")
+    agents = registry.list_agents()
+    if not agents:
+        agents = [
+            {"agent_name": path.name, "home": str(path)}
+            for path in _list_agent_dirs(root)
+        ]
+    typer.echo(json.dumps(agents, indent=2))
 
 
-@app.command("send")
+@agent_app.command("send")
 def agent_send(
     to: Optional[str] = typer.Option(None, "--to", help="Agent name to send to (broadcast if omitted)."),
     topic: str = typer.Option("task", "--topic", help="Message topic."),
@@ -1183,7 +1504,7 @@ def agent_send(
     typer.echo("Message sent.")
 
 
-@app.command("inbox")
+@agent_app.command("inbox")
 def agent_inbox() -> None:
     """Show unread A2A messages."""
     paths, _ = _resolve_paths()
@@ -1192,14 +1513,24 @@ def agent_inbox() -> None:
     typer.echo(json.dumps([dict(row) for row in rows], indent=2))
 
 
-@app.command("swarm")
+@agent_app.command("swarm")
 def swarm(prompt: str = typer.Argument(..., help="Swarm task prompt.")) -> None:
     """Run a swarm-enabled task turn."""
     paths, existing = _resolve_paths()
     _ensure_dependencies()
     config = _load_or_raise_config(paths, existing)
     db = _init_db(paths.db_path)
-    llm = _build_llm_client(config.llm)
+    planner_settings = config.planner_llm
+    responder_settings = config.responder_llm
+    if not planner_settings or not responder_settings:
+        typer.echo("Missing planner/responder LLM settings. Run `agent create`.")
+        raise typer.Exit(code=1)
+    planner_llm = _build_llm_client(planner_settings)
+    responder_llm = (
+        planner_llm
+        if responder_settings == planner_settings
+        else _build_llm_client(responder_settings)
+    )
     embedder = _build_embedder(config.embeddings)
     vector_index = VectorIndex(paths.vector_dir / "memory.index", config.embeddings.dim, embedder)
     retriever = Retriever(db, RetrievalConfig(), vector_index=vector_index)
@@ -1238,7 +1569,9 @@ def swarm(prompt: str = typer.Argument(..., help="Swarm task prompt.")) -> None:
     )
     task_runner = TaskRunner(
         db=db,
-        llm=llm,
+        llm=planner_llm,
+        planner_llm=planner_llm,
+        responder_llm=responder_llm,
         retriever=retriever,
         guardrails=guardrails,
         tool_runner=runner,
@@ -1250,7 +1583,7 @@ def swarm(prompt: str = typer.Argument(..., help="Swarm task prompt.")) -> None:
     typer.echo(result.message)
 
 
-@app.command("delete-agent")
+@agent_app.command("delete")
 def delete_agent(agent_name: str = typer.Argument(..., help="Agent name to delete.")) -> None:
     """Delete an agent by name."""
     root = Path.home() / ".tali"
@@ -1265,7 +1598,7 @@ def delete_agent(agent_name: str = typer.Argument(..., help="Agent name to delet
     remaining = [p for p in root.iterdir() if p.is_dir() and p.name != "shared" and (p / "config.json").exists()]
     if not remaining:
         typer.echo("No agents remain. Launching agent bootstrap.")
-        _bootstrap_first_agent(start_chat=True)
+        _bootstrap_first_agent(start_chat=False)
 
 
 @patch_app.command("list")
@@ -1409,67 +1742,7 @@ def patches_rollback(proposal_id: str = typer.Argument(..., help="Patch proposal
     typer.echo("Patch rolled back.")
 
 
-@app.command()
-def sleep(
-    output_dir: Optional[Path] = typer.Option(None, help="Directory to write sleep output."),
-    apply: Optional[Path] = typer.Option(
-        None, "--apply", help="Apply a sleep JSON output file and insert vetted facts."
-    ),
-) -> None:
-    """Run sleep consolidation (offline) or apply a sleep output file."""
-    paths, _ = _resolve_paths()
-    _ensure_dependencies()
-    config = _load_or_raise_config(paths)
-    db = _init_db(paths.db_path)
-    llm = _build_llm_client(config.llm)
-    embedder = _build_embedder(config.embeddings)
-    vector_index = VectorIndex(paths.vector_dir / "memory.index", config.embeddings.dim, embedder)
-    if apply:
-        snapshot = create_snapshot(paths.data_dir)
-        try:
-            payload = load_sleep_output(apply)
-            result = apply_sleep_output(db, payload)
-            for fact_id in result.inserted_fact_ids:
-                facts = db.fetch_facts_by_ids([fact_id])
-                if facts:
-                    vector_index.add(item_type="fact", item_id=fact_id, text=facts[0]["statement"])
-            typer.echo(
-                json.dumps(
-                    {
-                        "inserted_fact_ids": result.inserted_fact_ids,
-                        "skipped_candidates": result.skipped_candidates,
-                        "contested_fact_ids": result.contested_fact_ids,
-                        "staged_item_ids": result.staged_item_ids,
-                        "snapshot_id": snapshot.id,
-                    },
-                    indent=2,
-                )
-            )
-        except Exception:
-            rollback_snapshot(paths.data_dir, snapshot)
-            raise
-        return
-    if output_dir:
-        target_dir = output_dir
-        output_path = run_sleep(db, target_dir, llm=llm)
-        typer.echo(f"Sleep output written to {output_path}")
-        return
-    last_run = db.last_sleep_run()
-    last_time = last_run["timestamp"] if last_run else "never"
-    episodes_since = db.count_episodes_since_last_sleep()
-    typer.echo(
-        json.dumps(
-            {
-                "last_sleep": last_time,
-                "episodes_since_last_sleep": episodes_since,
-                "message": "Sleep runs automatically in chat.",
-            },
-            indent=2,
-        )
-    )
-
-
-@app.command()
+@agent_app.command("commitments")
 def commitments() -> None:
     """List commitments."""
     paths, _ = _resolve_paths()
@@ -1478,7 +1751,7 @@ def commitments() -> None:
     typer.echo(json.dumps([dict(row) for row in rows], indent=2))
 
 
-@app.command()
+@agent_app.command("facts")
 def facts() -> None:
     """List facts."""
     paths, _ = _resolve_paths()
@@ -1487,7 +1760,7 @@ def facts() -> None:
     typer.echo(json.dumps([dict(row) for row in rows], indent=2))
 
 
-@app.command()
+@agent_app.command("skills")
 def skills() -> None:
     """List skills."""
     paths, _ = _resolve_paths()
@@ -1496,32 +1769,32 @@ def skills() -> None:
     typer.echo(json.dumps([dict(row) for row in rows], indent=2))
 
 
-@app.command()
+@agent_app.command("diff")
 def diff() -> None:
     """Show differences between the latest snapshot and current data."""
     paths, _ = _resolve_paths()
     snapshots = list_snapshots(paths.data_dir)
     if not snapshots:
-        typer.echo("No snapshots found. Run `tali snapshot` first.")
+        typer.echo("No snapshots found. Run `snapshot` first.")
         raise typer.Exit(code=1)
     latest = snapshots[-1]
     typer.echo(diff_snapshot(paths.data_dir, latest))
 
 
-@app.command()
+@agent_app.command("rollback")
 def rollback() -> None:
     """Rollback data directory to the latest snapshot."""
     paths, _ = _resolve_paths()
     snapshots = list_snapshots(paths.data_dir)
     if not snapshots:
-        typer.echo("No snapshots found. Run `tali snapshot` first.")
+        typer.echo("No snapshots found. Run `snapshot` first.")
         raise typer.Exit(code=1)
     latest = snapshots[-1]
     rollback_snapshot(paths.data_dir, latest)
     typer.echo(f"Rolled back data to snapshot {latest.id}.")
 
 
-@app.command()
+@agent_app.command("snapshot")
 def snapshot() -> None:
     """Create a snapshot of the data directory."""
     paths, _ = _resolve_paths()
@@ -1529,7 +1802,7 @@ def snapshot() -> None:
     typer.echo(f"Snapshot created: {snapshot.id}")
 
 
-@app.command()
+@agent_app.command("doctor")
 def doctor() -> None:
     """Validate core invariants and report staged items."""
     paths, _ = _resolve_paths()
@@ -1578,55 +1851,86 @@ def doctor() -> None:
         raise typer.Exit(code=1)
 
 
-@app.command()
+@app.command("setup")
 def setup() -> None:
     """Walk through configuration and install dependencies."""
     root, agent_name, existing_config = resolve_agent(prompt_fn=typer.prompt, allow_create_config=True)
     paths = load_paths(root, agent_name)
     typer.echo("Setting up Tali configuration.")
     _ensure_dependencies()
-    provider = typer.prompt("LLM provider (openai/ollama)", default="openai")
-    if provider not in {"openai", "ollama"}:
+    planner_provider = typer.prompt("Planner LLM provider (openai/ollama)", default="openai")
+    if planner_provider not in {"openai", "ollama"}:
         typer.echo("Provider must be 'openai' or 'ollama'.")
         raise typer.Exit(code=1)
-    if provider == "openai":
-        base_url = typer.prompt("LLM base URL", default="http://localhost:8000/v1")
+    if planner_provider == "openai":
         catalog_models = list_catalog_models()
         if catalog_models:
             typer.echo("Catalog models:")
             for name in catalog_models[:10]:
                 typer.echo(f"  - {name}")
-        default_model = "llama3" if _is_local_base_url(base_url) else "gpt-4o-mini"
-        model = typer.prompt("LLM model", default=default_model)
+        planner_base_url, planner_auth = _prompt_openai_endpoint(
+            "Planner", "http://localhost:8000/v1"
+        )
+        if planner_auth == "local":
+            default_model = "llama3"
+        else:
+            default_model = "gpt-5-codex" if planner_auth == "codex" else "gpt-4o-mini"
+        planner_model = typer.prompt("Planner LLM model", default=default_model)
     else:
-        model = _prompt_ollama_model("LLM model", default="llama3")
-        base_url = typer.prompt("LLM base URL", default="http://localhost:11434")
-    api_key = None
-    if provider == "openai":
-        if _is_local_base_url(base_url):
-            api_key = typer.prompt(
-                "OpenAI API key (leave blank for local server)",
+        planner_model = _prompt_ollama_model("Planner LLM model", default="llama3")
+        planner_base_url = typer.prompt(
+            "Planner LLM base URL", default="http://localhost:11434"
+        )
+    planner_api_key = None
+    if planner_provider == "openai":
+        if planner_auth == "local":
+            planner_api_key = typer.prompt(
+                "Planner OpenAI API key (leave blank for local server)",
                 default="",
                 show_default=False,
                 hide_input=True,
             )
-            if api_key == "":
-                api_key = None
+            if planner_api_key == "":
+                planner_api_key = None
         else:
-            api_key = typer.prompt("OpenAI API key", hide_input=True)
+            if planner_auth == "codex":
+                planner_api_key = _ensure_codex_access_token("Planner", force_login=False)
+            else:
+                planner_api_key = typer.prompt("Planner OpenAI API key", hide_input=True)
     else:
-        _prompt_ollama_download(model)
-    if not _validate_provider_connectivity(provider, base_url, api_key):
+        _prompt_ollama_download(planner_model)
+    if not _validate_provider_connectivity(planner_provider, planner_base_url, planner_api_key):
         typer.echo("Warning: could not validate LLM connectivity. Check base URL or API key.")
 
-    embed_provider = typer.prompt("Embedding provider (openai/ollama)", default=provider)
+    planner_llm = LLMSettings(
+        provider=planner_provider,
+        model=planner_model,
+        base_url=planner_base_url,
+        api_key=planner_api_key,
+    )
+    if typer.confirm("Use the same LLM settings for the responder?", default=True):
+        responder_llm = planner_llm
+    else:
+        responder_llm = _prompt_llm_settings(
+            "Responder LLM",
+            default_provider=planner_provider,
+            default_base_url=planner_base_url,
+            default_model=planner_model,
+            models_dir=paths.models_dir,
+        )
+
+    embed_provider = typer.prompt(
+        "Embedding provider (openai/ollama)", default=planner_provider
+    )
     if embed_provider not in {"openai", "ollama"}:
         typer.echo("Embedding provider must be 'openai' or 'ollama'.")
         raise typer.Exit(code=1)
     if embed_provider == "openai":
         embed_base_url = typer.prompt(
             "Embedding base URL",
-            default=base_url if embed_provider == provider else "http://localhost:8000/v1",
+            default=planner_base_url
+            if embed_provider == planner_provider
+            else "http://localhost:8000/v1",
         )
         embed_default_model = (
             "nomic-embed-text" if _is_local_base_url(embed_base_url) else "text-embedding-3-small"
@@ -1639,7 +1943,9 @@ def setup() -> None:
         embed_model = _prompt_ollama_model("Embedding model", default="nomic-embed-text")
         embed_base_url = typer.prompt(
             "Embedding base URL",
-            default=base_url if embed_provider == provider else "http://localhost:11434",
+            default=planner_base_url
+            if embed_provider == planner_provider
+            else "http://localhost:11434",
         )
     embed_api_key = None
     if embed_provider == "openai":
@@ -1673,14 +1979,16 @@ def setup() -> None:
         created_at=created_at,
         role_description=existing_config.role_description if existing_config else "assistant",
         capabilities=capabilities,
-        llm=None,
+        planner_llm=None,
+        responder_llm=None,
         embeddings=None,
         tools=None,
-        task_runner=None,
+        task_runner=TaskRunnerConfig(),
     )
     save_config(paths.config_path, config)
     shared_settings = SharedSettings(
-        llm=LLMSettings(provider=provider, model=model, base_url=base_url, api_key=api_key),
+        planner_llm=planner_llm,
+        responder_llm=responder_llm,
         embeddings=EmbeddingSettings(
             provider=embed_provider,
             model=embed_model,
@@ -1689,6 +1997,7 @@ def setup() -> None:
             dim=int(embed_dim),
         ),
         tools=ToolSettings(fs_root=str(Path.home())),
+        task_runner=TaskRunnerConfig(),
     )
     save_shared_settings(paths.shared_home / "config.json", shared_settings)
     paths.vector_dir.mkdir(parents=True, exist_ok=True)
@@ -1696,7 +2005,6 @@ def setup() -> None:
     paths.snapshots_dir.mkdir(parents=True, exist_ok=True)
     paths.sleep_dir.mkdir(parents=True, exist_ok=True)
     paths.runs_dir.mkdir(parents=True, exist_ok=True)
-    paths.patches_dir.mkdir(parents=True, exist_ok=True)
     paths.inbox_dir.mkdir(parents=True, exist_ok=True)
     paths.outbox_dir.mkdir(parents=True, exist_ok=True)
     (paths.shared_home / "locks").mkdir(parents=True, exist_ok=True)

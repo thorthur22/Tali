@@ -6,6 +6,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable
 
+import httpx
+
+from tali.classifier import ScoringResult, classify_request
 from tali.db import Database
 from tali.guardrails import Guardrails
 from tali.hooks.core import HookManager
@@ -21,6 +24,7 @@ from tali.tasking import (
     TaskSpec,
     ReviewResult,
     build_action_plan_prompt,
+    build_response_prompt,
     build_completion_review_prompt,
     build_decomposition_prompt,
     parse_action_plan,
@@ -29,6 +33,27 @@ from tali.tasking import (
 )
 from tali.tools.protocol import ToolCall, ToolResult
 from tali.tools.runner import ToolRecord, ToolRunner
+from tali.working_memory import (
+    WorkingMemory,
+    is_stateful_progress,
+    summarize_tool_result,
+)
+
+
+def _format_llm_http_error(exc: httpx.HTTPStatusError) -> str:
+    status = exc.response.status_code
+    detail = ""
+    try:
+        payload = exc.response.json()
+        if isinstance(payload, dict):
+            detail = payload.get("error", {}).get("message") or payload.get("message") or ""
+    except Exception:
+        detail = exc.response.text.strip()
+    detail = detail[:500] if detail else ""
+    if status in {401, 403}:
+        hint = "Authentication failed. Use an OpenAI API key, or ensure Codex login is valid for this endpoint."
+        return f"HTTP {status}. {hint} {detail}".strip()
+    return f"HTTP {status}. {detail}".strip()
 
 
 @dataclass(frozen=True)
@@ -60,6 +85,8 @@ class TaskRunner:
         guardrails: Guardrails,
         tool_runner: ToolRunner,
         tool_descriptions: str,
+        planner_llm: LLMClient | None = None,
+        responder_llm: LLMClient | None = None,
         hook_manager: HookManager | None = None,
         a2a_client: A2AClient | None = None,
         agent_context: str = "",
@@ -68,6 +95,8 @@ class TaskRunner:
     ) -> None:
         self.db = db
         self.llm = llm
+        self.planner_llm = planner_llm or llm
+        self.responder_llm = responder_llm or llm
         self.retriever = retriever
         self.guardrails = guardrails
         self.tool_runner = tool_runner
@@ -84,10 +113,16 @@ class TaskRunner:
         prompt_fn: Callable[[str], str],
         show_plans: bool = False,
     ) -> TaskRunnerResult:
-        retrieval_context = self.retriever.retrieve(user_input)
+        active_run = self.db.fetch_active_run()
+        resume_intent = self._is_resume_intent(user_input)
+        classification = self._classify_request(user_input)
+        effective_prompt = user_input
+        if active_run is not None and active_run["status"] == "active" and resume_intent:
+            effective_prompt = str(active_run["user_prompt"])
+        retrieval_context = self.retriever.retrieve(effective_prompt)
         memory_context = format_retrieval_context(retrieval_context.bundle)
         skill_context = self._build_skill_context(list(retrieval_context.bundle.skills))
-        active_run = self.db.fetch_active_run()
+        working_memory = WorkingMemory(user_goal=effective_prompt)
         tool_records: list[ToolRecord] = []
         tool_results: list[ToolResult] = []
         messages: list[str] = []
@@ -99,12 +134,16 @@ class TaskRunner:
         if active_run is not None:
             if (
                 active_run["status"] == "active"
+                and not resume_intent
                 and str(active_run["user_prompt"]).strip() != user_input.strip()
             ):
-                self.db.update_run_status(
-                    str(active_run["id"]), status="failed", last_error="superseded"
-                )
-                active_run = None
+                if not self._is_prompt_related_to_run(user_input, active_run):
+                    return self._respond_to_unrelated_prompt(
+                        user_input=user_input,
+                        retrieval_context=retrieval_context,
+                        working_memory=working_memory,
+                        active_run=active_run,
+                    )
             else:
                 existing_tasks = self.db.fetch_tasks_for_run(str(active_run["id"]))
                 if not existing_tasks:
@@ -114,6 +153,26 @@ class TaskRunner:
                     active_run = None
                 else:
                     self._resolve_blocked_task_response(active_run, user_input)
+
+        if active_run is None and self._should_use_responder_only(classification):
+            response = self._generate_response(
+                user_prompt=user_input,
+                memory_context=memory_context,
+                working_memory_summary=working_memory.summary_for_prompt(),
+                tool_results=[],
+                run_summary=None,
+                planner_message=None,
+            )
+            guarded = self.guardrails.enforce(response, retrieval_context.bundle)
+            return TaskRunnerResult(
+                message=guarded.safe_output,
+                tool_records=[],
+                tool_results=[],
+                run_id=None,
+                llm_calls=1,
+                steps=1,
+                tool_calls=0,
+            )
 
         if active_run is None:
             created_run = True
@@ -182,7 +241,7 @@ class TaskRunner:
                 )
                 if waiting:
                     messages.append(
-                        "Waiting on a delegated agent. Try again later or check `tali inbox`."
+                        "Waiting on a delegated agent. Try again later or check `inbox`."
                     )
                     guarded = self.guardrails.enforce(
                         "\n\n".join(messages), retrieval_context.bundle
@@ -254,6 +313,7 @@ class TaskRunner:
                 user_prompt=str(self.db.fetch_run(run_id)["user_prompt"]),
                 prompt_fn=prompt_fn,
                 memory_context=memory_context,
+                working_memory=working_memory,
                 run_summary=run_summary,
                 skill_context=skill_context,
                 llm_calls_remaining=self.settings.max_total_llm_calls_per_run_per_turn - llm_calls,
@@ -315,7 +375,9 @@ class TaskRunner:
             user_prompt, self.tool_descriptions, self.agent_context, memory_context
         )
         try:
-            response = self.llm.generate(prompt)
+            response = self.planner_llm.generate(prompt)
+        except httpx.HTTPStatusError as exc:  # noqa: BLE001
+            return None, f"llm_error: {_format_llm_http_error(exc)}"
         except Exception as exc:  # noqa: BLE001
             return None, f"llm_error: {exc}"
         tasks, error = parse_decomposition(response.content)
@@ -452,6 +514,7 @@ class TaskRunner:
         current_task_title = None
         current_task_id = run_row["current_task_id"]
         blocked_questions: list[str] = []
+        clarifications: list[str] = []
         for row in tasks_rows:
             status = row["status"]
             if status in counts:
@@ -467,6 +530,20 @@ class TaskRunner:
                 question = payload.get("blocked_question")
                 if isinstance(question, str) and question.strip():
                     blocked_questions.append(question.strip())
+            if outputs_json and len(clarifications) < 3:
+                try:
+                    payload = json.loads(outputs_json)
+                except json.JSONDecodeError:
+                    payload = {}
+                question = payload.get("blocked_question")
+                answer = payload.get("blocked_answer")
+                if (
+                    isinstance(question, str)
+                    and question.strip()
+                    and isinstance(answer, str)
+                    and answer.strip()
+                ):
+                    clarifications.append(f"{question.strip()} -> {answer.strip()}")
         lines = [f"Goal: {run_row['user_prompt']}"]
         lines.append(
             "Status: "
@@ -481,6 +558,8 @@ class TaskRunner:
             lines.append(f"Current task: {current_task_title}")
         if blocked_questions:
             lines.append("Blocked questions: " + " | ".join(blocked_questions))
+        if clarifications:
+            lines.append("Clarifications: " + " | ".join(clarifications))
         if run_row["last_error"]:
             lines.append(f"Last error: {run_row['last_error']}")
         return "\n".join(lines)
@@ -543,6 +622,7 @@ class TaskRunner:
         user_prompt: str,
         prompt_fn: Callable[[str], str],
         memory_context: str,
+        working_memory: WorkingMemory,
         run_summary: str | None,
         skill_context: str | None,
         llm_calls_remaining: int,
@@ -569,7 +649,7 @@ class TaskRunner:
         stuck_replans = 0
         stuck_context: str | None = None
         tool_records: list[ToolRecord] = []
-        tool_results: list[ToolResult] = []
+        tool_results: list[ToolResult] = self._hydrate_task_state(task_row, working_memory)
         user_message: str | None = None
         blocked = False
 
@@ -585,6 +665,7 @@ class TaskRunner:
                 task_row,
                 tool_results,
                 memory_context,
+                working_memory.summary_for_prompt(),
                 run_summary,
                 stuck_context,
                 skill_context,
@@ -647,6 +728,27 @@ class TaskRunner:
                     {"name": plan.tool_name, "args": plan.tool_args or {}},
                     sort_keys=True,
                 )
+                args_hash = WorkingMemory.args_hash(plan.tool_args or {})
+                if working_memory.seen_success(plan.tool_name, args_hash):
+                    stuck_context = (
+                        "duplicate_success_blocked: "
+                        f"tool={plan.tool_name} args_hash={args_hash}"
+                    )
+                    working_memory.steps_since_progress += 1
+                    self._log_task_event(
+                        task_id,
+                        "note",
+                        {
+                            "reason": "duplicate_tool_blocked",
+                            "tool": plan.tool_name,
+                            "args_hash": args_hash,
+                        },
+                    )
+                    if self.status_fn:
+                        self.status_fn(
+                            f"Blocked duplicate tool call: {plan.tool_name} {args_hash}"
+                        )
+                    continue
                 repeated_tool_signatures[signature] = repeated_tool_signatures.get(signature, 0) + 1
                 if repeated_tool_signatures[signature] > 2:
                     if stuck_replans < 2:
@@ -704,6 +806,9 @@ class TaskRunner:
                 tool_records.extend(records)
                 tool_results.extend(results)
                 tool_calls += len(results)
+                combined_obs: list[str] = []
+                combined_durable: dict[str, Any] = {}
+                progress_made = False
                 for result in results:
                     if self.status_fn and result.status == "ok" and result.result_raw:
                         raw = result.result_raw
@@ -731,6 +836,66 @@ class TaskRunner:
                             },
                         )
                     stage_tool_result_fact(self.db, result)
+                    observations, durable = summarize_tool_result(
+                        tool_call.name, tool_call.args, result
+                    )
+                    combined_obs.extend(observations)
+                    for key, value in durable.items():
+                        if (
+                            key.endswith("_paths")
+                            and isinstance(value, list)
+                            and isinstance(combined_durable.get(key), list)
+                        ):
+                            combined = combined_durable[key] + value
+                            combined_durable[key] = list(dict.fromkeys(combined))
+                        else:
+                            combined_durable[key] = value
+                    working_memory.record_tool_call(
+                        tool_call.name, args_hash, result.status
+                    )
+                    if is_stateful_progress(tool_call.name, result) or durable:
+                        progress_made = True
+                working_memory.note_observations(combined_obs, combined_durable)
+                if progress_made:
+                    working_memory.note_progress(
+                        "tool_call",
+                        {
+                            "tool": tool_call.name,
+                            "args_hash": args_hash,
+                            "durable_facts": combined_durable,
+                        },
+                    )
+                    self._log_task_event(
+                        task_id,
+                        "note",
+                        {"reason": "progress_recorded", "tool": tool_call.name},
+                    )
+                else:
+                    working_memory.steps_since_progress += 1
+                    self._log_task_event(
+                        task_id,
+                        "note",
+                        {
+                            "reason": "no_progress",
+                            "tool": tool_call.name,
+                            "steps_since_progress": working_memory.steps_since_progress,
+                        },
+                    )
+                self._log_task_event(
+                    task_id,
+                    "note",
+                    {"reason": "memory_update", "observations": combined_obs},
+                )
+                if working_memory.steps_since_progress >= 2:
+                    stuck_context = (
+                        "Stuck detected: no progress in 2 tool calls. "
+                        "Next action must be stateful progress or a single targeted diagnostic."
+                    )
+                    self._log_task_event(
+                        task_id,
+                        "note",
+                        {"reason": "stuck_replan", "steps": working_memory.steps_since_progress},
+                    )
                 continue
             if action == "execute_skill":
                 if not plan.skill_name:
@@ -928,8 +1093,17 @@ class TaskRunner:
                 self._log_task_event(task_id, "note", {"outputs_json": plan.outputs_json or {}})
                 continue
             if action == "respond":
-                if plan.message:
-                    user_message = plan.message
+                response = self._generate_response(
+                    user_prompt=user_prompt,
+                    memory_context=memory_context,
+                    working_memory_summary=working_memory.summary_for_prompt(),
+                    tool_results=tool_results,
+                    run_summary=run_summary,
+                    planner_message=plan.message,
+                )
+                llm_calls += 1
+                if response:
+                    user_message = response
                 self._log_task_event(task_id, "note", {"message": plan.message or ""})
                 now = datetime.utcnow().isoformat()
                 self.db.update_task_status(
@@ -1042,7 +1216,14 @@ class TaskRunner:
                 f"Budget pause: steps={steps} llm_calls={llm_calls} tool_calls={tool_calls}"
             )
         self._log_task_event(task_id, "note", {"reason": "budget_pause"})
-        self.db.update_task_status(task_id, status="pending", outputs_json=task_row["outputs_json"], updated_at=datetime.utcnow().isoformat())
+        snapshot = self._build_task_state_snapshot(working_memory, tool_results)
+        updated_outputs = self._merge_outputs(task_row["outputs_json"], snapshot)
+        self.db.update_task_status(
+            task_id,
+            status="pending",
+            outputs_json=updated_outputs,
+            updated_at=datetime.utcnow().isoformat(),
+        )
         if self.hook_manager:
             self.hook_manager.run(
                 "on_task_end",
@@ -1063,6 +1244,7 @@ class TaskRunner:
         task_row: Any,
         tool_results: list[ToolResult],
         memory_context: str,
+        working_memory_summary: str,
         run_summary: str | None,
         stuck_context: str | None,
         skill_context: str | None,
@@ -1092,6 +1274,7 @@ class TaskRunner:
             recent_tool_outputs=outputs,
             agent_context=self.agent_context,
             memory_context=memory_context,
+            working_memory_summary=working_memory_summary,
             run_summary=run_summary,
             stuck_context=stuck_context,
             skill_context=skill_context,
@@ -1099,8 +1282,14 @@ class TaskRunner:
         if self.status_fn:
             self.status_fn("Planning next action")
         try:
-            response = self.llm.generate(prompt)
-        except Exception:
+            response = self.planner_llm.generate(prompt)
+        except httpx.HTTPStatusError as exc:
+            if self.status_fn:
+                self.status_fn(f"LLM error: {_format_llm_http_error(exc)}")
+            return None
+        except Exception as exc:
+            if self.status_fn:
+                self.status_fn(f"LLM error: {exc}")
             return None
         plan, error = parse_action_plan(response.content)
         if error or not plan:
@@ -1125,6 +1314,103 @@ class TaskRunner:
                 base = {}
         base.update(update)
         return json.dumps(base)
+
+    def _is_resume_intent(self, user_input: str) -> bool:
+        normalized = user_input.strip().lower()
+        if not normalized:
+            return False
+        if normalized in {
+            "continue",
+            "continue task",
+            "continue the task",
+            "continue working",
+            "continue working on it",
+            "resume",
+            "keep going",
+            "go on",
+            "carry on",
+        }:
+            return True
+        resume_prefixes = (
+            "continue ",
+            "resume ",
+            "keep going",
+            "go on",
+            "carry on",
+            "ok continue",
+            "okay continue",
+        )
+        return normalized.startswith(resume_prefixes)
+
+    def _hydrate_task_state(
+        self, task_row: Any, working_memory: WorkingMemory
+    ) -> list[ToolResult]:
+        outputs_json = task_row["outputs_json"]
+        if not outputs_json:
+            return []
+        try:
+            payload = json.loads(outputs_json)
+        except json.JSONDecodeError:
+            return []
+        memory_snapshot = payload.get("working_memory")
+        if isinstance(memory_snapshot, dict):
+            restored = WorkingMemory.from_snapshot(
+                memory_snapshot, user_goal=working_memory.user_goal
+            )
+            working_memory.constraints = restored.constraints
+            working_memory.environment_facts = restored.environment_facts
+            working_memory.progress = restored.progress
+            working_memory.last_observations = restored.last_observations
+            working_memory.recent_tool_calls = restored.recent_tool_calls
+            working_memory.steps_since_progress = restored.steps_since_progress
+        recent_results = payload.get("recent_tool_results")
+        if not isinstance(recent_results, list):
+            return []
+        hydrated: list[ToolResult] = []
+        for entry in recent_results:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name")
+            status = entry.get("status")
+            summary = entry.get("summary", "")
+            raw = entry.get("raw", "")
+            if not isinstance(name, str) or not isinstance(status, str):
+                continue
+            hydrated.append(
+                ToolResult(
+                    id=entry.get("id") if isinstance(entry.get("id"), str) else f"seed_{uuid.uuid4().hex}",
+                    name=name,
+                    status=status,
+                    started_at="",
+                    ended_at="",
+                    result_ref=entry.get("result_ref") if isinstance(entry.get("result_ref"), str) else "task_state",
+                    result_summary=summary if isinstance(summary, str) else "",
+                    result_raw=raw if isinstance(raw, str) else "",
+                )
+            )
+        return hydrated
+
+    def _build_task_state_snapshot(
+        self, working_memory: WorkingMemory, tool_results: list[ToolResult]
+    ) -> dict[str, Any]:
+        recent_tool_results: list[dict[str, Any]] = []
+        for result in tool_results[-5:]:
+            raw = result.result_raw or ""
+            truncated = raw if len(raw) <= 1500 else f"{raw[:1500]}...[truncated]"
+            recent_tool_results.append(
+                {
+                    "id": result.id,
+                    "name": result.name,
+                    "status": result.status,
+                    "summary": result.result_summary,
+                    "raw": truncated,
+                    "result_ref": result.result_ref,
+                }
+            )
+        return {
+            "working_memory": working_memory.snapshot(),
+            "recent_tool_results": recent_tool_results,
+        }
 
     def _resolve_blocked_task_response(self, run_row: Any, user_input: str) -> None:
         task_id = run_row["current_task_id"]
@@ -1182,7 +1468,9 @@ class TaskRunner:
             )
         prompt = build_completion_review_prompt(user_prompt, summaries, memory_context)
         try:
-            response = self.llm.generate(prompt)
+            response = self.planner_llm.generate(prompt)
+        except httpx.HTTPStatusError as exc:  # noqa: BLE001
+            return f"Completion review failed: {_format_llm_http_error(exc)}", 1, 1
         except Exception as exc:  # noqa: BLE001
             return f"Completion review failed: {exc}", 1, 1
         review, error = parse_completion_review(response.content)
@@ -1241,6 +1529,107 @@ class TaskRunner:
             lines.extend(f"- {item}" for item in review.assumptions)
         lines.append(review.user_message)
         return "\n".join(lines)
+
+    def _classify_request(self, user_input: str) -> ScoringResult:
+        return classify_request(user_input)
+
+    def _should_use_responder_only(self, classification: ScoringResult) -> bool:
+        return classification.tier == "SIMPLE"
+
+    def _is_prompt_related_to_run(self, user_input: str, run_row: Any) -> bool:
+        tasks = self.db.fetch_tasks_for_run(str(run_row["id"]))
+        if not tasks:
+            return False
+        task_lines: list[str] = []
+        for row in tasks[:6]:
+            title = str(row["title"]) if row["title"] else ""
+            description = str(row["description"]) if row["description"] else ""
+            if description:
+                task_lines.append(f"- {title}: {description}")
+            else:
+                task_lines.append(f"- {title}")
+        prompt = "\n".join(
+            [
+                "You are routing a user message against an active task run.",
+                "Return YES if the message is directly related to continuing or modifying the tasks.",
+                "Return NO if it is unrelated.",
+                "Return only YES or NO.",
+                "Active tasks:",
+                *task_lines,
+                f"User message: {user_input}",
+            ]
+        )
+        try:
+            response = self.responder_llm.generate(prompt)
+            answer = response.content.strip().lower()
+        except Exception:
+            return False
+        return answer.startswith("y")
+
+    def _respond_to_unrelated_prompt(
+        self,
+        user_input: str,
+        retrieval_context: Any,
+        working_memory: WorkingMemory,
+        active_run: Any,
+    ) -> TaskRunnerResult:
+        response = self._generate_response(
+            user_prompt=user_input,
+            memory_context=format_retrieval_context(retrieval_context.bundle),
+            working_memory_summary=working_memory.summary_for_prompt(),
+            tool_results=[],
+            run_summary=None,
+            planner_message=None,
+        )
+        guarded = self.guardrails.enforce(response, retrieval_context.bundle)
+        return TaskRunnerResult(
+            message=guarded.safe_output,
+            tool_records=[],
+            tool_results=[],
+            run_id=str(active_run["id"]),
+            llm_calls=1,
+            steps=1,
+            tool_calls=0,
+        )
+
+    def _generate_response(
+        self,
+        user_prompt: str,
+        memory_context: str,
+        working_memory_summary: str,
+        tool_results: list[ToolResult],
+        run_summary: str | None,
+        planner_message: str | None,
+    ) -> str:
+        summaries = [
+            f"- {result.name} status={result.status} summary={result.result_summary}"
+            for result in tool_results[-5:]
+        ]
+        outputs = []
+        for result in tool_results[-5:]:
+            raw = result.result_raw or ""
+            truncated = raw if len(raw) <= 1500 else f"{raw[:1500]}...[truncated]"
+            outputs.append(
+                f"- {result.name} status={result.status} summary={result.result_summary} raw={truncated}"
+            )
+        prompt = build_response_prompt(
+            user_prompt=user_prompt,
+            memory_context=memory_context,
+            working_memory_summary=working_memory_summary,
+            agent_context=self.agent_context,
+            planner_message=planner_message,
+            recent_tool_summaries=summaries,
+            recent_tool_outputs=outputs,
+            run_summary=run_summary,
+        )
+        try:
+            response = self.responder_llm.generate(prompt)
+        except httpx.HTTPStatusError as exc:
+            error_message = _format_llm_http_error(exc)
+            return planner_message or f"I hit a response error: {error_message}"
+        except Exception as exc:
+            return planner_message or f"I hit a response error: {exc}"
+        return response.content
 
 
 @dataclass

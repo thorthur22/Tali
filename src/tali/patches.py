@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
+import sys
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -75,9 +77,13 @@ def store_patch_proposal(db: Database, proposal: PatchProposal) -> str:
 
 def run_patch_tests(tests: list[str], cwd: Path) -> str:
     results: list[str] = []
+    base_cwd = _resolve_repo_root(cwd)
     for cmd in tests:
+        cmd = _maybe_use_python_pytest(cmd)
         try:
-            completed = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True)
+            completed = subprocess.run(
+                cmd, shell=True, cwd=base_cwd, capture_output=True, text=True
+            )
             results.append(
                 json.dumps(
                     {
@@ -91,6 +97,23 @@ def run_patch_tests(tests: list[str], cwd: Path) -> str:
         except Exception as exc:
             results.append(json.dumps({"command": cmd, "error": str(exc)}))
     return "\n".join(results)
+
+
+def _resolve_repo_root(start: Path) -> Path:
+    for candidate in (start, *start.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return start
+
+
+def _maybe_use_python_pytest(cmd: str) -> str:
+    stripped = cmd.strip()
+    if not stripped or not stripped.startswith("pytest"):
+        return cmd
+    if shutil.which("pytest"):
+        return cmd
+    suffix = stripped[len("pytest") :]
+    return f'"{sys.executable}" -m pytest{suffix}'
 
 
 def apply_patch(diff_text: str, cwd: Path) -> str | None:
