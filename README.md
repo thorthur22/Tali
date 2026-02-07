@@ -72,6 +72,18 @@ tali sleep
 tali sleep --apply data/sleep/<sleep_output.json>
 ```
 
+## Memory pipeline
+
+Tali uses a two-path memory flow:
+
+* Realtime ingestion: tool results and episodes are staged as fact candidates
+  (TOOL_VERIFIED / SYSTEM_OBSERVED) for fast recall.
+* Sleep consolidation: deeper extraction, contradiction handling, and promotion
+  policies run offline with stronger gates.
+
+When responses reference memory, the agent includes explicit citations like
+`[fact:<id>]`, `[commitment:<id>]`, or `[preference:<key>]`.
+
 ## Snapshots
 
 Create a snapshot, inspect differences, or rollback data:
@@ -125,6 +137,18 @@ tali patches test <id>
 tali patches apply <id>
 tali patches reject <id>
 tali patches rollback <id>
+```
+
+## Logs and run browser
+
+Structured logs are written under `~/.tali/<agent>/logs/` for each run.
+Quick commands:
+
+```bash
+tali logs --limit 20
+tali dashboard --duration 30
+tali run list
+tali run timeline <run_id>
 ```
 
 ## A2A (agent-to-agent)

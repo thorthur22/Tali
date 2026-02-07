@@ -58,6 +58,8 @@ def apply_sleep_changes(
     applied_commitment_ids: list[str] = []
     applied_skill_ids: list[str] = []
     staged_notes: list[str] = []
+    existing_commitments = db.list_commitments()
+    existing_skills = db.list_skills()
 
     if not isinstance(fact_candidates, list):
         raise ValueError("fact_candidates must be a list")
@@ -202,6 +204,15 @@ def apply_sleep_changes(
         if not description or not source_ref:
             skipped_candidates.append("commitment_missing_fields")
             continue
+        if not db.episode_exists(str(source_ref)):
+            skipped_candidates.append("commitment_missing_source")
+            continue
+        if any(
+            str(row["description"]).strip().lower() == description.lower()
+            for row in existing_commitments
+        ):
+            skipped_candidates.append("commitment_duplicate")
+            continue
         if not _is_explicit_commitment(db, source_ref, description, candidate):
             staged_item_ids.append(
                 _stage_item(
@@ -249,6 +260,15 @@ def apply_sleep_changes(
         evidence = candidate.get("success_evidence") or []
         if not name or not trigger or not steps or not source_ref:
             skipped_candidates.append("skill_missing_fields")
+            continue
+        if not db.episode_exists(str(source_ref)):
+            skipped_candidates.append("skill_missing_source")
+            continue
+        if any(
+            str(row["trigger"]).strip().lower() == trigger.lower()
+            for row in existing_skills
+        ):
+            skipped_candidates.append("skill_duplicate_trigger")
             continue
         if not _skill_evidence_strong(evidence) or not _steps_tool_safe(steps):
             staged_item_ids.append(

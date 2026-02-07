@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Iterable
 
 from tali.config import RetrievalConfig
@@ -36,6 +37,7 @@ class Retriever:
         self.vector_index = vector_index
 
     def retrieve(self, user_input: str) -> RetrievalContext:
+        self._sync_vector_index()
         commitments = self._commitments()
         vector_hits = self._vector_hits(user_input)
         facts = self._facts(user_input, vector_hits)
@@ -55,7 +57,14 @@ class Retriever:
 
     def _commitments(self) -> Iterable[Commitment]:
         rows = self.db.list_commitments()
-        selected = rows[: self.config.max_commitments]
+        ranked = sorted(
+            rows,
+            key=lambda row: (
+                int(row["priority"] or 3),
+                -_timestamp_score(row["last_touched"]),
+            ),
+        )
+        selected = ranked[: self.config.max_commitments]
         return [
             Commitment(
                 id=row["id"],
@@ -92,9 +101,10 @@ class Retriever:
             key=lambda row: (
                 -PROVENANCE_PRIORITY.get(row["provenance_type"], 0),
                 -row["confidence"],
+                -_timestamp_score(row["last_confirmed"] or row["created_at"]),
             ),
         )
-        selected = ranked[: self.config.max_facts]
+        selected = _diversify_rows(ranked, self.config.max_facts)
         return [
             Fact(
                 id=row["id"],
@@ -147,3 +157,69 @@ class Retriever:
         if not self.vector_index:
             return []
         return self.vector_index.search(user_input, k=5)
+
+    def _sync_vector_index(self) -> None:
+        if not self.vector_index:
+            return
+        mapping_items = list(self.vector_index.mapping.values())
+        if not mapping_items and not self.vector_index.needs_rebuild:
+            return
+        facts_ids = [item.item_id for item in mapping_items if item.item_type == "fact"]
+        episode_ids = [item.item_id for item in mapping_items if item.item_type == "episode"]
+        missing = False
+        if facts_ids:
+            found = {row["id"] for row in self.db.fetch_facts_by_ids(facts_ids)}
+            if len(found) < len(facts_ids):
+                missing = True
+        if episode_ids:
+            found = {row["id"] for row in self.db.fetch_episodes_by_ids(episode_ids)}
+            if len(found) < len(episode_ids):
+                missing = True
+        if missing or self.vector_index.needs_rebuild:
+            items: list[tuple[str, str, str]] = []
+            for row in self.db.list_facts():
+                items.append(("fact", row["id"], row["statement"]))
+            for row in self.db.list_episodes():
+                items.append(("episode", row["id"], f"{row['user_input']}\n{row['agent_output']}"))
+            self.vector_index.rebuild_from_items(items)
+
+
+def _timestamp_score(value: str | None) -> float:
+    if not value:
+        return 0.0
+    try:
+        return datetime.fromisoformat(value).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _diversify_rows(rows: list[object], limit: int) -> list[object]:
+    selected: list[object] = []
+    for row in rows:
+        if len(selected) >= limit:
+            break
+        statement = str(row["statement"] or "")
+        if not statement:
+            continue
+        if _is_too_similar(statement, [str(r["statement"] or "") for r in selected]):
+            continue
+        selected.append(row)
+    return selected
+
+
+def _is_too_similar(statement: str, existing: list[str]) -> bool:
+    if not existing:
+        return False
+    tokens = _tokenize(statement)
+    for other in existing:
+        other_tokens = _tokenize(other)
+        if not tokens or not other_tokens:
+            continue
+        overlap = len(tokens & other_tokens) / max(len(tokens | other_tokens), 1)
+        if overlap >= 0.8:
+            return True
+    return False
+
+
+def _tokenize(text: str) -> set[str]:
+    return {token for token in text.lower().split() if len(token) > 2}

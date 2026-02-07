@@ -21,6 +21,7 @@ class VectorIndex:
         self.store = VectorStore(path, dim=dim)
         self.mapping_path = path.with_suffix(".json")
         self.mapping: dict[int, VectorItem] = self._load_mapping()
+        self.needs_rebuild = False
 
     def _load_mapping(self) -> dict[int, VectorItem]:
         if not self.mapping_path.exists():
@@ -46,7 +47,20 @@ class VectorIndex:
         if not self.mapping:
             self._reset_store(vector_len)
             return True
-        return False
+        self._reset_store(vector_len)
+        self.needs_rebuild = True
+        return True
+
+    def rebuild_from_items(self, items: list[tuple[str, str, str]]) -> None:
+        if not items:
+            self._reset_store(self.store.dim)
+            self.needs_rebuild = False
+            return
+        first_vector = self.embedder.embed([items[0][2]])[0]
+        self._reset_store(len(first_vector))
+        for item_type, item_id, text in items:
+            self.add(item_type=item_type, item_id=item_id, text=text)
+        self.needs_rebuild = False
 
     def add(self, item_type: str, item_id: str, text: str) -> None:
         vector = self.embedder.embed([text])[0]

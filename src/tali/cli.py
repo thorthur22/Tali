@@ -5,6 +5,7 @@ import platform
 import subprocess
 import re
 import shutil
+import time
 from urllib.parse import urlparse
 from datetime import datetime
 from uuid import uuid4
@@ -13,6 +14,11 @@ from typing import Optional
 
 import typer
 from rich.console import Console
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
+from rich.layout import Layout
+import httpx
 from rich.markup import escape
 from dataclasses import replace
 
@@ -40,6 +46,7 @@ from tali.db import Database
 from tali.episode import build_episode, build_prompt
 from tali.embeddings import OllamaEmbeddingClient, OpenAIEmbeddingClient
 from tali.guardrails import GuardrailResult, Guardrails
+from tali.memory_ingest import stage_episode_fact
 from tali.llm import OllamaClient, OpenAIClient
 from tali.retrieval import Retriever
 from tali.self_care import SleepScheduler, resolve_staged_items
@@ -50,13 +57,14 @@ from tali.approvals import ApprovalManager
 from tali.task_runner import TaskRunner, TaskRunnerSettings
 from tali.hooks.core import HookManager
 from tali.idle import IdleScheduler
-from tali.knowledge_sources import KnowledgeSourceRegistry
+from tali.knowledge_sources import KnowledgeSourceRegistry, LocalFileSource
 from tali.questions import mark_question_asked, resolve_answered_question, select_question_to_ask
 from tali.patches import apply_patch, reverse_patch, run_patch_tests
 from tali.tools.registry import build_default_registry
 from tali.tools.policy import ToolPolicy
 from tali.tools.runner import ToolRunner
 from tali.model_catalog import list_models as list_catalog_models, download_model as download_catalog_model
+from tali.run_logs import append_run_log, read_recent_logs, latest_metrics_for_run
 
 app = typer.Typer(help="Tali agent CLI")
 run_app = typer.Typer(help="Manage task runs")
@@ -188,6 +196,20 @@ def _is_local_base_url(base_url: str | None) -> bool:
     parsed = urlparse(base_url)
     host = parsed.hostname or ""
     return host in {"localhost", "127.0.0.1", "::1"}
+
+
+def _validate_provider_connectivity(provider: str, base_url: str, api_key: str | None) -> bool:
+    try:
+        if provider == "ollama":
+            url = base_url.rstrip("/") + "/api/tags"
+            response = httpx.get(url, timeout=5.0)
+            return response.status_code < 400
+        url = base_url.rstrip("/") + "/models"
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        response = httpx.get(url, headers=headers, timeout=5.0)
+        return response.status_code < 400
+    except Exception:
+        return False
 
 
 def _list_ollama_models() -> list[str]:
@@ -444,6 +466,8 @@ def chat(
     show_plans: bool = typer.Option(False, "--show-plans", help="Show task planning steps."),
 ) -> None:
     """Start a chat loop or run a single turn if message is provided."""
+    if isinstance(message, typer.models.ArgumentInfo):
+        message = None
     paths, existing_config = _resolve_paths()
     _ensure_dependencies()
     config = _load_or_raise_config(paths, existing_config)
@@ -459,6 +483,7 @@ def chat(
     scheduler = SleepScheduler(paths.data_dir, db, llm, vector_index, hook_manager=hook_manager)
     scheduler.start()
     sources = KnowledgeSourceRegistry()
+    sources.register(LocalFileSource(paths.agent_home))
     idle_scheduler = IdleScheduler(
         paths.data_dir,
         db,
@@ -711,6 +736,24 @@ def chat(
                 outcome=episode.outcome,
                 quarantine=episode.quarantine,
             )
+            stage_episode_fact(db, episode.id, episode.user_input, episode.outcome)
+            append_run_log(
+                paths.logs_dir,
+                {
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "run_id": result.run_id,
+                    "user_input": user_input,
+                    "llm_calls": result.llm_calls,
+                    "steps": result.steps,
+                    "tool_calls": result.tool_calls,
+                    "steps_limit": task_runner.settings.max_total_steps_per_turn,
+                    "llm_limit": task_runner.settings.max_total_llm_calls_per_run_per_turn,
+                    "tool_limit": task_runner.settings.max_tool_calls_per_task,
+                },
+            )
+            console.print(
+                f"[dim]Metrics: llm_calls={result.llm_calls} steps={result.steps} tool_calls={result.tool_calls}[/dim]"
+            )
             if has_pending_question:
                 answer_payload = resolve_answered_question(
                     db, user_input, dict(pending_question_row), source_ref=episode.id
@@ -775,6 +818,7 @@ def chat(
                 outcome=episode.outcome,
                 quarantine=episode.quarantine,
             )
+            stage_episode_fact(db, episode.id, episode.user_input, episode.outcome)
             vector_index.add(
                 item_type="episode",
                 item_id=episode.id,
@@ -813,6 +857,7 @@ def chat(
                 outcome=episode.outcome,
                 quarantine=episode.quarantine,
             )
+            stage_episode_fact(db, episode.id, episode.user_input, episode.outcome)
             vector_index.add(
                 item_type="episode",
                 item_id=episode.id,
@@ -841,6 +886,7 @@ def chat(
                     outcome=episode.outcome,
                     quarantine=episode.quarantine,
                 )
+                stage_episode_fact(db, episode.id, episode.user_input, episode.outcome)
                 vector_index.add(
                     item_type="episode",
                     item_id=episode.id,
@@ -882,12 +928,14 @@ def run_status() -> None:
         typer.echo("No active run.")
         return
     tasks = db.fetch_tasks_for_run(run["id"])
+    metrics = latest_metrics_for_run(paths.logs_dir, str(run["id"]))
     payload = {
         "run": dict(run),
         "tasks": [
             {"ordinal": row["ordinal"], "title": row["title"], "status": row["status"]}
             for row in tasks
         ],
+        "metrics": metrics or {},
     }
     typer.echo(json.dumps(payload, indent=2))
 
@@ -944,6 +992,129 @@ def run_show(run_id: str = typer.Argument(..., help="Run ID to display.")) -> No
         ],
     }
     typer.echo(json.dumps(payload, indent=2))
+
+
+@run_app.command("list")
+def run_list(limit: int = typer.Option(20, "--limit", help="Max runs to show.")) -> None:
+    """List recent runs."""
+    paths, _ = _resolve_paths()
+    db = _init_db(paths.db_path)
+    runs = db.list_runs(limit=limit)
+    payload = [
+        {
+            "id": row["id"],
+            "created_at": row["created_at"],
+            "status": row["status"],
+            "last_error": row["last_error"],
+        }
+        for row in runs
+    ]
+    typer.echo(json.dumps(payload, indent=2))
+
+
+@run_app.command("timeline")
+def run_timeline(run_id: str = typer.Argument(..., help="Run ID to display timeline.")) -> None:
+    """Show task event timeline for a run."""
+    paths, _ = _resolve_paths()
+    db = _init_db(paths.db_path)
+    events = db.fetch_task_events_for_run(run_id)
+    payload = [
+        {
+            "timestamp": row["timestamp"],
+            "task_id": row["task_id"],
+            "event_type": row["event_type"],
+            "payload": row["payload"],
+        }
+        for row in events
+    ]
+    typer.echo(json.dumps(payload, indent=2))
+
+
+@app.command("logs")
+def logs(
+    limit: int = typer.Option(10, "--limit", help="Max log entries to show."),
+    run_id: Optional[str] = typer.Option(None, "--run-id", help="Filter by run ID."),
+) -> None:
+    """Show recent structured run logs."""
+    paths, _ = _resolve_paths()
+    entries = read_recent_logs(paths.logs_dir, limit=limit * 5)
+    if run_id:
+        entries = [entry for entry in entries if entry.get("run_id") == run_id]
+    if not entries:
+        typer.echo("No logs found.")
+        return
+    typer.echo(json.dumps(entries[-limit:], indent=2))
+
+
+def _render_dashboard(db: Database, paths: Paths) -> Layout:
+    layout = Layout()
+    layout.split_column(
+        Layout(name="top", ratio=1),
+        Layout(name="middle", ratio=2),
+        Layout(name="bottom", ratio=1),
+    )
+    layout["top"].split_row(Layout(name="memory"), Layout(name="metrics"))
+    run = db.fetch_active_run()
+    tasks = db.fetch_tasks_for_run(run["id"]) if run else []
+    staged_by_status = db.count_staged_items_by_status()
+    facts_count = len(db.list_facts())
+    commitments_count = len(db.list_commitments())
+    preferences_count = len(db.list_preferences())
+    memory_lines = [
+        f"Facts: {facts_count}",
+        f"Commitments: {commitments_count}",
+        f"Preferences: {preferences_count}",
+        f"Staged: {staged_by_status}",
+    ]
+    layout["top"]["memory"].update(Panel("\n".join(memory_lines), title="Memory Status"))
+    metrics = latest_metrics_for_run(paths.logs_dir, str(run["id"])) if run else None
+    metrics_lines = [
+        f"Run: {run['id']}" if run else "Run: (none)",
+        f"Status: {run['status']}" if run else "Status: n/a",
+        f"LLM calls: {metrics.get('llm_calls')}" if metrics else "LLM calls: n/a",
+        f"Tool calls: {metrics.get('tool_calls')}" if metrics else "Tool calls: n/a",
+        f"Steps: {metrics.get('steps')}" if metrics else "Steps: n/a",
+    ]
+    layout["top"]["metrics"].update(Panel("\n".join(metrics_lines), title="Run Metrics"))
+
+    task_table = Table(title="Tasks")
+    task_table.add_column("Ord", justify="right")
+    task_table.add_column("Title")
+    task_table.add_column("Status")
+    for row in tasks:
+        task_table.add_row(str(row["ordinal"]), str(row["title"]), str(row["status"]))
+    if not tasks:
+        task_table.add_row("-", "No active run", "-")
+    layout["middle"].update(task_table)
+
+    recent_logs = read_recent_logs(paths.logs_dir, limit=5)
+    log_lines = []
+    for entry in recent_logs:
+        run_id = entry.get("run_id", "")
+        llm_calls = entry.get("llm_calls", "")
+        tool_calls = entry.get("tool_calls", "")
+        log_lines.append(f"{run_id} llm={llm_calls} tools={tool_calls}")
+    layout["bottom"].update(Panel("\n".join(log_lines) if log_lines else "No logs.", title="Recent Logs"))
+    return layout
+
+
+@app.command("dashboard")
+def dashboard(
+    refresh_s: float = typer.Option(1.5, "--refresh", help="Refresh interval (seconds)."),
+    duration_s: int = typer.Option(30, "--duration", help="How long to run (seconds). 0 = once."),
+) -> None:
+    """Show a live dashboard with tasks, memory, and logs."""
+    paths, _ = _resolve_paths()
+    db = _init_db(paths.db_path)
+    if duration_s == 0:
+        console = Console()
+        console.print(_render_dashboard(db, paths))
+        return
+    start = time.time()
+    with Live(_render_dashboard(db, paths), refresh_per_second=max(1, int(1 / refresh_s))) as live:
+        while time.time() - start < duration_s:
+            live.update(_render_dashboard(db, paths))
+            time.sleep(refresh_s)
 
 
 @app.command("name")
@@ -1331,7 +1502,7 @@ def diff() -> None:
     paths, _ = _resolve_paths()
     snapshots = list_snapshots(paths.data_dir)
     if not snapshots:
-        typer.echo("No snapshots found. Run `agent snapshot` first.")
+        typer.echo("No snapshots found. Run `tali snapshot` first.")
         raise typer.Exit(code=1)
     latest = snapshots[-1]
     typer.echo(diff_snapshot(paths.data_dir, latest))
@@ -1343,7 +1514,7 @@ def rollback() -> None:
     paths, _ = _resolve_paths()
     snapshots = list_snapshots(paths.data_dir)
     if not snapshots:
-        typer.echo("No snapshots found. Run `agent snapshot` first.")
+        typer.echo("No snapshots found. Run `tali snapshot` first.")
         raise typer.Exit(code=1)
     latest = snapshots[-1]
     rollback_snapshot(paths.data_dir, latest)
@@ -1374,11 +1545,33 @@ def doctor() -> None:
         if confidence < 0.0 or confidence > 1.0:
             violations.append(f"Fact {row['id']} has confidence out of range.")
     staged_count = db.count_staged_items()
+    staged_by_status = db.count_staged_items_by_status()
     oldest = db.oldest_pending_staged_item()
+    mapping_path = (paths.vector_dir / "memory.index").with_suffix(".json")
+    vector_report = {"mapping_path": str(mapping_path), "mapping_entries": 0, "missing_facts": 0, "missing_episodes": 0}
+    if mapping_path.exists():
+        try:
+            mapping_payload = json.loads(mapping_path.read_text())
+        except json.JSONDecodeError:
+            mapping_payload = {}
+            violations.append("Vector index mapping JSON is invalid.")
+        if isinstance(mapping_payload, dict):
+            items = list(mapping_payload.values())
+            vector_report["mapping_entries"] = len(items)
+            fact_ids = [item.get("item_id") for item in items if item.get("item_type") == "fact"]
+            episode_ids = [item.get("item_id") for item in items if item.get("item_type") == "episode"]
+            facts_found = {row["id"] for row in db.fetch_facts_by_ids([fid for fid in fact_ids if fid])}
+            episodes_found = {row["id"] for row in db.fetch_episodes_by_ids([eid for eid in episode_ids if eid])}
+            vector_report["missing_facts"] = len([fid for fid in fact_ids if fid and fid not in facts_found])
+            vector_report["missing_episodes"] = len([eid for eid in episode_ids if eid and eid not in episodes_found])
+    else:
+        vector_report["mapping_entries"] = 0
     report = {
         "violations": violations,
         "staged_items": staged_count,
+        "staged_items_by_status": staged_by_status,
         "oldest_pending_staged_item": dict(oldest) if oldest else None,
+        "vector_index": vector_report,
     }
     typer.echo(json.dumps(report, indent=2))
     if violations:
@@ -1398,6 +1591,11 @@ def setup() -> None:
         raise typer.Exit(code=1)
     if provider == "openai":
         base_url = typer.prompt("LLM base URL", default="http://localhost:8000/v1")
+        catalog_models = list_catalog_models()
+        if catalog_models:
+            typer.echo("Catalog models:")
+            for name in catalog_models[:10]:
+                typer.echo(f"  - {name}")
         default_model = "llama3" if _is_local_base_url(base_url) else "gpt-4o-mini"
         model = typer.prompt("LLM model", default=default_model)
     else:
@@ -1418,6 +1616,8 @@ def setup() -> None:
             api_key = typer.prompt("OpenAI API key", hide_input=True)
     else:
         _prompt_ollama_download(model)
+    if not _validate_provider_connectivity(provider, base_url, api_key):
+        typer.echo("Warning: could not validate LLM connectivity. Check base URL or API key.")
 
     embed_provider = typer.prompt("Embedding provider (openai/ollama)", default=provider)
     if embed_provider not in {"openai", "ollama"}:
@@ -1431,6 +1631,9 @@ def setup() -> None:
         embed_default_model = (
             "nomic-embed-text" if _is_local_base_url(embed_base_url) else "text-embedding-3-small"
         )
+        typer.echo("Embedding models (catalog):")
+        for name in list_catalog_models()[:10]:
+            typer.echo(f"  - {name}")
         embed_model = typer.prompt("Embedding model", default=embed_default_model)
     else:
         embed_model = _prompt_ollama_model("Embedding model", default="nomic-embed-text")
@@ -1453,6 +1656,8 @@ def setup() -> None:
             embed_api_key = typer.prompt("OpenAI API key for embeddings", hide_input=True)
     else:
         _prompt_ollama_download(embed_model)
+    if not _validate_provider_connectivity(embed_provider, embed_base_url, embed_api_key):
+        typer.echo("Warning: could not validate embedding connectivity. Check base URL or API key.")
     embed_dim = typer.prompt("Embedding dimension", default="1536")
     typer.echo(
         "File access is scoped by tools.fs_root (default: your user profile). "

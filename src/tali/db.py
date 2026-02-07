@@ -126,6 +126,7 @@ CREATE TABLE IF NOT EXISTS runs (
   created_at DATETIME NOT NULL,
   status TEXT NOT NULL,
   user_prompt TEXT NOT NULL,
+  run_summary TEXT,
   current_task_id TEXT,
   last_error TEXT
 );
@@ -242,6 +243,13 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+            self._ensure_run_summary_column(connection)
+
+    def _ensure_run_summary_column(self, connection: sqlite3.Connection) -> None:
+        cursor = connection.execute("PRAGMA table_info(runs)")
+        columns = {row["name"] for row in cursor.fetchall()}
+        if "run_summary" not in columns:
+            connection.execute("ALTER TABLE runs ADD COLUMN run_summary TEXT")
 
     def insert_episode(
         self,
@@ -463,6 +471,30 @@ class Database:
             )
             return cursor.fetchall()
 
+    def upsert_preference(
+        self,
+        key: str,
+        value: str,
+        confidence: float,
+        provenance_type: str,
+        source_ref: str,
+        updated_at: str,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO preferences (key, value, confidence, provenance_type, source_ref, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                  value = excluded.value,
+                  confidence = excluded.confidence,
+                  provenance_type = excluded.provenance_type,
+                  source_ref = excluded.source_ref,
+                  updated_at = excluded.updated_at
+                """,
+                (key, value, confidence, provenance_type, source_ref, updated_at),
+            )
+
     def fetch_recent_episodes(self, limit: int) -> list[sqlite3.Row]:
         with self.connect() as connection:
             cursor = connection.execute(
@@ -472,6 +504,16 @@ class Database:
                 LIMIT ?
                 """,
                 (limit,),
+            )
+            return cursor.fetchall()
+
+    def list_episodes(self) -> list[sqlite3.Row]:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                SELECT * FROM episodes
+                ORDER BY timestamp DESC
+                """
             )
             return cursor.fetchall()
 
@@ -641,6 +683,30 @@ class Database:
                 (skill_id, name, trigger, steps, created_at, source_ref),
             )
 
+    def increment_skill_success(self, name: str) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE skills
+                SET success_count = success_count + 1,
+                    last_used = ?
+                WHERE name = ?
+                """,
+                (datetime.utcnow().isoformat(), name),
+            )
+
+    def increment_skill_failure(self, name: str) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE skills
+                SET failure_count = failure_count + 1,
+                    last_used = ?
+                WHERE name = ?
+                """,
+                (datetime.utcnow().isoformat(), name),
+            )
+
     def fetch_skill_by_name(self, name: str) -> sqlite3.Row | None:
         with self.connect() as connection:
             cursor = connection.execute(
@@ -738,6 +804,17 @@ class Database:
             row = cursor.fetchone()
             return int(row["count"]) if row else 0
 
+    def count_staged_items_by_status(self) -> dict[str, int]:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                SELECT status, COUNT(*) as count
+                FROM staged_items
+                GROUP BY status
+                """
+            )
+            return {row["status"]: int(row["count"]) for row in cursor.fetchall()}
+
     def oldest_pending_staged_item(self) -> sqlite3.Row | None:
         with self.connect() as connection:
             cursor = connection.execute(
@@ -807,16 +884,17 @@ class Database:
         created_at: str,
         status: str,
         user_prompt: str,
+        run_summary: str | None = None,
         current_task_id: str | None = None,
         last_error: str | None = None,
     ) -> None:
         with self.connect() as connection:
             connection.execute(
                 """
-                INSERT INTO runs (id, created_at, status, user_prompt, current_task_id, last_error)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO runs (id, created_at, status, user_prompt, run_summary, current_task_id, last_error)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (run_id, created_at, status, user_prompt, current_task_id, last_error),
+                (run_id, created_at, status, user_prompt, run_summary, current_task_id, last_error),
             )
 
     def update_run_status(
@@ -836,6 +914,17 @@ class Database:
                 (status, current_task_id, last_error, run_id),
             )
 
+    def update_run_summary(self, run_id: str, run_summary: str) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE runs
+                SET run_summary = ?
+                WHERE id = ?
+                """,
+                (run_summary, run_id),
+            )
+
     def fetch_run(self, run_id: str) -> sqlite3.Row | None:
         with self.connect() as connection:
             cursor = connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,))
@@ -852,6 +941,18 @@ class Database:
                 """
             )
             return cursor.fetchone()
+
+    def list_runs(self, limit: int = 20) -> list[sqlite3.Row]:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                SELECT * FROM runs
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            return cursor.fetchall()
 
     def insert_task(
         self,
@@ -959,6 +1060,20 @@ class Database:
                 """,
                 (event_id, task_id, timestamp, event_type, payload),
             )
+
+    def fetch_task_events_for_run(self, run_id: str) -> list[sqlite3.Row]:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                SELECT task_events.*
+                FROM task_events
+                JOIN tasks ON tasks.id = task_events.task_id
+                WHERE tasks.run_id = ?
+                ORDER BY task_events.timestamp ASC
+                """,
+                (run_id,),
+            )
+            return cursor.fetchall()
 
     def insert_user_question(
         self,

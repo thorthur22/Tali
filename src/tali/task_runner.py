@@ -11,7 +11,11 @@ from tali.guardrails import Guardrails
 from tali.hooks.core import HookManager
 from tali.a2a import A2AClient
 from tali.llm import LLMClient
+from tali.models import ProvenanceType
+from tali.memory_ingest import stage_tool_result_fact
 from tali.retrieval import Retriever
+from tali.prompting import format_retrieval_context
+from tali.preferences import extract_preferences
 from tali.tasking import (
     ActionPlan,
     TaskSpec,
@@ -42,6 +46,9 @@ class TaskRunnerResult:
     tool_records: list[ToolRecord]
     tool_results: list[ToolResult]
     run_id: str | None
+    llm_calls: int
+    steps: int
+    tool_calls: int
 
 
 class TaskRunner:
@@ -78,6 +85,8 @@ class TaskRunner:
         show_plans: bool = False,
     ) -> TaskRunnerResult:
         retrieval_context = self.retriever.retrieve(user_input)
+        memory_context = format_retrieval_context(retrieval_context.bundle)
+        skill_context = self._build_skill_context(list(retrieval_context.bundle.skills))
         active_run = self.db.fetch_active_run()
         tool_records: list[ToolRecord] = []
         tool_results: list[ToolResult] = []
@@ -117,7 +126,9 @@ class TaskRunner:
                 current_task_id=None,
                 last_error=None,
             )
-            tasks, error = self._decompose_and_persist(run_id, user_input)
+            tasks, error = self._decompose_and_persist(
+                run_id, user_input, memory_context
+            )
             llm_calls += 1
             if error or not tasks:
                 self.db.update_run_status(run_id, status="blocked", last_error=error or "decomposition_failed")
@@ -130,7 +141,13 @@ class TaskRunner:
                     question = "I couldn't break this into tasks. Could you rephrase or clarify the request?"
                 guarded = self.guardrails.enforce(question, retrieval_context.bundle)
                 return TaskRunnerResult(
-                    message=guarded.safe_output, tool_records=[], tool_results=[], run_id=run_id
+                    message=guarded.safe_output,
+                    tool_records=[],
+                    tool_results=[],
+                    run_id=run_id,
+                    llm_calls=llm_calls,
+                    steps=steps,
+                    tool_calls=0,
                 )
             if show_plans:
                 messages.append(self._format_plan(tasks))
@@ -146,7 +163,13 @@ class TaskRunner:
             self.db.update_run_status(run_id, status="failed", last_error="no_tasks")
             guarded = self.guardrails.enforce(message, retrieval_context.bundle)
             return TaskRunnerResult(
-                message=guarded.safe_output, tool_records=[], tool_results=[], run_id=run_id
+                message=guarded.safe_output,
+                tool_records=[],
+                tool_results=[],
+                run_id=run_id,
+                llm_calls=llm_calls,
+                steps=steps,
+                tool_calls=0,
             )
 
         tasks_by_ordinal = {int(row["ordinal"]): row for row in tasks_rows}
@@ -169,6 +192,9 @@ class TaskRunner:
                         tool_records=tool_records,
                         tool_results=tool_results,
                         run_id=run_id,
+                        llm_calls=llm_calls,
+                        steps=steps,
+                        tool_calls=len(tool_results),
                     )
                 self.db.update_run_status(run_id, status="failed", last_error="no_eligible_tasks")
                 run_id = str(uuid.uuid4())
@@ -180,7 +206,9 @@ class TaskRunner:
                     current_task_id=None,
                     last_error=None,
                 )
-                tasks, error = self._decompose_and_persist(run_id, user_input)
+                tasks, error = self._decompose_and_persist(
+                    run_id, user_input, memory_context
+                )
                 llm_calls += 1
                 if error or not tasks:
                     self.db.update_run_status(
@@ -194,12 +222,23 @@ class TaskRunner:
                     )
                     guarded = self.guardrails.enforce(question, retrieval_context.bundle)
                     return TaskRunnerResult(
-                        message=guarded.safe_output, tool_records=[], tool_results=[], run_id=run_id
+                        message=guarded.safe_output,
+                        tool_records=[],
+                        tool_results=[],
+                        run_id=run_id,
+                        llm_calls=llm_calls,
+                        steps=steps,
+                        tool_calls=0,
                     )
                 if show_plans:
                     messages.append(self._format_plan(tasks))
                 tasks_rows = self.db.fetch_tasks_for_run(run_id)
-                tasks_by_ordinal = {int(row["ordinal"]): row for row in tasks_rows}
+        tasks_by_ordinal = {int(row["ordinal"]): row for row in tasks_rows}
+        if self._apply_user_preferences(run_id, user_input):
+            retrieval_context = self.retriever.retrieve(user_input)
+            memory_context = format_retrieval_context(retrieval_context.bundle)
+            skill_context = self._build_skill_context(list(retrieval_context.bundle.skills))
+        run_summary = self._refresh_run_summary(run_id, tasks_rows)
         completed_this_turn = 0
         while (
             completed_this_turn < self.settings.max_tasks_per_turn
@@ -214,6 +253,9 @@ class TaskRunner:
                 task_row=next_task,
                 user_prompt=str(self.db.fetch_run(run_id)["user_prompt"]),
                 prompt_fn=prompt_fn,
+                memory_context=memory_context,
+                run_summary=run_summary,
+                skill_context=skill_context,
                 llm_calls_remaining=self.settings.max_total_llm_calls_per_run_per_turn - llm_calls,
                 steps_remaining=self.settings.max_total_steps_per_turn - steps,
             )
@@ -229,12 +271,14 @@ class TaskRunner:
             completed_this_turn += 1
             tasks_rows = self.db.fetch_tasks_for_run(run_id)
             tasks_by_ordinal = {int(row["ordinal"]): row for row in tasks_rows}
+            run_summary = self._refresh_run_summary(run_id, tasks_rows)
 
         if self._all_tasks_complete(tasks_rows):
             review_message, review_llm_calls, review_steps = self._completion_review(
                 run_id=run_id,
                 user_prompt=str(self.db.fetch_run(run_id)["user_prompt"]),
                 tasks_rows=tasks_rows,
+                memory_context=memory_context,
             )
             llm_calls += review_llm_calls
             steps += review_steps
@@ -247,20 +291,29 @@ class TaskRunner:
         final_message = "\n\n".join(msg for msg in messages if msg.strip())
         if not final_message:
             final_message = "Working on it."
+        self._refresh_run_summary(run_id, tasks_rows)
         guarded = self.guardrails.enforce(final_message, retrieval_context.bundle)
         return TaskRunnerResult(
             message=guarded.safe_output,
             tool_records=tool_records,
             tool_results=tool_results,
             run_id=run_id,
+            llm_calls=llm_calls,
+            steps=steps,
+            tool_calls=len(tool_results),
         )
 
     def _decompose_and_persist(
-        self, run_id: str, user_prompt: str
+        self,
+        run_id: str,
+        user_prompt: str,
+        memory_context: str,
     ) -> tuple[list[TaskSpec] | None, str | None]:
         if self.status_fn:
             self.status_fn("Decomposing request into tasks")
-        prompt = build_decomposition_prompt(user_prompt, self.tool_descriptions, self.agent_context)
+        prompt = build_decomposition_prompt(
+            user_prompt, self.tool_descriptions, self.agent_context, memory_context
+        )
         try:
             response = self.llm.generate(prompt)
         except Exception as exc:  # noqa: BLE001
@@ -298,6 +351,138 @@ class TaskRunner:
         lines = ["Here’s what I’ll do:"]
         for idx, task in enumerate(tasks, start=1):
             lines.append(f"{idx}) {task.title}")
+        return "\n".join(lines)
+
+    def _apply_user_preferences(self, run_id: str, user_input: str) -> bool:
+        candidates = extract_preferences(user_input)
+        if not candidates:
+            return False
+        now = datetime.utcnow().isoformat()
+        for candidate in candidates:
+            self.db.upsert_preference(
+                key=candidate.key,
+                value=candidate.value,
+                confidence=candidate.confidence,
+                provenance_type=ProvenanceType.USER_REPORTED.value,
+                source_ref=f"run:{run_id}",
+                updated_at=now,
+            )
+        return True
+
+    def _build_skill_context(self, skill_names: list[str]) -> str:
+        if not skill_names:
+            return "- None"
+        lines: list[str] = []
+        for name in skill_names:
+            row = self.db.fetch_skill_by_name(name)
+            if not row:
+                continue
+            steps_raw = row["steps"] or "[]"
+            try:
+                steps = json.loads(steps_raw)
+            except json.JSONDecodeError:
+                steps = [steps_raw]
+            steps_text = ", ".join(step for step in steps if isinstance(step, str)) or "(no steps)"
+            lines.append(
+                f"- {row['name']} (trigger={row['trigger']}, success={row['success_count']}, "
+                f"failure={row['failure_count']}): {steps_text}"
+            )
+        return "\n".join(lines) if lines else "- None"
+
+    def _append_skill_use(self, existing: str | None, skill_name: str, steps: list[str]) -> str:
+        base: dict[str, Any] = {}
+        if existing:
+            try:
+                base = json.loads(existing)
+            except json.JSONDecodeError:
+                base = {}
+        skills_used = base.get("skills_used")
+        if not isinstance(skills_used, list):
+            skills_used = []
+        if not any(entry.get("name") == skill_name for entry in skills_used if isinstance(entry, dict)):
+            skills_used.append(
+                {
+                    "name": skill_name,
+                    "steps": steps,
+                    "used_at": datetime.utcnow().isoformat(),
+                }
+            )
+        base["skills_used"] = skills_used
+        return json.dumps(base)
+
+    def _apply_skill_outcome(self, outputs_json: str | None, outcome: str) -> None:
+        if not outputs_json:
+            return
+        try:
+            payload = json.loads(outputs_json)
+        except json.JSONDecodeError:
+            return
+        skills_used = payload.get("skills_used")
+        if not isinstance(skills_used, list):
+            return
+        for entry in skills_used:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name")
+            if not isinstance(name, str) or not name.strip():
+                continue
+            if outcome == "success":
+                self.db.increment_skill_success(name)
+            elif outcome == "failure":
+                self.db.increment_skill_failure(name)
+
+    def _refresh_run_summary(self, run_id: str, tasks_rows: list[Any]) -> str:
+        run_row = self.db.fetch_run(run_id)
+        if not run_row:
+            return ""
+        summary = self._build_run_summary(run_row, tasks_rows)
+        self.db.update_run_summary(run_id, summary)
+        return summary
+
+    def _build_run_summary(self, run_row: Any, tasks_rows: list[Any]) -> str:
+        total = len(tasks_rows)
+        counts = {
+            "done": 0,
+            "active": 0,
+            "pending": 0,
+            "blocked": 0,
+            "failed": 0,
+            "skipped": 0,
+        }
+        current_task_title = None
+        current_task_id = run_row["current_task_id"]
+        blocked_questions: list[str] = []
+        for row in tasks_rows:
+            status = row["status"]
+            if status in counts:
+                counts[status] += 1
+            if current_task_id and str(row["id"]) == str(current_task_id):
+                current_task_title = row["title"]
+            outputs_json = row["outputs_json"]
+            if row["status"] == "blocked" and outputs_json and len(blocked_questions) < 2:
+                try:
+                    payload = json.loads(outputs_json)
+                except json.JSONDecodeError:
+                    payload = {}
+                question = payload.get("blocked_question")
+                if isinstance(question, str) and question.strip():
+                    blocked_questions.append(question.strip())
+        lines = [f"Goal: {run_row['user_prompt']}"]
+        lines.append(
+            "Status: "
+            f"done {counts['done']}/{total}; "
+            f"active {counts['active']}; "
+            f"pending {counts['pending']}; "
+            f"blocked {counts['blocked']}; "
+            f"failed {counts['failed']}; "
+            f"skipped {counts['skipped']}"
+        )
+        if current_task_title:
+            lines.append(f"Current task: {current_task_title}")
+        if blocked_questions:
+            lines.append("Blocked questions: " + " | ".join(blocked_questions))
+        if run_row["last_error"]:
+            lines.append(f"Last error: {run_row['last_error']}")
         return "\n".join(lines)
 
     def _select_next_task(
@@ -357,6 +542,9 @@ class TaskRunner:
         task_row: Any,
         user_prompt: str,
         prompt_fn: Callable[[str], str],
+        memory_context: str,
+        run_summary: str | None,
+        skill_context: str | None,
         llm_calls_remaining: int,
         steps_remaining: int,
     ) -> "TaskExecutionResult":
@@ -378,6 +566,8 @@ class TaskRunner:
         tool_calls = 0
         store_output_repeats = 0
         repeated_tool_signatures: dict[str, int] = {}
+        stuck_replans = 0
+        stuck_context: str | None = None
         tool_records: list[ToolRecord] = []
         tool_results: list[ToolResult] = []
         user_message: str | None = None
@@ -390,8 +580,17 @@ class TaskRunner:
             and steps < steps_remaining
         ):
             steps += 1
-            plan = self._next_action_plan(user_prompt, task_row, tool_results)
+            plan = self._next_action_plan(
+                user_prompt,
+                task_row,
+                tool_results,
+                memory_context,
+                run_summary,
+                stuck_context,
+                skill_context,
+            )
             llm_calls += 1
+            stuck_context = None
             if plan is None:
                 self._log_task_event(task_id, "fail", {"reason": "action_plan_invalid"})
                 self.db.update_task_status(task_id, status="failed", outputs_json=task_row["outputs_json"], updated_at=datetime.utcnow().isoformat())
@@ -416,6 +615,7 @@ class TaskRunner:
                         block_reason=plan.block_reason,
                         delegate_to=plan.delegate_to,
                         delegate_task=plan.delegate_task,
+                        skill_name=plan.skill_name,
                     )
                 if not plan.tool_name or (plan.tool_args is None and plan.tool_name != "fs.list"):
                     self._log_task_event(task_id, "fail", {"reason": "tool_call_missing_fields"})
@@ -441,13 +641,27 @@ class TaskRunner:
                             block_reason=plan.block_reason,
                             delegate_to=plan.delegate_to,
                             delegate_task=plan.delegate_task,
+                            skill_name=plan.skill_name,
                         )
                 signature = json.dumps(
                     {"name": plan.tool_name, "args": plan.tool_args or {}},
                     sort_keys=True,
                 )
                 repeated_tool_signatures[signature] = repeated_tool_signatures.get(signature, 0) + 1
-                if repeated_tool_signatures[signature] > 3:
+                if repeated_tool_signatures[signature] > 2:
+                    if stuck_replans < 2:
+                        stuck_replans += 1
+                        stuck_context = (
+                            "Repeated tool call detected. "
+                            f"signature={signature} count={repeated_tool_signatures[signature]}. "
+                            "Propose a different strategy or tool before asking the user."
+                        )
+                        self._log_task_event(
+                            task_id,
+                            "note",
+                            {"reason": "stuck_replan", "signature": signature},
+                        )
+                        continue
                     question = (
                         "I'm repeating the same tool call without making progress. "
                         "Can you confirm the correct path or give more details?"
@@ -516,6 +730,59 @@ class TaskRunner:
                                 "summary": result.result_summary,
                             },
                         )
+                    stage_tool_result_fact(self.db, result)
+                continue
+            if action == "execute_skill":
+                if not plan.skill_name:
+                    self._log_task_event(task_id, "fail", {"reason": "skill_missing_name"})
+                    self.db.update_task_status(
+                        task_id,
+                        status="failed",
+                        outputs_json=task_row["outputs_json"],
+                        updated_at=datetime.utcnow().isoformat(),
+                    )
+                    return TaskExecutionResult(
+                        llm_calls=llm_calls,
+                        steps=steps,
+                        tool_records=tool_records,
+                        tool_results=tool_results,
+                        user_message="Skill execution failed: missing skill name.",
+                        blocked=False,
+                    )
+                skill_row = self.db.fetch_skill_by_name(plan.skill_name)
+                if not skill_row:
+                    self._log_task_event(task_id, "fail", {"reason": "skill_not_found"})
+                    self.db.update_task_status(
+                        task_id,
+                        status="failed",
+                        outputs_json=task_row["outputs_json"],
+                        updated_at=datetime.utcnow().isoformat(),
+                    )
+                    return TaskExecutionResult(
+                        llm_calls=llm_calls,
+                        steps=steps,
+                        tool_records=tool_records,
+                        tool_results=tool_results,
+                        user_message=f"Skill not found: {plan.skill_name}.",
+                        blocked=False,
+                    )
+                try:
+                    steps_list = json.loads(skill_row["steps"] or "[]")
+                except json.JSONDecodeError:
+                    steps_list = [skill_row["steps"]]
+                steps_list = [step for step in steps_list if isinstance(step, str)]
+                updated_outputs = self._append_skill_use(
+                    task_row["outputs_json"], plan.skill_name, steps_list
+                )
+                now = datetime.utcnow().isoformat()
+                self.db.update_task_outputs(task_id, outputs_json=updated_outputs, updated_at=now)
+                task_row = dict(task_row)
+                task_row["outputs_json"] = updated_outputs
+                self._log_task_event(
+                    task_id,
+                    "note",
+                    {"skill": plan.skill_name, "steps": steps_list},
+                )
                 continue
             if action == "delegate":
                 if not self.a2a_client or not plan.delegate_task:
@@ -671,6 +938,7 @@ class TaskRunner:
                     outputs_json=task_row["outputs_json"],
                     updated_at=now,
                 )
+                self._apply_skill_outcome(task_row["outputs_json"], "success")
                 if self.hook_manager:
                     self.hook_manager.run(
                         "on_task_end",
@@ -735,6 +1003,7 @@ class TaskRunner:
                 now = datetime.utcnow().isoformat()
                 self.db.update_task_status(task_id, status="done", outputs_json=updated_outputs, updated_at=now)
                 self._log_task_event(task_id, "complete", {"outputs_json": plan.outputs_json or {}})
+                self._apply_skill_outcome(updated_outputs, "success")
                 if self.hook_manager:
                     self.hook_manager.run(
                         "on_task_end",
@@ -753,6 +1022,7 @@ class TaskRunner:
                     self.status_fn("Failing task per plan")
                 self.db.update_task_status(task_id, status="failed", outputs_json=task_row["outputs_json"], updated_at=datetime.utcnow().isoformat())
                 self._log_task_event(task_id, "fail", {"reason": plan.block_reason or "failed"})
+                self._apply_skill_outcome(task_row["outputs_json"], "failure")
                 if self.hook_manager:
                     self.hook_manager.run(
                         "on_task_end",
@@ -792,6 +1062,10 @@ class TaskRunner:
         user_prompt: str,
         task_row: Any,
         tool_results: list[ToolResult],
+        memory_context: str,
+        run_summary: str | None,
+        stuck_context: str | None,
+        skill_context: str | None,
     ) -> ActionPlan | None:
         summaries = []
         for result in tool_results[-5:]:
@@ -817,6 +1091,10 @@ class TaskRunner:
             recent_tool_summaries=summaries,
             recent_tool_outputs=outputs,
             agent_context=self.agent_context,
+            memory_context=memory_context,
+            run_summary=run_summary,
+            stuck_context=stuck_context,
+            skill_context=skill_context,
         )
         if self.status_fn:
             self.status_fn("Planning next action")
@@ -890,7 +1168,7 @@ class TaskRunner:
         return True
 
     def _completion_review(
-        self, run_id: str, user_prompt: str, tasks_rows: list[Any]
+        self, run_id: str, user_prompt: str, tasks_rows: list[Any], memory_context: str
     ) -> tuple[str | None, int, int]:
         summaries: list[dict[str, Any]] = []
         for row in tasks_rows:
@@ -902,7 +1180,7 @@ class TaskRunner:
                     "outputs_json": row["outputs_json"],
                 }
             )
-        prompt = build_completion_review_prompt(user_prompt, summaries)
+        prompt = build_completion_review_prompt(user_prompt, summaries, memory_context)
         try:
             response = self.llm.generate(prompt)
         except Exception as exc:  # noqa: BLE001

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from tali.models import RetrievalBundle
+from tali.prompting import format_retrieval_context
 
 
 @dataclass(frozen=True)
@@ -126,40 +127,7 @@ def format_tool_results(tool_results: list[ToolResult]) -> str:
 def build_phase1_prompt(bundle: RetrievalBundle, user_input: str, tool_descriptions: str) -> str:
     parts: list[str] = []
     parts.append("System rules: Do not claim memory without citation. Ask if unsure. No recursion.")
-    parts.append("\n[Active Commitments]")
-    if bundle.commitments:
-        for commitment in bundle.commitments:
-            parts.append(f"- ({commitment.status}) {commitment.description}")
-    else:
-        parts.append("- None")
-    parts.append("\n[Relevant Facts]")
-    if bundle.facts:
-        for fact in bundle.facts:
-            parts.append(
-                f"- {fact.statement} (id={fact.id}, provenance={fact.provenance_type.value}, confidence={fact.confidence:.2f})"
-            )
-    else:
-        parts.append("- None")
-    parts.append("\n[Recent Episodes]")
-    if bundle.episodes:
-        for episode in bundle.episodes:
-            parts.append(f"- {episode.timestamp}: {episode.user_input} -> {episode.agent_output}")
-    else:
-        parts.append("- None")
-    parts.append("\n[Preferences]")
-    if bundle.preferences:
-        for pref in bundle.preferences:
-            parts.append(
-                f"- {pref.key} = {pref.value} (provenance={pref.provenance_type.value}, confidence={pref.confidence:.2f})"
-            )
-    else:
-        parts.append("- None")
-    parts.append("\n[Skills]")
-    if bundle.skills:
-        for skill in bundle.skills:
-            parts.append(f"- {skill}")
-    else:
-        parts.append("- None")
+    parts.append(format_retrieval_context(bundle))
     parts.append("\nUser:")
     parts.append(user_input)
     parts.append("\n[Tool Planning]")
@@ -180,40 +148,7 @@ def build_phase2_prompt(
     if raw_tool_results:
         parts.append("\n[Tool Outputs]")
         parts.append(raw_tool_results)
-    parts.append("\n[Active Commitments]")
-    if bundle.commitments:
-        for commitment in bundle.commitments:
-            parts.append(f"- ({commitment.status}) {commitment.description}")
-    else:
-        parts.append("- None")
-    parts.append("\n[Relevant Facts]")
-    if bundle.facts:
-        for fact in bundle.facts:
-            parts.append(
-                f"- {fact.statement} (id={fact.id}, provenance={fact.provenance_type.value}, confidence={fact.confidence:.2f})"
-            )
-    else:
-        parts.append("- None")
-    parts.append("\n[Recent Episodes]")
-    if bundle.episodes:
-        for episode in bundle.episodes:
-            parts.append(f"- {episode.timestamp}: {episode.user_input} -> {episode.agent_output}")
-    else:
-        parts.append("- None")
-    parts.append("\n[Preferences]")
-    if bundle.preferences:
-        for pref in bundle.preferences:
-            parts.append(
-                f"- {pref.key} = {pref.value} (provenance={pref.provenance_type.value}, confidence={pref.confidence:.2f})"
-            )
-    else:
-        parts.append("- None")
-    parts.append("\n[Skills]")
-    if bundle.skills:
-        for skill in bundle.skills:
-            parts.append(f"- {skill}")
-    else:
-        parts.append("- None")
+    parts.append(format_retrieval_context(bundle))
     parts.append("\nUser:")
     parts.append(user_input)
     return "\n".join(parts)

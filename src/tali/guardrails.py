@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 
 from tali.config import GuardrailConfig
 from tali.models import RetrievalBundle
@@ -22,17 +23,60 @@ class Guardrails:
         if not safe_output:
             safe_output = "I don't have a response yet."
             flags.append("empty_output")
-        if self._claims_memory(safe_output, bundle):
-            safe_output = (
-                "I don't have verified memory for that yet. "
-                "If you want it stored, please provide a source so it can be added safely."
-            )
-            flags.append("unverified_memory_claim")
+        citations = self._extract_citations(safe_output)
+        invalid = self._invalid_citations(citations, bundle)
+        memory_signal = self._contains_memory_signal(safe_output) or bool(citations)
+        if memory_signal:
+            if not citations:
+                safe_output = (
+                    "I don't have verified memory citations for that yet. "
+                    "If you want it stored, please provide a source so it can be added safely."
+                )
+                flags.append("missing_memory_citation")
+            elif invalid:
+                safe_output = (
+                    "I couldn't validate the memory citations used. "
+                    "Please provide a source or confirm the details."
+                )
+                flags.append("invalid_memory_citation")
         return GuardrailResult(safe_output=safe_output, flags=flags)
 
-    def _claims_memory(self, output: str, bundle: RetrievalBundle) -> bool:
+    def _contains_memory_signal(self, output: str) -> bool:
         lowered = output.lower()
-        if "as we discussed" in lowered or "you told me" in lowered:
-            return True
-        known_ids = {fact.id for fact in bundle.facts}
-        return any(fact_id in output for fact_id in known_ids)
+        return any(
+            phrase in lowered
+            for phrase in (
+                "as we discussed",
+                "you told me",
+                "as noted before",
+                "earlier you said",
+                "previously you said",
+                "remember",
+            )
+        )
+
+    def _extract_citations(self, output: str) -> list[tuple[str, str]]:
+        pattern = re.compile(r"\[(fact|commitment|preference|episode|skill):([^\]]+)\]")
+        return [(match.group(1), match.group(2).strip()) for match in pattern.finditer(output)]
+
+    def _invalid_citations(
+        self, citations: list[tuple[str, str]], bundle: RetrievalBundle
+    ) -> list[tuple[str, str]]:
+        fact_ids = {fact.id for fact in bundle.facts}
+        commitment_ids = {commitment.id for commitment in bundle.commitments}
+        preference_keys = {pref.key for pref in bundle.preferences}
+        episode_ids = {episode.id for episode in bundle.episodes}
+        skill_names = set(bundle.skills)
+        invalid: list[tuple[str, str]] = []
+        for kind, value in citations:
+            if kind == "fact" and value not in fact_ids:
+                invalid.append((kind, value))
+            elif kind == "commitment" and value not in commitment_ids:
+                invalid.append((kind, value))
+            elif kind == "preference" and value not in preference_keys:
+                invalid.append((kind, value))
+            elif kind == "episode" and value not in episode_ids:
+                invalid.append((kind, value))
+            elif kind == "skill" and value not in skill_names:
+                invalid.append((kind, value))
+        return invalid

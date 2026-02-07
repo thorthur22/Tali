@@ -47,6 +47,7 @@ class ToolRunner:
         self.approvals = approvals
         self.settings = settings
         self.paths = paths
+        self._cache: dict[str, tuple[str, str]] = {}
 
     def run(
         self, tool_calls: list[ToolCall], prompt_fn: Callable[[str], str]
@@ -119,6 +120,42 @@ class ToolRunner:
                         result_raw="",
                     )
                 )
+                continue
+            cache_key = self._cache_key(call)
+            if cache_key and cache_key in self._cache:
+                summary, raw = self._cache[cache_key]
+                result_ref = f"tool_cache:{call.id}"
+                result_json, result_hash, result_path = self._store_result(call.id, summary, raw)
+                tool_records.append(
+                    ToolRecord(
+                        id=call.id,
+                        name=call.name,
+                        args=call.args,
+                        status="cached",
+                        result_ref=result_ref,
+                        result_summary=summary,
+                        approval_mode="cached",
+                        risk_level=decision.risk_level,
+                        started_at=None,
+                        ended_at=None,
+                        result_json=result_json,
+                        result_hash=result_hash,
+                        result_path=result_path,
+                    )
+                )
+                tool_results.append(
+                    ToolResult(
+                        id=call.id,
+                        name=call.name,
+                        status="ok",
+                        started_at="",
+                        ended_at="",
+                        result_ref=result_ref,
+                        result_summary=f"[cached] {summary}",
+                        result_raw=raw,
+                    )
+                )
+                tool_counts[call.name] = tool_counts.get(call.name, 0) + 1
                 continue
             details = self._format_approval_details(call)
             approval: ApprovalOutcome = self.approvals.resolve(
@@ -209,7 +246,18 @@ class ToolRunner:
                     result_raw=raw,
                 )
             )
+            if status == "ok" and cache_key:
+                self._cache[cache_key] = (summary, raw)
         return tool_results, tool_records
+
+    def _cache_key(self, call: ToolCall) -> str | None:
+        definition = self.registry.get(call.name)
+        if not definition:
+            return None
+        signature = definition.signature(call.args)
+        if not signature:
+            return None
+        return f"{call.name}:{signature}"
 
     def _format_approval_details(self, call: ToolCall) -> str:
         purpose = call.purpose or ""

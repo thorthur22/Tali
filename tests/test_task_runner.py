@@ -17,8 +17,10 @@ class FakeLLM:
     def __init__(self, responses: list[str]) -> None:
         self.responses = responses
         self.calls = 0
+        self.prompts: list[str] = []
 
     def generate(self, prompt: str) -> LLMResponse:
+        self.prompts.append(prompt)
         if self.calls >= len(self.responses):
             raise AssertionError("LLM called more than expected")
         content = self.responses[self.calls]
@@ -179,6 +181,98 @@ class TaskRunnerTests(unittest.TestCase):
         run = self.db.fetch_active_run()
         self.assertIsNotNone(run)
         self.assertEqual(run["status"], "blocked")
+
+    def test_memory_injected_into_prompts(self) -> None:
+        self.db.insert_fact(
+            fact_id="fact-1",
+            statement="Project codename is Atlas",
+            provenance_type="SYSTEM_OBSERVED",
+            source_ref="episode-1",
+            confidence=0.9,
+            created_at="2024-01-01T00:00:00",
+            contested=0,
+        )
+        decomposition = {
+            "tasks": [
+                {
+                    "title": "Do thing",
+                    "description": "Step one.",
+                    "requires_tools": False,
+                    "verification": "Done.",
+                    "dependencies": [],
+                }
+            ]
+        }
+        action_done = {"next_action_type": "mark_done", "outputs_json": {"ok": True}}
+        review = {
+            "overall_status": "complete",
+            "checks": [{"task_ordinal": 0, "status": "ok", "note": ""}],
+            "missing_items": [],
+            "assumptions": [],
+            "user_message": "All set.",
+        }
+        llm = FakeLLM([json.dumps(decomposition), json.dumps(action_done), json.dumps(review)])
+        runner = TaskRunner(
+            db=self.db,
+            llm=llm,
+            retriever=self.retriever,
+            guardrails=self.guardrails,
+            tool_runner=FakeToolRunner(),
+            tool_descriptions="none",
+        )
+        runner.run_turn("Do thing", prompt_fn=lambda _: "")
+        prompt_blob = "\n".join(llm.prompts)
+        self.assertIn("Project codename is Atlas", prompt_blob)
+
+    def test_execute_skill_tracks_success(self) -> None:
+        self.db.insert_skill(
+            skill_id="skill-1",
+            name="TestSkill",
+            trigger="do test",
+            steps=json.dumps(["Step one", "Step two"]),
+            created_at="2024-01-01T00:00:00",
+            source_ref="episode-1",
+        )
+        decomposition = {
+            "tasks": [
+                {
+                    "title": "Use skill",
+                    "description": "Apply skill.",
+                    "requires_tools": False,
+                    "verification": "Done.",
+                    "dependencies": [],
+                }
+            ]
+        }
+        execute_skill = {"next_action_type": "execute_skill", "skill_name": "TestSkill"}
+        action_done = {"next_action_type": "mark_done", "outputs_json": {"ok": True}}
+        review = {
+            "overall_status": "complete",
+            "checks": [{"task_ordinal": 0, "status": "ok", "note": ""}],
+            "missing_items": [],
+            "assumptions": [],
+            "user_message": "All set.",
+        }
+        llm = FakeLLM(
+            [
+                json.dumps(decomposition),
+                json.dumps(execute_skill),
+                json.dumps(action_done),
+                json.dumps(review),
+            ]
+        )
+        runner = TaskRunner(
+            db=self.db,
+            llm=llm,
+            retriever=self.retriever,
+            guardrails=self.guardrails,
+            tool_runner=FakeToolRunner(),
+            tool_descriptions="none",
+        )
+        runner.run_turn("Use skill", prompt_fn=lambda _: "")
+        skill = self.db.fetch_skill_by_name("TestSkill")
+        self.assertIsNotNone(skill)
+        self.assertEqual(skill["success_count"], 1)
 
     def _last_run_id(self) -> str:
         with self.db.connect() as connection:

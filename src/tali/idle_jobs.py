@@ -61,6 +61,14 @@ class IdleJobRunner:
                 llm_calls += job_result.llm_calls
         return IdleJobResult(messages=messages, llm_calls=llm_calls)
 
+    def _has_active_run(self) -> bool:
+        run = self.db.fetch_active_run()
+        return bool(run and run["status"] in {"active", "blocked"})
+
+    def _has_active_commitments(self) -> bool:
+        commitments = self.db.list_commitments()
+        return any(row["status"] in {"pending", "active"} for row in commitments)
+
     def _job_skill_review(self) -> IdleJobResult | None:
         episodes = [row for row in self.db.fetch_recent_episodes(limit=20) if row["quarantine"] == 0]
         skills = self.db.list_skills()
@@ -129,6 +137,8 @@ class IdleJobRunner:
         return IdleJobResult(messages=["Idle: knowledge expansion staged excerpts."], llm_calls=0)
 
     def _job_clarifying_question(self) -> IdleJobResult | None:
+        if self._has_active_run() or self._has_active_commitments():
+            return None
         daily_cutoff = (datetime.utcnow() - timedelta(days=1)).isoformat()
         if self.db.count_user_questions_since(daily_cutoff) >= MAX_QUESTIONS_PER_DAY:
             return None
@@ -148,6 +158,8 @@ class IdleJobRunner:
         return IdleJobResult(messages=["Idle: queued a clarifying question."], llm_calls=0)
 
     def _job_patch_proposal(self) -> IdleJobResult | None:
+        if self._has_active_run() or self._has_active_commitments():
+            return None
         daily_cutoff = (datetime.utcnow() - timedelta(days=1)).isoformat()
         if self.db.count_patch_proposals_since(daily_cutoff) >= MAX_PATCHES_PER_DAY:
             return None

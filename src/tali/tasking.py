@@ -25,6 +25,7 @@ class ActionPlan:
     block_reason: str | None
     delegate_to: str | None
     delegate_task: dict[str, Any] | None
+    skill_name: str | None
 
 
 @dataclass(frozen=True)
@@ -36,7 +37,12 @@ class ReviewResult:
     user_message: str
 
 
-def build_decomposition_prompt(user_prompt: str, tool_descriptions: str, agent_context: str) -> str:
+def build_decomposition_prompt(
+    user_prompt: str,
+    tool_descriptions: str,
+    agent_context: str,
+    memory_context: str,
+) -> str:
     return "\n".join(
         [
             "You are an execution planner. Return STRICT JSON ONLY. No reasoning.",
@@ -48,6 +54,7 @@ def build_decomposition_prompt(user_prompt: str, tool_descriptions: str, agent_c
             "Include dependencies as indexes of earlier tasks.",
             "Do NOT use tools for greetings or small talk.",
             "Set requires_tools=true for any task needing files, shell, web, or python tools.",
+            "Respect preferences from memory context as constraints.",
             "Required JSON schema:",
             "{",
             '  "tasks": [',
@@ -62,6 +69,8 @@ def build_decomposition_prompt(user_prompt: str, tool_descriptions: str, agent_c
             "}",
             "Available tools:",
             tool_descriptions,
+            "Memory context:",
+            memory_context or "- None",
             "Agent context:",
             agent_context,
             "User request:",
@@ -130,6 +139,10 @@ def build_action_plan_prompt(
     recent_tool_summaries: list[str],
     recent_tool_outputs: list[str],
     agent_context: str,
+    memory_context: str,
+    run_summary: str | None,
+    stuck_context: str | None,
+    skill_context: str | None,
 ) -> str:
     parts = [
         "You are the task action planner. Return STRICT JSON ONLY. No reasoning.",
@@ -137,20 +150,23 @@ def build_action_plan_prompt(
         "Do NOT claim you lack tool access; request tools when needed.",
         "Choose the single next action for this task.",
         "Valid next_action_type values:",
-        '"respond", "tool_call", "ask_user", "store_output", "mark_done", "block", "fail", "delegate"',
+        '"respond", "tool_call", "ask_user", "store_output", "mark_done", "block", "fail", "delegate", "execute_skill"',
         "If asking the user, keep it to ONE minimal question.",
         "If using a tool, provide tool_name and tool_args.",
+        "If executing a skill, provide skill_name and use the skill steps to guide actions.",
         "Always include tool_args as an object; use {} when a tool takes no args.",
         "When work requires files, shell, web, or python, choose tool_call.",
         "If storing outputs, provide outputs_json as an object.",
         "Use recent tool outputs to decide next steps; do NOT repeat a tool call if the output already provides the needed info.",
+        "If stuck signals indicate repeated tool calls, pick a different strategy or tool before asking the user.",
+        "If you reference memory in message, cite it with [fact:ID], [commitment:ID], [preference:KEY], or [episode:ID].",
         "For fs.list, omit the path to list fs_root; never pass an empty string path.",
         "Avoid shell.run unless using allowed read-only commands (git status/diff/log, ls/dir, cat/type).",
         "To find the Desktop, prefer fs.list on fs_root and locate 'Desktop'. If no Desktop entry exists, ask the user for a path.",
         "Use the OS info from agent context to avoid OS-specific assumptions.",
         "JSON schema:",
         "{",
-        '  "next_action_type": "respond|tool_call|ask_user|store_output|mark_done|block|fail|delegate",',
+        '  "next_action_type": "respond|tool_call|ask_user|store_output|mark_done|block|fail|delegate|execute_skill",',
         '  "message": "optional user-visible message",',
         '  "tool_name": "optional",',
         '  "tool_args": { ... },',
@@ -158,7 +174,8 @@ def build_action_plan_prompt(
         '  "outputs_json": { ... },',
         '  "block_reason": "optional",',
         '  "delegate_to": "optional agent name",',
-        '  "delegate_task": { "title": "...", "description": "...", "inputs": {...}, "requested_outputs": ["..."] }',
+        '  "delegate_task": { "title": "...", "description": "...", "inputs": {...}, "requested_outputs": ["..."] },',
+        '  "skill_name": "optional skill name"',
         "}",
         "User request:",
         user_prompt,
@@ -173,6 +190,14 @@ def build_action_plan_prompt(
         "\n".join(recent_tool_outputs) if recent_tool_outputs else "- None",
         "Available tools:",
         tool_descriptions,
+        "Memory context:",
+        memory_context or "- None",
+        "Run summary:",
+        run_summary or "- None",
+        "Stuck signals:",
+        stuck_context or "- None",
+        "Skill details:",
+        skill_context or "- None",
         "Agent context:",
         agent_context,
     ]
@@ -202,6 +227,7 @@ def parse_action_plan(text: str) -> tuple[ActionPlan | None, str | None]:
     block_reason = payload.get("block_reason")
     delegate_to = payload.get("delegate_to")
     delegate_task = payload.get("delegate_task")
+    skill_name = payload.get("skill_name")
     if tool_name is not None and not isinstance(tool_name, str):
         return None, "tool_name must be string"
     if tool_args is not None and not isinstance(tool_args, dict):
@@ -216,6 +242,8 @@ def parse_action_plan(text: str) -> tuple[ActionPlan | None, str | None]:
         return None, "delegate_to must be string"
     if delegate_task is not None and not isinstance(delegate_task, dict):
         return None, "delegate_task must be object"
+    if skill_name is not None and not isinstance(skill_name, str):
+        return None, "skill_name must be string"
     return (
         ActionPlan(
             next_action_type=next_action_type,
@@ -227,18 +255,20 @@ def parse_action_plan(text: str) -> tuple[ActionPlan | None, str | None]:
             block_reason=block_reason,
             delegate_to=delegate_to,
             delegate_task=delegate_task,
+            skill_name=skill_name,
         ),
         None,
     )
 
 
 def build_completion_review_prompt(
-    user_prompt: str, task_summaries: list[dict[str, Any]]
+    user_prompt: str, task_summaries: list[dict[str, Any]], memory_context: str
 ) -> str:
     return "\n".join(
         [
             "You are the completion reviewer. Return STRICT JSON ONLY. No reasoning.",
             "Validate whether the tasks fully satisfy the user request.",
+            "If you reference memory in user_message, cite it with [fact:ID], [commitment:ID], [preference:KEY], or [episode:ID].",
             "JSON schema:",
             "{",
             '  "overall_status": "complete|incomplete",',
@@ -247,6 +277,8 @@ def build_completion_review_prompt(
             '  "assumptions": ["..."],',
             '  "user_message": "concise final response to user"',
             "}",
+            "Memory context:",
+            memory_context or "- None",
             "User request:",
             user_prompt,
             "Task summaries:",
