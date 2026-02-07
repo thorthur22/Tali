@@ -56,11 +56,11 @@ class ToolPolicy:
                 signature=None,
             )
         risk_level = risk_override or definition.risk_level
-        requires_approval = risk_level in {"needs_approval", "destructive"} or bool(red_flags)
-        if self._is_destructive(call):
+        requires_approval = False
+        if self._requires_approval(call):
             risk_level = "destructive"
             requires_approval = True
-            red_flags = red_flags + ["destructive"]
+            red_flags = red_flags + ["create_or_delete"]
         if call.name.startswith("fs."):
             fs_error = self._validate_fs_path(call)
             if fs_error:
@@ -82,16 +82,32 @@ class ToolPolicy:
             signature=signature,
         )
 
-    def _is_destructive(self, call: ToolCall) -> bool:
+    def _requires_approval(self, call: ToolCall) -> bool:
+        if call.name == "fs.delete":
+            return True
+        if call.name == "fs.move":
+            return True
         if call.name == "fs.write":
-            return True
-        if call.name == "shell.run":
-            command = str(call.args.get("command", "")).lower()
-            destructive = ["rm", "del", "format", "mkfs", "shutdown", "reboot", "erase", "rmdir", "rd"]
-            return any(word in command for word in destructive)
-        if call.name == "python.eval":
-            return True
+            return self._is_fs_create(call, "path")
+        if call.name == "fs.write_patch":
+            return self._is_fs_create(call, "path")
+        if call.name == "fs.copy":
+            return self._is_fs_create(call, "dest")
         return False
+
+    def _is_fs_create(self, call: ToolCall, key: str) -> bool:
+        root = Path(self.settings.fs_root) if self.settings.fs_root else self.paths.data_dir
+        target = call.args.get(key)
+        if not isinstance(target, str) or not target:
+            return False
+        candidate = Path(target)
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            return True
+        return not resolved.exists()
 
     def _validate_fs_path(self, call: ToolCall) -> str | None:
         root = Path(self.settings.fs_root) if self.settings.fs_root else self.paths.data_dir

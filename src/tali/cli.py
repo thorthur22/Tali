@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import platform
 import subprocess
 import re
@@ -59,6 +60,7 @@ from tali.idle import IdleScheduler
 from tali.knowledge_sources import KnowledgeSourceRegistry, LocalFileSource
 from tali.questions import mark_question_asked, resolve_answered_question, select_question_to_ask
 from tali.patches import apply_patch, reverse_patch, run_patch_tests
+from tali.worktrees import ensure_agent_worktree, resolve_main_repo_root
 from tali.tools.registry import build_default_registry
 from tali.tools.policy import ToolPolicy
 from tali.tools.runner import ToolRunner
@@ -142,9 +144,21 @@ def _init_db(db_path: Path) -> Database:
     return db
 
 
-def _resolve_paths() -> tuple[Paths, AppConfig | None]:
-    root, agent_name, config = resolve_agent(prompt_fn=typer.prompt, allow_create_config=False)
-    paths = load_paths(root, agent_name)
+def _resolve_paths(agent_name: str | None = None) -> tuple[Paths, AppConfig | None]:
+    if agent_name:
+        root = Path.home() / ".tali"
+        agent_home = root / agent_name
+        if not agent_home.exists() or not (agent_home / "config.json").exists():
+            typer.echo(f"Agent not found: {agent_name}")
+            raise typer.Exit(code=1)
+        paths = load_paths(root, agent_name)
+        config_path = agent_home / "config.json"
+        config = load_config(config_path) if config_path.exists() else None
+        return paths, config
+    root, resolved_name, config = resolve_agent(
+        prompt_fn=typer.prompt, allow_create_config=False
+    )
+    paths = load_paths(root, resolved_name)
     return paths, config
 
 
@@ -249,6 +263,66 @@ def _ensure_dependencies() -> None:
         import hnswlib  # noqa: F401
     except ImportError:
         subprocess.run(["python", "-m", "pip", "install", "hnswlib"], check=True)
+    try:
+        import pytest  # noqa: F401
+    except ImportError:
+        subprocess.run(["python", "-m", "pip", "install", "pytest"], check=True)
+
+
+def _ensure_agent_worktree(paths: Paths) -> Path | None:
+    repo_root = resolve_main_repo_root(Path(__file__).resolve())
+    if repo_root is None:
+        return None
+    code_dir, status = ensure_agent_worktree(paths, repo_root)
+    if status.message:
+        typer.echo(status.message)
+    return code_dir
+
+
+def _should_spawn_agent_terminal() -> bool:
+    if os.environ.get("TALI_AGENT_SPAWNED") == "1":
+        return False
+    if os.environ.get("TALI_HEADLESS") == "1":
+        return False
+    return True
+
+
+def _spawn_agent_terminal(agent_name: str, code_dir: Path) -> bool:
+    env = os.environ.copy()
+    env["TALI_AGENT_SPAWNED"] = "1"
+    system = platform.system()
+    if system == "Windows":
+        command = (
+            f'Set-Location -LiteralPath "{code_dir}"; '
+            f'tali agent chat {agent_name}'
+        )
+        subprocess.Popen(
+            ["cmd", "/c", "start", "powershell", "-NoExit", "-Command", command],
+            env=env,
+        )
+        return True
+    if system == "Darwin":
+        command = f'cd "{code_dir}"; tali agent chat {agent_name}'
+        escaped = command.replace('"', '\\"')
+        subprocess.Popen(
+            ["osascript", "-e", f'tell application "Terminal" to do script "{escaped}"'],
+            env=env,
+        )
+        return True
+    shell_command = f'cd "{code_dir}" && tali agent chat "{agent_name}"'
+    for term in ["x-terminal-emulator", "gnome-terminal", "konsole", "xfce4-terminal", "xterm"]:
+        if not shutil.which(term):
+            continue
+        if term in {"gnome-terminal", "x-terminal-emulator", "xterm"}:
+            subprocess.Popen([term, "-e", "bash", "-lc", shell_command], env=env)
+            return True
+        if term == "konsole":
+            subprocess.Popen([term, "-e", "bash", "-lc", shell_command], env=env)
+            return True
+        if term == "xfce4-terminal":
+            subprocess.Popen([term, "-e", f"bash -lc '{shell_command}'"], env=env)
+            return True
+    return False
 
 
 def _is_local_base_url(base_url: str | None) -> bool:
@@ -687,19 +761,30 @@ def create_agent() -> None:
     )
     save_config(paths.config_path, config)
     _ensure_agent_dirs(paths)
+    _ensure_agent_worktree(paths)
     typer.echo(f"Agent created: {paths.agent_home}")
 
 
 @agent_app.command("chat")
 def chat(
-    message: Optional[str] = typer.Argument(None, help="Message to send to the agent."),
+    agent_name: str = typer.Argument(
+        ..., help="Agent name."
+    ),
+    message: Optional[str] = typer.Argument(
+        None, help="Message to send to the agent."
+    ),
     verbose_tools: bool = typer.Option(False, "--verbose-tools", help="Show full tool output."),
     show_plans: bool = typer.Option(False, "--show-plans", help="Show task planning steps."),
 ) -> None:
     """Start a chat loop or run a single turn if message is provided."""
     if isinstance(message, typer.models.ArgumentInfo):
         message = None
-    paths, existing_config = _resolve_paths()
+    paths, existing_config = _resolve_paths(agent_name)
+    code_dir = _ensure_agent_worktree(paths)
+    if message is None and code_dir and _should_spawn_agent_terminal():
+        spawned = _spawn_agent_terminal(paths.agent_name, code_dir)
+        if spawned:
+            return
     _ensure_dependencies()
     config = _load_or_raise_config(paths, existing_config)
     db = _init_db(paths.db_path)
@@ -1635,6 +1720,8 @@ def patches_show(proposal_id: str = typer.Argument(..., help="Patch proposal ID.
 def patches_test(proposal_id: str = typer.Argument(..., help="Patch proposal ID.")) -> None:
     """Run tests for a patch proposal."""
     paths, _ = _resolve_paths()
+    _ensure_dependencies()
+    code_dir = _ensure_agent_worktree(paths)
     db = _init_db(paths.db_path)
     row = db.fetch_patch_proposal(proposal_id)
     if not row:
@@ -1649,7 +1736,8 @@ def patches_test(proposal_id: str = typer.Argument(..., help="Patch proposal ID.
     if not tests:
         typer.echo("No tests specified for this proposal.")
         return
-    results = run_patch_tests(tests, cwd=Path.cwd())
+    repo_hint = Path(__file__).resolve().parent
+    results = run_patch_tests(tests, cwd=code_dir or repo_hint)
     parsed["results"] = results
     db.update_patch_proposal(
         proposal_id=proposal_id,
@@ -1664,6 +1752,7 @@ def patches_test(proposal_id: str = typer.Argument(..., help="Patch proposal ID.
 def patches_apply(proposal_id: str = typer.Argument(..., help="Patch proposal ID.")) -> None:
     """Apply a patch proposal after tests pass."""
     paths, _ = _resolve_paths()
+    code_dir = _ensure_agent_worktree(paths)
     db = _init_db(paths.db_path)
     row = db.fetch_patch_proposal(proposal_id)
     if not row:
@@ -1680,7 +1769,7 @@ def patches_apply(proposal_id: str = typer.Argument(..., help="Patch proposal ID
     if "results" not in parsed:
         typer.echo("Test results missing; run tests first.")
         return
-    error = apply_patch(row["diff_text"], cwd=Path.cwd())
+    error = apply_patch(row["diff_text"], cwd=code_dir or Path.cwd())
     if error:
         db.update_patch_proposal(
             proposal_id=proposal_id,
@@ -1721,6 +1810,7 @@ def patches_reject(proposal_id: str = typer.Argument(..., help="Patch proposal I
 def patches_rollback(proposal_id: str = typer.Argument(..., help="Patch proposal ID.")) -> None:
     """Rollback an applied patch proposal."""
     paths, _ = _resolve_paths()
+    code_dir = _ensure_agent_worktree(paths)
     db = _init_db(paths.db_path)
     row = db.fetch_patch_proposal(proposal_id)
     if not row:
@@ -1729,7 +1819,7 @@ def patches_rollback(proposal_id: str = typer.Argument(..., help="Patch proposal
     if row["status"] != "applied":
         typer.echo("Patch proposal is not applied.")
         return
-    error = reverse_patch(row["diff_text"], cwd=Path.cwd())
+    error = reverse_patch(row["diff_text"], cwd=code_dir or Path.cwd())
     if error:
         typer.echo(error)
         return

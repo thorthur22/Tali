@@ -62,6 +62,10 @@ class Paths:
         return self.agent_home / "patches"
 
     @property
+    def code_dir(self) -> Path:
+        return self.agent_home / "code"
+
+    @property
     def inbox_dir(self) -> Path:
         return self.agent_home / "inbox"
 
@@ -76,15 +80,15 @@ class RetrievalConfig:
     max_episodes: int = 2
     max_preferences: int = 2
     max_commitments: int = 50
-    token_budget: int = 1500
+    token_budget: int = 10_000
     vector_k: int = 12
     vector_sync_min_interval_s: float = 30.0
 
 
 @dataclass(frozen=True)
 class GuardrailConfig:
-    max_replans: int = 1
-    max_critiques: int = 1
+    max_replans: int = 2
+    max_critiques: int = 2
 
 
 LLMProvider = Literal["openai", "ollama"]
@@ -117,20 +121,20 @@ class ToolSettings:
     web_timeout_s: float = 20.0
     web_max_redirects: int = 5
     python_enabled: bool = False
-    python_timeout_s: float = 5.0
-    max_tool_calls_per_turn: int = 3
-    max_tool_seconds: float = 20.0
-    max_calls_per_tool: int = 2
-    tool_result_max_bytes: int = 10000
+    python_timeout_s: float = 30.0
+    max_tool_calls_per_turn: int = 30
+    max_tool_seconds: float = 60.0
+    max_calls_per_tool: int = 100
+    tool_result_max_bytes: int = 1_000_000
 
 
 @dataclass(frozen=True)
 class TaskRunnerConfig:
-    max_tasks_per_turn: int = 5
-    max_llm_calls_per_task: int = 3
-    max_tool_calls_per_task: int = 5
-    max_total_llm_calls_per_run_per_turn: int = 10
-    max_total_steps_per_turn: int = 30
+    max_tasks_per_turn: int = 50
+    max_llm_calls_per_task: int = 30
+    max_tool_calls_per_task: int = 50
+    max_total_llm_calls_per_run_per_turn: int = 100
+    max_total_steps_per_turn: int = 100
 
 
 @dataclass(frozen=True)

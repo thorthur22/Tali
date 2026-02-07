@@ -60,6 +60,24 @@ Each agent has its own home directory:
 Per-agent storage is isolated under `~/.tali/<agent_name>/`. Shared A2A infra
 and registry live under `~/.tali/shared/`.
 
+## Agent code worktrees
+
+Each agent gets its own git worktree copy of the Tali codebase at:
+
+```
+~/.tali/<agent_name>/code
+```
+
+`agent chat <name>` ensures the worktree exists and auto-syncs it from the main
+repo before starting the agent. If a merge conflict happens, the agent is told
+to resolve the conflict in its worktree.
+
+This worktree is the execution context for:
+
+* Patch proposal tests (`patches test <id>`)
+* Patch application/rollback (`patches apply|rollback <id>`)
+* Hooks loaded from `src/tali/hooks/` (from the agent's worktree copy)
+
 ## Sleep consolidation
 
 Sleep runs automatically in chat when thresholds are met (episode count, idle
@@ -107,6 +125,19 @@ Idle jobs (in order):
 Idle jobs can queue clarifying questions. At most one question is asked per
 user turn, and only when relevant or high priority. Answers are staged as
 USER_REPORTED fact candidates (never direct facts).
+
+## Request classification and model routing
+
+Each user turn is scored by a lightweight rule-based classifier that maps the
+request into a tier (SIMPLE, MEDIUM, COMPLEX, REASONING). The tier influences
+how the agent routes work:
+
+* SIMPLE: responder-only for quick replies with no task decomposition.
+* MEDIUM/COMPLEX/REASONING: planner + tool runner for multi-step work.
+
+If a task run is already active, the responder checks whether a new prompt is
+related to that run before continuing it. Unrelated prompts are answered
+directly without canceling the active run.
 
 ## Hooks and safe extensions
 

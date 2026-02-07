@@ -101,7 +101,7 @@ def run_patch_tests(tests: list[str], cwd: Path) -> str:
 
 def _resolve_repo_root(start: Path) -> Path:
     for candidate in (start, *start.parents):
-        if (candidate / ".git").exists():
+        if (candidate / ".git").exists() or (candidate / "pyproject.toml").exists():
             return candidate
     return start
 

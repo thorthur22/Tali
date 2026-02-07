@@ -647,6 +647,7 @@ class TaskRunner:
         store_output_repeats = 0
         repeated_tool_signatures: dict[str, int] = {}
         stuck_replans = 0
+        action_replans = 0
         stuck_context: str | None = None
         tool_records: list[ToolRecord] = []
         tool_results: list[ToolResult] = self._hydrate_task_state(task_row, working_memory)
@@ -684,6 +685,41 @@ class TaskRunner:
                     blocked=False,
                 )
             action = plan.next_action_type
+            requires_tools = bool(task_row.get("requires_tools"))
+            if (
+                action == "respond"
+                and plan.message
+                and self._response_mentions_tool_action(plan.message)
+            ):
+                if action_replans < 2:
+                    action_replans += 1
+                    stuck_context = (
+                        "Planner returned respond but message describes a tool action. "
+                        "Use next_action_type=tool_call and provide tool_name/tool_args."
+                    )
+                    self._log_task_event(
+                        task_id,
+                        "note",
+                        {"reason": "respond_contains_tool_action", "message": plan.message},
+                    )
+                    continue
+            if (
+                action == "respond"
+                and requires_tools
+                and not self._has_successful_tool_result(tool_results)
+            ):
+                if action_replans < 2:
+                    action_replans += 1
+                    stuck_context = (
+                        "Task requires tools but no successful tool results exist yet. "
+                        "Choose tool_call or ask_user to proceed."
+                    )
+                    self._log_task_event(
+                        task_id,
+                        "note",
+                        {"reason": "respond_before_tool_use", "message": plan.message or ""},
+                    )
+                    continue
             if action == "tool_call":
                 if plan.tool_name == "fs.list" and plan.tool_args is None:
                     plan = ActionPlan(
@@ -1314,6 +1350,27 @@ class TaskRunner:
                 base = {}
         base.update(update)
         return json.dumps(base)
+
+    def _response_mentions_tool_action(self, message: str) -> bool:
+        lowered = message.lower()
+        markers = [
+            "action:",
+            "next action:",
+            "run tool",
+            "use tool",
+            "tool call",
+            "tool_call",
+            "run the tool",
+            "execute tool",
+            "execute the tool",
+        ]
+        return any(marker in lowered for marker in markers)
+
+    def _has_successful_tool_result(self, results: list[ToolResult]) -> bool:
+        for result in results:
+            if result.status in {"ok", "cached"}:
+                return True
+        return False
 
     def _is_resume_intent(self, user_input: str) -> bool:
         normalized = user_input.strip().lower()

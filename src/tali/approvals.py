@@ -39,7 +39,7 @@ class ApprovalManager:
             return ApprovalOutcome(approved=False, approval_mode="denied", reason="session denied")
         if signature and signature in self.approved_signatures:
             return ApprovalOutcome(approved=True, approval_mode="auto")
-        if tool_name in self.approved_tools and not requires_approval:
+        if tool_name in self.approved_tools:
             return ApprovalOutcome(approved=True, approval_mode="auto")
         if self.mode == "auto_approve_safe" and not requires_approval:
             return ApprovalOutcome(approved=True, approval_mode="auto")
@@ -77,18 +77,32 @@ class ApprovalManager:
                 ]
             )
             choice = self._prompt(prompt_fn, prompt)
-        if choice in {"a", "approve"}:
+        normalized = choice.strip().lower()
+        if normalized.startswith("approve tool"):
+            normalized = "t"
+        elif normalized.startswith("approve signature") or normalized.startswith(
+            "approve command signature"
+        ):
+            normalized = "s"
+        elif normalized.startswith("approve all safe") or normalized == "approve all":
+            normalized = "y"
+        elif normalized.startswith("deny all"):
+            normalized = "d"
+        elif normalized.startswith("deny once") or normalized in {"no", "n"}:
+            normalized = "n"
+
+        if normalized in {"a", "approve", "approve once"}:
             return ApprovalOutcome(approved=True, approval_mode="prompt")
-        if choice in {"t", "tool"}:
+        if normalized in {"t", "tool"}:
             self.approved_tools.add(tool_name)
             return ApprovalOutcome(approved=True, approval_mode="prompt")
-        if choice in {"s", "sig", "signature"} and signature:
+        if normalized in {"s", "sig", "signature"} and signature:
             self.approved_signatures.add(signature)
             return ApprovalOutcome(approved=True, approval_mode="prompt")
-        if choice in {"y", "all", "auto"}:
+        if normalized in {"y", "all", "auto"}:
             self.mode = "auto_approve_safe"
             return ApprovalOutcome(approved=True, approval_mode="prompt")
-        if choice in {"d", "deny"}:
+        if normalized in {"d", "deny"}:
             self.mode = "deny"
             return ApprovalOutcome(approved=False, approval_mode="denied", reason="session denied")
         return ApprovalOutcome(approved=False, approval_mode="denied", reason="denied by user")
