@@ -135,6 +135,7 @@ def main(ctx: typer.Context) -> None:
     if ctx.invoked_subcommand is not None:
         return
     _bootstrap_first_agent(start_chat=False)
+    _sync_all_agent_worktrees()
     _management_shell()
 
 
@@ -142,6 +143,13 @@ def _init_db(db_path: Path) -> Database:
     db = Database(db_path)
     db.initialize()
     return db
+
+
+def _sync_all_agent_worktrees() -> None:
+    root = Path.home() / ".tali"
+    for agent_home in _list_agent_dirs(root):
+        paths = load_paths(root, agent_home.name)
+        _ensure_agent_worktree(paths)
 
 
 def _resolve_paths(agent_name: str | None = None) -> tuple[Paths, AppConfig | None]:
