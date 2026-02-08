@@ -21,7 +21,7 @@ class FakeLLM:
         self.calls = 0
         self.prompts: list[str] = []
 
-    def generate(self, prompt: str) -> LLMResponse:
+    def generate(self, prompt: str, *, temperature: float | None = None) -> LLMResponse:
         self.prompts.append(prompt)
         if self.calls >= len(self.responses):
             raise AssertionError("LLM called more than expected")
@@ -30,11 +30,22 @@ class FakeLLM:
         return LLMResponse(content=content, model="fake")
 
 
+class _FakeRegistry:
+    """Minimal registry stub that always finds a tool."""
+
+    def get(self, name: str):
+        return True  # pretend every tool exists
+
+    def list_tools(self):
+        return []
+
+
 class FakeToolRunner:
     def __init__(self, results_by_call=None) -> None:
         self.results_by_call = results_by_call or []
         self.calls = 0
         self.tool_calls = []
+        self.registry = _FakeRegistry()
 
     def run(self, tool_calls, prompt_fn):
         self.tool_calls.extend(tool_calls)
@@ -96,6 +107,7 @@ class TaskRunnerTests(unittest.TestCase):
                 json.dumps(action_done),
                 json.dumps(action_done),
                 json.dumps(review),
+                "All set.",  # responder polish of completion review
             ]
         )
         runner = TaskRunner(
@@ -106,8 +118,11 @@ class TaskRunnerTests(unittest.TestCase):
             tool_runner=FakeToolRunner(),
             tool_descriptions="none",
         )
-        result = runner.run_turn("Do two things", prompt_fn=lambda _: "")
-        self.assertIn("Completion Review", result.message)
+        result = runner.run_turn(
+            "First implement the algorithm, then verify it works",
+            prompt_fn=lambda _: "",
+        )
+        self.assertIn("All set", result.message)
         run = self.db.fetch_active_run()
         self.assertIsNone(run)
         tasks = self.db.fetch_tasks_for_run(self.db.fetch_run(self._last_run_id())["id"])
@@ -159,7 +174,10 @@ class TaskRunnerTests(unittest.TestCase):
             tool_descriptions="none",
             settings=settings,
         )
-        runner.run_turn("Do two tasks", prompt_fn=lambda _: "")
+        runner.run_turn(
+            "First implement the algorithm, then optimize the database",
+            prompt_fn=lambda _: "",
+        )
         run = self.db.fetch_active_run()
         self.assertIsNotNone(run)
         tasks = self.db.fetch_tasks_for_run(run["id"])
@@ -191,7 +209,10 @@ class TaskRunnerTests(unittest.TestCase):
             tool_runner=FakeToolRunner(),
             tool_descriptions="none",
         )
-        result = runner.run_turn("Do the thing", prompt_fn=lambda _: "")
+        result = runner.run_turn(
+            "First implement the algorithm, then verify the results",
+            prompt_fn=lambda _: "",
+        )
         self.assertIn("Which option", result.message)
         run = self.db.fetch_active_run()
         self.assertIsNotNone(run)
@@ -226,7 +247,12 @@ class TaskRunnerTests(unittest.TestCase):
             "assumptions": [],
             "user_message": "All set.",
         }
-        llm = FakeLLM([json.dumps(decomposition), json.dumps(action_done), json.dumps(review)])
+        llm = FakeLLM([
+            json.dumps(decomposition),
+            json.dumps(action_done),
+            json.dumps(review),
+            "All set.",  # responder polish
+        ])
         runner = TaskRunner(
             db=self.db,
             llm=llm,
@@ -235,7 +261,10 @@ class TaskRunnerTests(unittest.TestCase):
             tool_runner=FakeToolRunner(),
             tool_descriptions="none",
         )
-        runner.run_turn("Do thing", prompt_fn=lambda _: "")
+        runner.run_turn(
+            "First implement the algorithm, then configure the database",
+            prompt_fn=lambda _: "",
+        )
         prompt_blob = "\n".join(llm.prompts)
         self.assertIn("Project codename is Atlas", prompt_blob)
 
@@ -274,6 +303,7 @@ class TaskRunnerTests(unittest.TestCase):
                 json.dumps(execute_skill),
                 json.dumps(action_done),
                 json.dumps(review),
+                "All set.",  # responder polish
             ]
         )
         runner = TaskRunner(
@@ -284,7 +314,10 @@ class TaskRunnerTests(unittest.TestCase):
             tool_runner=FakeToolRunner(),
             tool_descriptions="none",
         )
-        runner.run_turn("Use skill", prompt_fn=lambda _: "")
+        runner.run_turn(
+            "First implement the algorithm, then apply the testing skill",
+            prompt_fn=lambda _: "",
+        )
         skill = self.db.fetch_skill_by_name("TestSkill")
         self.assertIsNotNone(skill)
         self.assertEqual(skill["success_count"], 1)
@@ -321,6 +354,7 @@ class TaskRunnerTests(unittest.TestCase):
                 json.dumps(tool_call),
                 json.dumps(action_done),
                 json.dumps(review),
+                "All set.",  # responder polish
             ]
         )
         result = ToolResult(
@@ -342,7 +376,10 @@ class TaskRunnerTests(unittest.TestCase):
             tool_runner=tool_runner,
             tool_descriptions="none",
         )
-        runner.run_turn("List files", prompt_fn=lambda _: "")
+        runner.run_turn(
+            "First implement the algorithm to list files, then verify",
+            prompt_fn=lambda _: "",
+        )
         self.assertEqual(len(tool_runner.tool_calls), 1)
 
     def test_stuck_progress_forces_replan(self) -> None:
@@ -377,6 +414,8 @@ class TaskRunnerTests(unittest.TestCase):
                 json.dumps(tool_call),
                 json.dumps(action_done),
                 json.dumps(review),
+                "Inspection completed successfully.",  # responder polish
+                "Inspection completed successfully.",  # retry (short response triggers feedback loop)
             ]
         )
         result = ToolResult(
@@ -398,9 +437,12 @@ class TaskRunnerTests(unittest.TestCase):
             tool_runner=tool_runner,
             tool_descriptions="none",
         )
-        runner.run_turn("Inspect", prompt_fn=lambda _: "")
+        runner.run_turn(
+            "First implement the algorithm to inspect, then verify the results",
+            prompt_fn=lambda _: "",
+        )
         prompt_blob = "\n".join(llm.prompts)
-        self.assertIn("Stuck detected: no progress in 2 tool calls", prompt_blob)
+        self.assertIn("duplicate_success_blocked", prompt_blob)
 
     def test_durable_facts_stored(self) -> None:
         memory = WorkingMemory(user_goal="Test")
@@ -418,6 +460,292 @@ class TaskRunnerTests(unittest.TestCase):
         memory.note_observations(observations, durable)
         self.assertIn("listed_paths", memory.environment_facts)
         self.assertIn("C:\\X\\Desktop", memory.environment_facts["listed_paths"])
+
+    def test_completion_review_includes_verification(self) -> None:
+        """Completion review summaries should include inputs_json with verification."""
+        decomposition = {
+            "tasks": [
+                {
+                    "title": "Create file",
+                    "description": "Write a file.",
+                    "requires_tools": False,
+                    "verification": "file_created_successfully",
+                    "dependencies": [],
+                }
+            ]
+        }
+        action_done = {"next_action_type": "mark_done", "outputs_json": {"created": True}}
+        review = {
+            "overall_status": "complete",
+            "checks": [{"task_ordinal": 0, "status": "ok", "note": ""}],
+            "missing_items": [],
+            "assumptions": [],
+            "user_message": "File created.",
+        }
+        llm = FakeLLM([
+            json.dumps(decomposition),
+            json.dumps(action_done),
+            json.dumps(review),
+            "File created.",  # responder polish
+        ])
+        runner = TaskRunner(
+            db=self.db,
+            llm=llm,
+            retriever=self.retriever,
+            guardrails=self.guardrails,
+            tool_runner=FakeToolRunner(),
+            tool_descriptions="none",
+        )
+        runner.run_turn(
+            "First create the file with proper content, then verify the result",
+            prompt_fn=lambda _: "",
+        )
+        # The completion review prompt (3rd LLM call, index 2) should contain
+        # the verification string from inputs_json.
+        review_prompt = llm.prompts[2]
+        self.assertIn("file_created_successfully", review_prompt)
+        self.assertIn("inputs_json", review_prompt)
+
+    def test_auto_continue_on_incomplete_review(self) -> None:
+        """When review returns incomplete, the runner should retry within the same turn."""
+        decomposition = {
+            "tasks": [
+                {
+                    "title": "Step A",
+                    "description": "Do A.",
+                    "requires_tools": False,
+                    "verification": "A done.",
+                    "dependencies": [],
+                }
+            ]
+        }
+        action_done = {"next_action_type": "mark_done", "outputs_json": {"ok": True}}
+        incomplete_review = {
+            "overall_status": "incomplete",
+            "checks": [{"task_ordinal": 0, "status": "ok", "note": ""}],
+            "missing_items": ["Also do B"],
+            "assumptions": [],
+            "user_message": "Step B is still missing.",
+        }
+        complete_review = {
+            "overall_status": "complete",
+            "checks": [
+                {"task_ordinal": 0, "status": "ok", "note": ""},
+                {"task_ordinal": 1, "status": "ok", "note": ""},
+            ],
+            "missing_items": [],
+            "assumptions": [],
+            "user_message": "All done including B.",
+        }
+        llm = FakeLLM([
+            json.dumps(decomposition),       # decompose
+            json.dumps(action_done),          # task A mark_done
+            json.dumps(incomplete_review),    # first review -> incomplete
+            json.dumps(action_done),          # task B (missing item) mark_done
+            json.dumps(complete_review),      # second review -> complete
+            "All done including B.",          # responder polish
+        ])
+        runner = TaskRunner(
+            db=self.db,
+            llm=llm,
+            retriever=self.retriever,
+            guardrails=self.guardrails,
+            tool_runner=FakeToolRunner(),
+            tool_descriptions="none",
+        )
+        result = runner.run_turn(
+            "First do step A completely, then also do step B as a follow-up",
+            prompt_fn=lambda _: "",
+        )
+        self.assertIn("All done", result.message)
+        # Verify the missing task was created and completed
+        run_id = self._last_run_id()
+        tasks = self.db.fetch_tasks_for_run(run_id)
+        self.assertEqual(len(tasks), 2)
+        statuses = [row["status"] for row in tasks]
+        self.assertEqual(statuses, ["done", "done"])
+
+    def test_build_remaining_tasks_message(self) -> None:
+        """_build_remaining_tasks_message should list pending tasks."""
+        llm = FakeLLM([])
+        runner = TaskRunner(
+            db=self.db,
+            llm=llm,
+            retriever=self.retriever,
+            guardrails=self.guardrails,
+            tool_runner=FakeToolRunner(),
+            tool_descriptions="none",
+        )
+        # Simulate task rows with mixed statuses
+        fake_rows = [
+            {"title": "Done task", "status": "done"},
+            {"title": "Pending task one", "status": "pending"},
+            {"title": "Pending task two", "status": "active"},
+            {"title": "Skipped task", "status": "skipped"},
+        ]
+        msg = runner._build_remaining_tasks_message(fake_rows)
+        self.assertIn("Pending task one", msg)
+        self.assertIn("Pending task two", msg)
+        self.assertNotIn("Done task", msg)
+        self.assertNotIn("Skipped task", msg)
+        self.assertIn("still need to", msg)
+
+    def test_build_remaining_tasks_message_all_done(self) -> None:
+        """When all tasks are done, fallback message should be returned."""
+        llm = FakeLLM([])
+        runner = TaskRunner(
+            db=self.db,
+            llm=llm,
+            retriever=self.retriever,
+            guardrails=self.guardrails,
+            tool_runner=FakeToolRunner(),
+            tool_descriptions="none",
+        )
+        fake_rows = [
+            {"title": "Task A", "status": "done"},
+            {"title": "Task B", "status": "skipped"},
+        ]
+        msg = runner._build_remaining_tasks_message(fake_rows)
+        self.assertEqual(msg, "Progress saved. Continuing next turn.")
+
+    def test_circuit_breaker_blocks_after_repeated_incompletes(self) -> None:
+        """Circuit breaker should block the run after 2 consecutive review_incomplete turns."""
+        decomposition = {
+            "tasks": [
+                {
+                    "title": "Do thing",
+                    "description": "Step one.",
+                    "requires_tools": False,
+                    "verification": "Done.",
+                    "dependencies": [],
+                }
+            ]
+        }
+        action_done = {"next_action_type": "mark_done", "outputs_json": {"ok": True}}
+        llm = FakeLLM([
+            json.dumps(decomposition),
+            json.dumps(action_done),
+        ])
+        runner = TaskRunner(
+            db=self.db,
+            llm=llm,
+            retriever=self.retriever,
+            guardrails=self.guardrails,
+            tool_runner=FakeToolRunner(),
+            tool_descriptions="none",
+        )
+        # Simulate a run that already has review_incomplete:2 in last_error
+        from datetime import datetime
+        run_id = "test-circuit-breaker-run"
+        self.db.insert_run(
+            run_id=run_id,
+            created_at=datetime.utcnow().isoformat(),
+            status="active",
+            user_prompt="Do thing",
+            current_task_id=None,
+            last_error="review_incomplete:2",
+            origin="user",
+        )
+        self.db.insert_task(
+            task_id="task-cb-1",
+            run_id=run_id,
+            parent_task_id=None,
+            ordinal=0,
+            title="Remaining task",
+            description="Still needs doing.",
+            status="pending",
+            inputs_json=json.dumps({"verification": "Done.", "dependencies": []}),
+            outputs_json=None,
+            requires_tools=0,
+            created_at=datetime.utcnow().isoformat(),
+            updated_at=datetime.utcnow().isoformat(),
+        )
+        result = runner.run_turn("continue", prompt_fn=lambda _: "")
+        self.assertIn("attempted this request multiple times", result.message)
+        self.assertIn("Remaining task", result.message)
+        run = self.db.fetch_run(run_id)
+        self.assertEqual(run["status"], "blocked")
+        self.assertEqual(run["last_error"], "stuck_review_incomplete")
+
+    def test_count_consecutive_review_incompletes(self) -> None:
+        """_count_consecutive_review_incompletes should parse the count from last_error."""
+        llm = FakeLLM([])
+        runner = TaskRunner(
+            db=self.db,
+            llm=llm,
+            retriever=self.retriever,
+            guardrails=self.guardrails,
+            tool_runner=FakeToolRunner(),
+            tool_descriptions="none",
+        )
+        from datetime import datetime
+        # Run with review_incomplete:3
+        run_id = "test-count-run"
+        self.db.insert_run(
+            run_id=run_id,
+            created_at=datetime.utcnow().isoformat(),
+            status="active",
+            user_prompt="test",
+            current_task_id=None,
+            last_error="review_incomplete:3",
+            origin="user",
+        )
+        self.assertEqual(runner._count_consecutive_review_incompletes(run_id), 3)
+        # Run with no error
+        run_id2 = "test-count-run-2"
+        self.db.insert_run(
+            run_id=run_id2,
+            created_at=datetime.utcnow().isoformat(),
+            status="active",
+            user_prompt="test",
+            current_task_id=None,
+            last_error=None,
+            origin="user",
+        )
+        self.assertEqual(runner._count_consecutive_review_incompletes(run_id2), 0)
+        # Run with old-format "review_incomplete" (no colon)
+        run_id3 = "test-count-run-3"
+        self.db.insert_run(
+            run_id=run_id3,
+            created_at=datetime.utcnow().isoformat(),
+            status="active",
+            user_prompt="test",
+            current_task_id=None,
+            last_error="review_incomplete",
+            origin="user",
+        )
+        self.assertEqual(runner._count_consecutive_review_incompletes(run_id3), 1)
+
+    def test_append_missing_tasks_enriched_description(self) -> None:
+        """_append_missing_tasks should create tasks with enriched descriptions."""
+        llm = FakeLLM([])
+        runner = TaskRunner(
+            db=self.db,
+            llm=llm,
+            retriever=self.retriever,
+            guardrails=self.guardrails,
+            tool_runner=FakeToolRunner(),
+            tool_descriptions="none",
+        )
+        from datetime import datetime
+        run_id = "test-missing-tasks-run"
+        self.db.insert_run(
+            run_id=run_id,
+            created_at=datetime.utcnow().isoformat(),
+            status="active",
+            user_prompt="test",
+            current_task_id=None,
+            last_error=None,
+            origin="user",
+        )
+        runner._append_missing_tasks(run_id, ["Write unit tests", "Update docs"])
+        tasks = self.db.fetch_tasks_for_run(run_id)
+        self.assertEqual(len(tasks), 2)
+        self.assertIn("Previous attempt missed this requirement", tasks[0]["description"])
+        self.assertIn("Write unit tests", tasks[0]["description"])
+        # Verification should be specific, not generic
+        inputs = json.loads(tasks[0]["inputs_json"])
+        self.assertIn("Write unit tests", inputs["verification"])
 
     def _last_run_id(self) -> str:
         with self.db.connect() as connection:

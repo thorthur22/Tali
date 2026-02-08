@@ -19,7 +19,7 @@ class LLMResponse:
 
 
 class LLMClient(Protocol):
-    def generate(self, prompt: str) -> LLMResponse:
+    def generate(self, prompt: str, *, temperature: float | None = None) -> LLMResponse:
         ...
 
 
@@ -29,14 +29,15 @@ class OpenAIClient:
     api_key: str
     model: str
     timeout_s: float = 60.0
+    default_temperature: float = 0.2
 
-    def generate(self, prompt: str) -> LLMResponse:
+    def generate(self, prompt: str, *, temperature: float | None = None) -> LLMResponse:
         url = f"{self.base_url.rstrip('/')}/chat/completions"
         headers = {"Authorization": f"Bearer {self.api_key}"}
         payload = {
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.2,
+            "temperature": temperature if temperature is not None else self.default_temperature,
         }
         client = _shared_http_client()
         response = client.post(url, headers=headers, json=payload, timeout=self.timeout_s)
@@ -51,13 +52,16 @@ class OllamaClient:
     base_url: str
     model: str
     timeout_s: float = 60.0
+    default_temperature: float = 0.2
 
-    def generate(self, prompt: str) -> LLMResponse:
+    def generate(self, prompt: str, *, temperature: float | None = None) -> LLMResponse:
         url = f"{self.base_url.rstrip('/')}/api/chat"
+        temp = temperature if temperature is not None else self.default_temperature
         payload = {
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
+            "options": {"temperature": temp},
         }
         client = _shared_http_client()
         response = client.post(url, json=payload, timeout=self.timeout_s)

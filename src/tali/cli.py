@@ -26,6 +26,7 @@ from dataclasses import replace
 
 from tali.config import (
     AppConfig,
+    AutonomyConfig,
     EmbeddingSettings,
     GuardrailConfig,
     LLMSettings,
@@ -39,6 +40,7 @@ from tali.config import (
     load_shared_settings,
     save_config,
     save_shared_settings,
+    infer_model_strengths,
 )
 from tali.agent_identity import resolve_agent, validate_agent_name
 from tali.a2a import A2AClient, A2APoller, AgentProfile
@@ -50,11 +52,12 @@ from tali.guardrails import GuardrailResult, Guardrails
 from tali.memory_ingest import stage_episode_fact
 from tali.llm import OllamaClient, OpenAIClient
 from tali.retrieval import Retriever
-from tali.self_care import SleepScheduler, resolve_staged_items
+from tali.self_care import SleepScheduler, resolve_contradiction_answer, resolve_staged_items
 from tali.snapshots import create_snapshot, diff_snapshot, list_snapshots, rollback_snapshot
 from tali.vector_index import VectorIndex
 from tali.approvals import ApprovalManager
 from tali.task_runner import TaskRunner, TaskRunnerSettings
+from tali.tasking import build_swarm_context
 from tali.hooks.core import HookManager
 from tali.idle import IdleScheduler
 from tali.knowledge_sources import KnowledgeSourceRegistry, LocalFileSource
@@ -66,14 +69,40 @@ from tali.tools.policy import ToolPolicy
 from tali.tools.runner import ToolRunner
 from tali.model_catalog import list_models as list_catalog_models, download_model as download_catalog_model
 from tali.run_logs import append_run_log, read_recent_logs, latest_metrics_for_run
+from tali.cli_format import (
+    format_inbox,
+    format_patches_list,
+    format_patch_detail,
+    format_run_status,
+    format_run_show,
+    format_run_list,
+    format_timeline,
+    format_logs,
+    format_agent_name,
+    format_agent_list,
+    format_commitments,
+    format_facts,
+    format_skills,
+    format_doctor,
+    format_preferences,
+    format_memory_search,
+    format_config,
+    format_help_guide,
+)
 
-app = typer.Typer(help="Tali agent CLI")
+app = typer.Typer(help="Tali agent CLI \u2014 run 'tali --install-completion' for shell tab-completion.")
 agent_app = typer.Typer(help="Manage agents")
 app.add_typer(agent_app, name="agent")
 run_app = typer.Typer(help="Manage task runs")
 agent_app.add_typer(run_app, name="run")
 patch_app = typer.Typer(help="Manage patch proposals")
 agent_app.add_typer(patch_app, name="patches")
+config_app = typer.Typer(help="View and edit agent configuration.")
+agent_app.add_typer(config_app, name="config")
+memory_app = typer.Typer(help="Search and explore agent memory.")
+agent_app.add_typer(memory_app, name="memory")
+pref_app = typer.Typer(help="Manage user preferences.")
+agent_app.add_typer(pref_app, name="preferences")
 
 
 def _bootstrap_first_agent(start_chat: bool = True) -> None:
@@ -641,7 +670,11 @@ def _ensure_agent_dirs(paths: Paths) -> None:
 
 @agent_app.command("create")
 def create_agent() -> None:
-    """Create a new agent with role and LLM settings."""
+    """Create a new agent with role and LLM settings.
+
+    Walks through an interactive setup to configure the agent's name,
+    role, LLM provider, model, and embedding settings.
+    """
     root = Path.home() / ".tali"
     root.mkdir(parents=True, exist_ok=True)
     (root / "shared").mkdir(parents=True, exist_ok=True)
@@ -784,7 +817,12 @@ def chat(
     verbose_tools: bool = typer.Option(False, "--verbose-tools", help="Show full tool output."),
     show_plans: bool = typer.Option(False, "--show-plans", help="Show task planning steps."),
 ) -> None:
-    """Start a chat loop or run a single turn if message is provided."""
+    """Start a chat loop or run a single turn if message is provided.
+
+    Opens an interactive session with the agent. Provide a message
+    argument to run a single turn, or omit it for a persistent chat loop.
+    Type 'exit' or 'quit' to leave the chat.
+    """
     if isinstance(message, typer.models.ArgumentInfo):
         message = None
     paths, existing_config = _resolve_paths(agent_name)
@@ -820,6 +858,7 @@ def chat(
     scheduler.start()
     sources = KnowledgeSourceRegistry()
     sources.register(LocalFileSource(paths.agent_home))
+    autonomy_config = config.autonomy if config.autonomy else None
     idle_scheduler = IdleScheduler(
         paths.data_dir,
         db,
@@ -827,6 +866,7 @@ def chat(
         sources,
         hook_manager=hook_manager,
         status_fn=lambda msg: console.print(f"[dim]{escape(msg)}[/dim]"),
+        autonomy_config=autonomy_config,
     )
     idle_scheduler.start()
     console = Console()
@@ -863,6 +903,8 @@ def chat(
     )
     if a2a_client.secret is None:
         console.print("[dim]A2A: shared secret missing; messages are unsigned.[/dim]")
+    planner_strengths = ", ".join(infer_model_strengths(planner_settings))
+    responder_strengths = ", ".join(infer_model_strengths(responder_settings))
     agent_context = "\n".join(
         [
             f"Agent name: {config.agent_name}",
@@ -878,8 +920,15 @@ def chat(
             f"You are the LLM planner; the {agent_label} agent executes tool calls you request.",
             "Use config.json (not config.txt).",
             "Do not use tools for greetings or small talk.",
+            "Model capabilities:",
+            f"- Planner ({planner_settings.model}): {planner_strengths}",
+            f"- Responder ({responder_settings.model}): {responder_strengths}",
+            "When choosing 'respond', provide detailed factual content in your message so the responder can phrase it well for the user.",
         ]
     )
+    swarm_info = build_swarm_context(a2a_client, config.agent_name)
+    if swarm_info:
+        agent_context += "\n\nTeam resources:\n" + swarm_info
     task_runner_config = (
         config.task_runner if isinstance(config.task_runner, TaskRunnerConfig) else None
     )
@@ -910,7 +959,9 @@ def chat(
         agent_context=agent_context,
         status_fn=(lambda msg: console.print(f"[dim]{escape(msg)}[/dim]")),
         settings=task_runner_settings,
+        responder_strengths=responder_strengths,
     )
+    idle_scheduler.set_task_runner(task_runner)
     poller = A2APoller(
         db=db,
         client=a2a_client,
@@ -1166,16 +1217,29 @@ def chat(
                     db, user_input, dict(pending_question_row), source_ref=episode.id
                 )
                 if answer_payload:
-                    db.insert_staged_item(
-                        item_id=str(uuid4()),
-                        kind="fact",
-                        payload=json.dumps(answer_payload),
-                        status="pending",
-                        created_at=episode.timestamp,
-                        source_ref=episode.id,
-                        provenance_type="USER_REPORTED",
-                        next_check_at=episode.timestamp,
-                    )
+                    # Check if this was a contradiction question
+                    _reason_raw = pending_question_row["reason"] if pending_question_row["reason"] else ""
+                    _contradiction_resolved = False
+                    if _reason_raw:
+                        try:
+                            _reason_data = json.loads(_reason_raw)
+                            if isinstance(_reason_data, dict) and _reason_data.get("type") == "contradiction":
+                                _contradiction_resolved = resolve_contradiction_answer(
+                                    db, user_input, _reason_data, source_ref=episode.id
+                                )
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                    if not _contradiction_resolved:
+                        db.insert_staged_item(
+                            item_id=str(uuid4()),
+                            kind="fact",
+                            payload=json.dumps(answer_payload),
+                            status="pending",
+                            created_at=episode.timestamp,
+                            source_ref=episode.id,
+                            provenance_type="USER_REPORTED",
+                            next_check_at=episode.timestamp,
+                        )
             for record in result.tool_records:
                 db.insert_tool_call(
                     tool_call_id=record.id,
@@ -1315,6 +1379,19 @@ def chat(
         return
 
     console.print(f"[dim]{agent_label} chat (type 'exit' to quit)[/dim]")
+    # Check for incomplete/stale runs on startup
+    _startup_incomplete = db.fetch_incomplete_runs()
+    if _startup_incomplete:
+        for _inc_run in _startup_incomplete:
+            _run_created = _inc_run["created_at"] or "unknown"
+            _run_status = _inc_run["status"]
+            _run_prompt = str(_inc_run["user_prompt"] or "")[:80]
+            console.print(
+                f"[bold yellow]Incomplete run:[/bold yellow] {_inc_run['id'][:8]}... "
+                f"(status={_run_status}, created={_run_created})"
+            )
+            console.print(f"  [dim]Prompt: {escape(_run_prompt)}[/dim]")
+        console.print("[dim]Type 'resume' to continue or 'cancel' to abort.[/dim]")
     while True:
         user_input = console.input("[bold cyan]You[/bold cyan]: ")
         if user_input.strip().lower() in {"exit", "quit"}:
@@ -1327,8 +1404,14 @@ def chat(
 
 
 @run_app.command("status")
-def run_status() -> None:
-    """Show the active run and its tasks."""
+def run_status(
+    as_json: bool = typer.Option(False, "--json", help="Output raw JSON."),
+) -> None:
+    """Show the active run and its tasks.
+
+    Displays the current run status, task list, and metrics in a
+    human-readable format. Use --json for machine-readable output.
+    """
     paths, _ = _resolve_paths()
     db = _init_db(paths.db_path)
     run = db.fetch_active_run()
@@ -1337,20 +1420,28 @@ def run_status() -> None:
         return
     tasks = db.fetch_tasks_for_run(run["id"])
     metrics = latest_metrics_for_run(paths.logs_dir, str(run["id"]))
-    payload = {
-        "run": dict(run),
-        "tasks": [
-            {"ordinal": row["ordinal"], "title": row["title"], "status": row["status"]}
-            for row in tasks
-        ],
-        "metrics": metrics or {},
-    }
-    typer.echo(json.dumps(payload, indent=2))
+    if as_json:
+        payload = {
+            "run": dict(run),
+            "tasks": [
+                {"ordinal": row["ordinal"], "title": row["title"], "status": row["status"]}
+                for row in tasks
+            ],
+            "metrics": metrics or {},
+        }
+        typer.echo(json.dumps(payload, indent=2))
+    else:
+        console = Console()
+        console.print(format_run_status(run, tasks, metrics))
 
 
 @run_app.command("cancel")
 def run_cancel() -> None:
-    """Cancel the active run."""
+    """Cancel the active run.
+
+    Immediately sets the active run's status to 'canceled' and clears
+    its current task pointer.
+    """
     paths, _ = _resolve_paths()
     db = _init_db(paths.db_path)
     run = db.fetch_active_run()
@@ -1363,23 +1454,54 @@ def run_cancel() -> None:
 
 @run_app.command("resume")
 def run_resume() -> None:
-    """Resume a blocked run."""
+    """Resume a blocked or stale run.
+
+    Transitions a blocked (or stale active) run back to 'active' status
+    so that task execution can continue.
+    """
     paths, _ = _resolve_paths()
     db = _init_db(paths.db_path)
     run = db.fetch_active_run()
     if not run:
-        typer.echo("No active run to resume.")
+        # Also check for stale runs that might not appear as "active"
+        stale = db.fetch_stale_runs(timeout_minutes=30)
+        if stale:
+            run = stale[0]
+        else:
+            typer.echo("No active or stale run to resume.")
+            return
+    if run["status"] == "active":
+        # Check if it is stale
+        updated_at = run["updated_at"]
+        if updated_at:
+            from datetime import timedelta
+            try:
+                last_update = datetime.fromisoformat(str(updated_at))
+                if datetime.utcnow() - last_update > timedelta(minutes=30):
+                    typer.echo(f"Run {run['id']} appears stale (last updated: {updated_at}). Resuming.")
+                    db.update_run_status(run["id"], status="active", current_task_id=run["current_task_id"], last_error=None)
+                    typer.echo(f"Run {run['id']} resumed.")
+                    return
+            except (ValueError, TypeError):
+                pass
+        typer.echo("Active run is not blocked or stale.")
         return
     if run["status"] != "blocked":
-        typer.echo("Active run is not blocked.")
+        typer.echo(f"Run {run['id']} has status '{run['status']}' and cannot be resumed.")
         return
     db.update_run_status(run["id"], status="active", current_task_id=run["current_task_id"], last_error=None)
     typer.echo(f"Run {run['id']} resumed.")
 
 
 @run_app.command("show")
-def run_show(run_id: str = typer.Argument(..., help="Run ID to display.")) -> None:
-    """Show a run and its tasks."""
+def run_show(
+    run_id: str = typer.Argument(..., help="Run ID to display."),
+    as_json: bool = typer.Option(False, "--json", help="Output raw JSON."),
+) -> None:
+    """Show a run and its tasks.
+
+    Displays run details with task list and output summaries.
+    """
     paths, _ = _resolve_paths()
     db = _init_db(paths.db_path)
     run = db.fetch_run(run_id)
@@ -1387,63 +1509,99 @@ def run_show(run_id: str = typer.Argument(..., help="Run ID to display.")) -> No
         typer.echo("Run not found.")
         return
     tasks = db.fetch_tasks_for_run(run_id)
-    payload = {
-        "run": dict(run),
-        "tasks": [
-            {
-                "ordinal": row["ordinal"],
-                "title": row["title"],
-                "status": row["status"],
-                "outputs_json": row["outputs_json"],
-            }
-            for row in tasks
-        ],
-    }
-    typer.echo(json.dumps(payload, indent=2))
+    if as_json:
+        payload = {
+            "run": dict(run),
+            "tasks": [
+                {
+                    "ordinal": row["ordinal"],
+                    "title": row["title"],
+                    "status": row["status"],
+                    "outputs_json": row["outputs_json"],
+                }
+                for row in tasks
+            ],
+        }
+        typer.echo(json.dumps(payload, indent=2))
+    else:
+        console = Console()
+        console.print(format_run_show(run, tasks))
 
 
 @run_app.command("list")
-def run_list(limit: int = typer.Option(20, "--limit", help="Max runs to show.")) -> None:
-    """List recent runs."""
+def run_list(
+    limit: int = typer.Option(20, "--limit", help="Max runs to show."),
+    incomplete: bool = typer.Option(False, "--incomplete", help="Show only incomplete (active/blocked) runs."),
+    as_json: bool = typer.Option(False, "--json", help="Output raw JSON."),
+) -> None:
+    """List recent runs.
+
+    Shows a table of recent runs with their status and any errors.
+    Use --incomplete to filter to only active or blocked runs.
+    """
     paths, _ = _resolve_paths()
     db = _init_db(paths.db_path)
-    runs = db.list_runs(limit=limit)
-    payload = [
-        {
-            "id": row["id"],
-            "created_at": row["created_at"],
-            "status": row["status"],
-            "last_error": row["last_error"],
-        }
-        for row in runs
-    ]
-    typer.echo(json.dumps(payload, indent=2))
+    if incomplete:
+        runs = db.fetch_incomplete_runs()
+    else:
+        runs = db.list_runs(limit=limit)
+    if as_json:
+        payload = [
+            {
+                "id": row["id"],
+                "created_at": row["created_at"],
+                "status": row["status"],
+                "last_error": row["last_error"],
+            }
+            for row in runs
+        ]
+        typer.echo(json.dumps(payload, indent=2))
+    else:
+        console = Console()
+        console.print(format_run_list(runs))
 
 
 @run_app.command("timeline")
-def run_timeline(run_id: str = typer.Argument(..., help="Run ID to display timeline.")) -> None:
-    """Show task event timeline for a run."""
+def run_timeline(
+    run_id: str = typer.Argument(..., help="Run ID to display timeline."),
+    as_json: bool = typer.Option(False, "--json", help="Output raw JSON."),
+) -> None:
+    """Show task event timeline for a run.
+
+    Displays a chronological list of task events including status
+    transitions, tool calls, and LLM interactions.
+    """
     paths, _ = _resolve_paths()
     db = _init_db(paths.db_path)
     events = db.fetch_task_events_for_run(run_id)
-    payload = [
-        {
-            "timestamp": row["timestamp"],
-            "task_id": row["task_id"],
-            "event_type": row["event_type"],
-            "payload": row["payload"],
-        }
-        for row in events
-    ]
-    typer.echo(json.dumps(payload, indent=2))
+    if as_json:
+        payload = [
+            {
+                "timestamp": row["timestamp"],
+                "task_id": row["task_id"],
+                "event_type": row["event_type"],
+                "payload": row["payload"],
+            }
+            for row in events
+        ]
+        typer.echo(json.dumps(payload, indent=2))
+    else:
+        console = Console()
+        console.print(format_timeline(events))
 
 
 @agent_app.command("logs")
 def logs(
     limit: int = typer.Option(10, "--limit", help="Max log entries to show."),
     run_id: Optional[str] = typer.Option(None, "--run-id", help="Filter by run ID."),
+    as_json: bool = typer.Option(False, "--json", help="Output raw JSON."),
 ) -> None:
-    """Show recent structured run logs."""
+    """Show recent structured run logs.
+
+    Displays a table of recent run logs with LLM call counts, tool
+    call counts, and step counts. Filter by --run-id to see logs for
+    a specific run.
+    """
     paths, _ = _resolve_paths()
     entries = read_recent_logs(paths.logs_dir, limit=limit * 5)
     if run_id:
@@ -1451,19 +1609,54 @@ def logs(
     if not entries:
         typer.echo("No logs found.")
         return
-    typer.echo(json.dumps(entries[-limit:], indent=2))
+    trimmed = entries[-limit:]
+    if as_json:
+        typer.echo(json.dumps(trimmed, indent=2))
+    else:
+        console = Console()
+        console.print(format_logs(trimmed))
 
 
-def _render_dashboard(db: Database, paths: Paths) -> Layout:
+def _render_dashboard(db: Database, paths: Paths, config: AppConfig | None = None) -> Layout:
     layout = Layout()
     layout.split_column(
-        Layout(name="top", ratio=1),
+        Layout(name="top", ratio=2),
         Layout(name="middle", ratio=2),
         Layout(name="bottom", ratio=1),
     )
-    layout["top"].split_row(Layout(name="memory"), Layout(name="metrics"))
+    layout["top"].split_row(
+        Layout(name="agent_state"),
+        Layout(name="memory"),
+        Layout(name="metrics"),
+    )
     run = db.fetch_active_run()
     tasks = db.fetch_tasks_for_run(run["id"]) if run else []
+
+    # --- Agent State panel ---
+    agent_name_str = config.agent_name if config else "unknown"
+    if run:
+        state_label = f"[bold green]{run['status']}[/bold green]"
+    else:
+        state_label = "[dim]idle[/dim]"
+    unread_count = len(db.list_unread_agent_messages(limit=100))
+    pending_commitments = len(db.fetch_pending_commitments())
+    agent_lines = [
+        f"Agent: [bold]{agent_name_str}[/bold]",
+        f"State: {state_label}",
+        f"Inbox: {unread_count} unread",
+        f"Pending commitments: {pending_commitments}",
+    ]
+    # Autonomy status
+    if config and config.autonomy:
+        auto = config.autonomy
+        auto_status = "[green]on[/green]" if auto.enabled else "[dim]off[/dim]"
+        agent_lines.append(f"Autonomy: {auto_status}")
+        if auto.enabled:
+            agent_lines.append(f"  Idle trigger: {auto.idle_trigger_seconds}s")
+            agent_lines.append(f"  Auto-continue: {'yes' if auto.auto_continue else 'no'}")
+    layout["top"]["agent_state"].update(Panel("\n".join(agent_lines), title="Agent"))
+
+    # --- Memory panel ---
     staged_by_status = db.count_staged_items_by_status()
     facts_count = len(db.list_facts())
     commitments_count = len(db.list_commitments())
@@ -1474,17 +1667,20 @@ def _render_dashboard(db: Database, paths: Paths) -> Layout:
         f"Preferences: {preferences_count}",
         f"Staged: {staged_by_status}",
     ]
-    layout["top"]["memory"].update(Panel("\n".join(memory_lines), title="Memory Status"))
+    layout["top"]["memory"].update(Panel("\n".join(memory_lines), title="Memory"))
+
+    # --- Run Metrics panel ---
     metrics = latest_metrics_for_run(paths.logs_dir, str(run["id"])) if run else None
     metrics_lines = [
-        f"Run: {run['id']}" if run else "Run: (none)",
+        f"Run: {run['id'][:8] if run else '(none)'}",
         f"Status: {run['status']}" if run else "Status: n/a",
         f"LLM calls: {metrics.get('llm_calls')}" if metrics else "LLM calls: n/a",
         f"Tool calls: {metrics.get('tool_calls')}" if metrics else "Tool calls: n/a",
         f"Steps: {metrics.get('steps')}" if metrics else "Steps: n/a",
     ]
-    layout["top"]["metrics"].update(Panel("\n".join(metrics_lines), title="Run Metrics"))
+    layout["top"]["metrics"].update(Panel("\n".join(metrics_lines), title="Metrics"))
 
+    # --- Tasks table ---
     task_table = Table(title="Tasks")
     task_table.add_column("Ord", justify="right")
     task_table.add_column("Title")
@@ -1495,13 +1691,14 @@ def _render_dashboard(db: Database, paths: Paths) -> Layout:
         task_table.add_row("-", "No active run", "-")
     layout["middle"].update(task_table)
 
+    # --- Logs ---
     recent_logs = read_recent_logs(paths.logs_dir, limit=5)
     log_lines = []
     for entry in recent_logs:
         run_id = entry.get("run_id", "")
         llm_calls = entry.get("llm_calls", "")
         tool_calls = entry.get("tool_calls", "")
-        log_lines.append(f"{run_id} llm={llm_calls} tools={tool_calls}")
+        log_lines.append(f"{run_id[:8] if run_id else ''} llm={llm_calls} tools={tool_calls}")
     layout["bottom"].update(Panel("\n".join(log_lines) if log_lines else "No logs.", title="Recent Logs"))
     return layout
 
@@ -1511,36 +1708,59 @@ def dashboard(
     refresh_s: float = typer.Option(1.5, "--refresh", help="Refresh interval (seconds)."),
     duration_s: int = typer.Option(30, "--duration", help="How long to run (seconds). 0 = once."),
 ) -> None:
-    """Show a live dashboard with tasks, memory, and logs."""
-    paths, _ = _resolve_paths()
+    """Show a live dashboard with tasks, memory, and logs.
+
+    Renders a Rich-based live-updating panel showing memory stats,
+    run metrics, current tasks, and recent logs. Use --duration 0
+    for a single snapshot.
+    """
+    paths, existing = _resolve_paths()
     db = _init_db(paths.db_path)
+    try:
+        cfg = _load_or_raise_config(paths, existing)
+    except (typer.Exit, SystemExit):
+        cfg = None
     if duration_s == 0:
         console = Console()
-        console.print(_render_dashboard(db, paths))
+        console.print(_render_dashboard(db, paths, cfg))
         return
     start = time.time()
-    with Live(_render_dashboard(db, paths), refresh_per_second=max(1, int(1 / refresh_s))) as live:
+    with Live(_render_dashboard(db, paths, cfg), refresh_per_second=max(1, int(1 / refresh_s))) as live:
         while time.time() - start < duration_s:
-            live.update(_render_dashboard(db, paths))
+            live.update(_render_dashboard(db, paths, cfg))
             time.sleep(refresh_s)
 
 
 @agent_app.command("name")
-def agent_name() -> None:
-    """Show current agent identity."""
+def agent_name_cmd(
+    as_json: bool = typer.Option(False, "--json", help="Output raw JSON."),
+) -> None:
+    """Show current agent identity.
+
+    Displays the agent's name, unique ID, home directory, and role.
+    """
     paths, existing = _resolve_paths()
     config = _load_or_raise_config(paths, existing)
-    typer.echo(
-        json.dumps(
-            {"agent_id": config.agent_id, "agent_name": config.agent_name, "home": str(paths.agent_home)},
-            indent=2,
+    if as_json:
+        typer.echo(
+            json.dumps(
+                {"agent_id": config.agent_id, "agent_name": config.agent_name, "home": str(paths.agent_home)},
+                indent=2,
+            )
         )
-    )
+    else:
+        console = Console()
+        console.print(format_agent_name(config, str(paths.agent_home)))
 
 
 @agent_app.command("list")
-def agent_list() -> None:
-    """List known local agents."""
+def agent_list(
+    as_json: bool = typer.Option(False, "--json", help="Output raw JSON."),
+) -> None:
+    """List known local agents.
+
+    Shows all agents registered in the local Tali directory.
+    """
     root = Path.home() / ".tali"
     registry = Registry(root / "shared" / "registry.json")
     agents = registry.list_agents()
@@ -1549,7 +1769,11 @@ def agent_list() -> None:
             {"agent_name": path.name, "home": str(path)}
             for path in _list_agent_dirs(root)
         ]
-    typer.echo(json.dumps(agents, indent=2))
+    if as_json:
+        typer.echo(json.dumps(agents, indent=2))
+    else:
+        console = Console()
+        console.print(format_agent_list(agents))
 
 
 @agent_app.command("send")
@@ -1558,7 +1782,11 @@ def agent_send(
     topic: str = typer.Option("task", "--topic", help="Message topic."),
     payload_json: str = typer.Option(..., "--json", help="JSON payload."),
 ) -> None:
-    """Send an A2A message."""
+    """Send an A2A message.
+
+    Sends a message to another agent. If --to is omitted the message
+    is broadcast to all registered agents.
+    """
     paths, existing = _resolve_paths()
     config = _load_or_raise_config(paths, existing)
     try:
@@ -1598,17 +1826,31 @@ def agent_send(
 
 
 @agent_app.command("inbox")
-def agent_inbox() -> None:
-    """Show unread A2A messages."""
+def agent_inbox(
+    as_json: bool = typer.Option(False, "--json", help="Output raw JSON."),
+) -> None:
+    """Show unread A2A messages.
+
+    Displays sender, topic, timestamp, and a payload summary for each
+    unread message in the agent's inbox.
+    """
     paths, _ = _resolve_paths()
     db = _init_db(paths.db_path)
     rows = db.list_unread_agent_messages(limit=20)
-    typer.echo(json.dumps([dict(row) for row in rows], indent=2))
+    if as_json:
+        typer.echo(json.dumps([dict(row) for row in rows], indent=2))
+    else:
+        console = Console()
+        console.print(format_inbox(rows))
 
 
 @agent_app.command("swarm")
 def swarm(prompt: str = typer.Argument(..., help="Swarm task prompt.")) -> None:
-    """Run a swarm-enabled task turn."""
+    """Run a swarm-enabled task turn.
+
+    Executes a task using the multi-agent swarm, coordinating with
+    other registered agents via A2A messaging.
+    """
     paths, existing = _resolve_paths()
     _ensure_dependencies()
     config = _load_or_raise_config(paths, existing)
@@ -1644,6 +1886,31 @@ def swarm(prompt: str = typer.Argument(..., help="Swarm task prompt.")) -> None:
             capabilities=config.capabilities,
         ),
     )
+    run_planner_strengths = ", ".join(infer_model_strengths(planner_settings))
+    run_responder_strengths = ", ".join(infer_model_strengths(responder_settings))
+    agent_context = "\n".join(
+        [
+            f"Agent name: {config.agent_name}",
+            f"Role: {config.role_description or 'assistant'}",
+            f"Agent home: {paths.agent_home}",
+            f"Config path: {paths.config_path}",
+            f"Planner model: {planner_settings.model}",
+            f"Responder model: {responder_settings.model}",
+            f"Tool fs_root: {tool_settings.fs_root}",
+            f"OS: {platform.system()} {platform.release()}",
+            "The agent is distinct from the LLM model.",
+            f"You are the LLM planner; the {config.agent_name} agent executes tool calls you request.",
+            "Use config.json (not config.txt).",
+            "Do not use tools for greetings or small talk.",
+            "Model capabilities:",
+            f"- Planner ({planner_settings.model}): {run_planner_strengths}",
+            f"- Responder ({responder_settings.model}): {run_responder_strengths}",
+            "When choosing 'respond', provide detailed factual content in your message so the responder can phrase it well for the user.",
+        ]
+    )
+    swarm_info = build_swarm_context(a2a_client, config.agent_name)
+    if swarm_info:
+        agent_context += "\n\nTeam resources:\n" + swarm_info
     task_runner_config = (
         config.task_runner if isinstance(config.task_runner, TaskRunnerConfig) else None
     )
@@ -1670,15 +1937,21 @@ def swarm(prompt: str = typer.Argument(..., help="Swarm task prompt.")) -> None:
         tool_runner=runner,
         tool_descriptions=tool_descriptions,
         a2a_client=a2a_client,
+        agent_context=agent_context,
         settings=task_runner_settings,
+        responder_strengths=run_responder_strengths,
     )
-    result = task_runner.run_turn(prompt, prompt_fn=typer.prompt, show_plans=show_plans)
+    result = task_runner.run_turn(prompt, prompt_fn=typer.prompt)
     typer.echo(result.message)
 
 
 @agent_app.command("delete")
 def delete_agent(agent_name: str = typer.Argument(..., help="Agent name to delete.")) -> None:
-    """Delete an agent by name."""
+    """Delete an agent by name.
+
+    Removes the agent's data directory, worktree, and registry entry.
+    If no agents remain, the bootstrap wizard is launched.
+    """
     root = Path.home() / ".tali"
     agent_home = root / agent_name
     if not agent_home.exists():
@@ -1701,38 +1974,63 @@ def delete_agent(agent_name: str = typer.Argument(..., help="Agent name to delet
 
 
 @patch_app.command("list")
-def patches_list() -> None:
-    """List patch proposals."""
+def patches_list(
+    as_json: bool = typer.Option(False, "--json", help="Output raw JSON."),
+) -> None:
+    """List patch proposals.
+
+    Shows a table of all patch proposals with their ID, creation date,
+    title, and current status.
+    """
     paths, _ = _resolve_paths()
     db = _init_db(paths.db_path)
     rows = db.list_patch_proposals()
-    payload = [
-        {
-            "id": row["id"],
-            "created_at": row["created_at"],
-            "title": row["title"],
-            "status": row["status"],
-        }
-        for row in rows
-    ]
-    typer.echo(json.dumps(payload, indent=2))
+    if as_json:
+        payload = [
+            {
+                "id": row["id"],
+                "created_at": row["created_at"],
+                "title": row["title"],
+                "status": row["status"],
+            }
+            for row in rows
+        ]
+        typer.echo(json.dumps(payload, indent=2))
+    else:
+        console = Console()
+        console.print(format_patches_list(rows))
 
 
 @patch_app.command("show")
-def patches_show(proposal_id: str = typer.Argument(..., help="Patch proposal ID.")) -> None:
-    """Show a patch proposal."""
+def patches_show(
+    proposal_id: str = typer.Argument(..., help="Patch proposal ID."),
+    as_json: bool = typer.Option(False, "--json", help="Output raw JSON."),
+) -> None:
+    """Show a patch proposal.
+
+    Displays full details of a patch proposal including title, rationale,
+    affected files, diff, and test results.
+    """
     paths, _ = _resolve_paths()
     db = _init_db(paths.db_path)
     row = db.fetch_patch_proposal(proposal_id)
     if not row:
         typer.echo("Patch proposal not found.")
         return
-    typer.echo(json.dumps(dict(row), indent=2))
+    if as_json:
+        typer.echo(json.dumps(dict(row), indent=2))
+    else:
+        console = Console()
+        console.print(format_patch_detail(row))
 
 
 @patch_app.command("test")
 def patches_test(proposal_id: str = typer.Argument(..., help="Patch proposal ID.")) -> None:
-    """Run tests for a patch proposal."""
+    """Run tests for a patch proposal.
+
+    Executes the test suite specified in the patch proposal and records
+    the results in the database.
+    """
     paths, _ = _resolve_paths()
     _ensure_dependencies()
     code_dir = _ensure_agent_worktree(paths)
@@ -1764,7 +2062,11 @@ def patches_test(proposal_id: str = typer.Argument(..., help="Patch proposal ID.
 
 @patch_app.command("apply")
 def patches_apply(proposal_id: str = typer.Argument(..., help="Patch proposal ID.")) -> None:
-    """Apply a patch proposal after tests pass."""
+    """Apply a patch proposal after tests pass.
+
+    Applies the diff from the proposal to the agent's worktree. The
+    patch must be in 'tested' or 'approved' status with recorded results.
+    """
     paths, _ = _resolve_paths()
     code_dir = _ensure_agent_worktree(paths)
     db = _init_db(paths.db_path)
@@ -1804,7 +2106,10 @@ def patches_apply(proposal_id: str = typer.Argument(..., help="Patch proposal ID
 
 @patch_app.command("reject")
 def patches_reject(proposal_id: str = typer.Argument(..., help="Patch proposal ID.")) -> None:
-    """Reject a patch proposal."""
+    """Reject a patch proposal.
+
+    Marks a patch proposal as 'rejected' without applying changes.
+    """
     paths, _ = _resolve_paths()
     db = _init_db(paths.db_path)
     row = db.fetch_patch_proposal(proposal_id)
@@ -1822,7 +2127,11 @@ def patches_reject(proposal_id: str = typer.Argument(..., help="Patch proposal I
 
 @patch_app.command("rollback")
 def patches_rollback(proposal_id: str = typer.Argument(..., help="Patch proposal ID.")) -> None:
-    """Rollback an applied patch proposal."""
+    """Rollback an applied patch proposal.
+
+    Reverses a previously applied patch, restoring the worktree to its
+    pre-patch state.
+    """
     paths, _ = _resolve_paths()
     code_dir = _ensure_agent_worktree(paths)
     db = _init_db(paths.db_path)
@@ -1847,35 +2156,66 @@ def patches_rollback(proposal_id: str = typer.Argument(..., help="Patch proposal
 
 
 @agent_app.command("commitments")
-def commitments() -> None:
-    """List commitments."""
+def commitments_cmd(
+    as_json: bool = typer.Option(False, "--json", help="Output raw JSON."),
+) -> None:
+    """List commitments.
+
+    Shows all agent commitments with their status, priority, and due date.
+    """
     paths, _ = _resolve_paths()
     db = _init_db(paths.db_path)
     rows = db.list_commitments()
-    typer.echo(json.dumps([dict(row) for row in rows], indent=2))
+    if as_json:
+        typer.echo(json.dumps([dict(row) for row in rows], indent=2))
+    else:
+        console = Console()
+        console.print(format_commitments(rows))
 
 
 @agent_app.command("facts")
-def facts() -> None:
-    """List facts."""
+def facts_cmd(
+    as_json: bool = typer.Option(False, "--json", help="Output raw JSON."),
+) -> None:
+    """List facts.
+
+    Shows all stored facts with confidence scores and provenance.
+    """
     paths, _ = _resolve_paths()
     db = _init_db(paths.db_path)
     rows = db.list_facts()
-    typer.echo(json.dumps([dict(row) for row in rows], indent=2))
+    if as_json:
+        typer.echo(json.dumps([dict(row) for row in rows], indent=2))
+    else:
+        console = Console()
+        console.print(format_facts(rows))
 
 
 @agent_app.command("skills")
-def skills() -> None:
-    """List skills."""
+def skills_cmd(
+    as_json: bool = typer.Option(False, "--json", help="Output raw JSON."),
+) -> None:
+    """List skills.
+
+    Shows all learned skills with success/failure counts and triggers.
+    """
     paths, _ = _resolve_paths()
     db = _init_db(paths.db_path)
     rows = db.list_skills()
-    typer.echo(json.dumps([dict(row) for row in rows], indent=2))
+    if as_json:
+        typer.echo(json.dumps([dict(row) for row in rows], indent=2))
+    else:
+        console = Console()
+        console.print(format_skills(rows))
 
 
 @agent_app.command("diff")
 def diff() -> None:
-    """Show differences between the latest snapshot and current data."""
+    """Show differences between the latest snapshot and current data.
+
+    Compares the current data directory against the most recent snapshot
+    and displays what has changed.
+    """
     paths, _ = _resolve_paths()
     snapshots = list_snapshots(paths.data_dir)
     if not snapshots:
@@ -1887,7 +2227,11 @@ def diff() -> None:
 
 @agent_app.command("rollback")
 def rollback() -> None:
-    """Rollback data directory to the latest snapshot."""
+    """Rollback data directory to the latest snapshot.
+
+    Restores the agent's data directory to the state captured in the
+    most recent snapshot. Use 'agent diff' to preview changes first.
+    """
     paths, _ = _resolve_paths()
     snapshots = list_snapshots(paths.data_dir)
     if not snapshots:
@@ -1900,20 +2244,30 @@ def rollback() -> None:
 
 @agent_app.command("snapshot")
 def snapshot() -> None:
-    """Create a snapshot of the data directory."""
+    """Create a snapshot of the data directory.
+
+    Saves a point-in-time backup of the agent's data that can be
+    restored later with 'agent rollback'.
+    """
     paths, _ = _resolve_paths()
     snapshot = create_snapshot(paths.data_dir)
     typer.echo(f"Snapshot created: {snapshot.id}")
 
 
 @agent_app.command("doctor")
-def doctor() -> None:
-    """Validate core invariants and report staged items."""
+def doctor(
+    as_json: bool = typer.Option(False, "--json", help="Output raw JSON."),
+) -> None:
+    """Validate core invariants and report staged items.
+
+    Checks fact provenance, confidence ranges, staged item health,
+    and vector index integrity. Returns exit code 1 if violations found.
+    """
     paths, _ = _resolve_paths()
     db = _init_db(paths.db_path)
     violations: list[str] = []
-    facts = db.list_facts()
-    for row in facts:
+    all_facts = db.list_facts()
+    for row in all_facts:
         if row["provenance_type"] == "AGENT_OUTPUT":
             violations.append(f"Fact {row['id']} has forbidden provenance.")
         if not row["source_ref"]:
@@ -1925,7 +2279,7 @@ def doctor() -> None:
     staged_by_status = db.count_staged_items_by_status()
     oldest = db.oldest_pending_staged_item()
     mapping_path = (paths.vector_dir / "memory.index").with_suffix(".json")
-    vector_report = {"mapping_path": str(mapping_path), "mapping_entries": 0, "missing_facts": 0, "missing_episodes": 0}
+    vector_report: dict = {"mapping_path": str(mapping_path), "mapping_entries": 0, "missing_facts": 0, "missing_episodes": 0}
     if mapping_path.exists():
         try:
             mapping_payload = json.loads(mapping_path.read_text())
@@ -1950,14 +2304,335 @@ def doctor() -> None:
         "oldest_pending_staged_item": dict(oldest) if oldest else None,
         "vector_index": vector_report,
     }
-    typer.echo(json.dumps(report, indent=2))
+    if as_json:
+        typer.echo(json.dumps(report, indent=2))
+    else:
+        console = Console()
+        console.print(format_doctor(report))
     if violations:
         raise typer.Exit(code=1)
 
 
+# ---------------------------------------------------------------------------
+# Config commands
+# ---------------------------------------------------------------------------
+
+_CONFIG_SECTIONS = {
+    "planner_llm": LLMSettings,
+    "responder_llm": LLMSettings,
+    "embeddings": EmbeddingSettings,
+    "tools": ToolSettings,
+    "task_runner": TaskRunnerConfig,
+    "autonomy": AutonomyConfig,
+}
+
+
+def _coerce_value(field_type: object, raw: str) -> object:
+    """Coerce a CLI string to the expected dataclass field type."""
+    import types
+    import typing
+
+    # Unwrap union types (e.g. str | None, bool | None) to their first
+    # non-None component.
+    origin = getattr(field_type, "__origin__", None)
+    if isinstance(field_type, types.UnionType) or origin is typing.Union:
+        args = typing.get_args(field_type)
+        non_none = [a for a in args if a is not type(None)]
+        if non_none:
+            field_type = non_none[0]
+
+    if field_type is bool:
+        return raw.lower() in ("true", "1", "yes", "on")
+    if field_type is int:
+        return int(raw)
+    if field_type is float:
+        return float(raw)
+    if field_type is str:
+        return raw
+
+    # Fallback – try int then float then string
+    try:
+        return int(raw)
+    except ValueError:
+        pass
+    try:
+        return float(raw)
+    except ValueError:
+        pass
+    if raw.lower() in ("true", "false"):
+        return raw.lower() == "true"
+    return raw
+
+
+@config_app.command("show")
+def config_show(
+    as_json: bool = typer.Option(False, "--json", help="Output raw JSON."),
+) -> None:
+    """Show current agent configuration.
+
+    Displays all configuration sections (LLM, embeddings, tools,
+    task runner, autonomy) in a human-readable format.
+    """
+    paths, existing = _resolve_paths()
+    config = _load_or_raise_config(paths, existing)
+    if as_json:
+        typer.echo(json.dumps(json.loads(paths.config_path.read_text()), indent=2))
+    else:
+        console = Console()
+        console.print(format_config(config, str(paths.agent_home)))
+
+
+@config_app.command("set")
+def config_set(
+    field: str = typer.Argument(..., help="Dot-notation path, e.g. responder_llm.model or autonomy.enabled"),
+    value: str = typer.Argument(..., help="New value for the field."),
+) -> None:
+    """Update a configuration field.
+
+    Accepts dot-notation paths such as:
+      responder_llm.model, planner_llm.base_url, autonomy.enabled,
+      tools.approval_mode, task_runner.max_tasks_per_turn
+
+    Example:
+      tali agent config set responder_llm.model gemma-3b-v2
+    """
+    paths, existing = _resolve_paths()
+    config = _load_or_raise_config(paths, existing)
+    parts = field.split(".")
+    if len(parts) == 1:
+        # Top-level agent field
+        top = parts[0]
+        if top in ("role_description",):
+            old_val = getattr(config, top, None)
+            config = replace(config, **{top: value})
+            save_config(paths.config_path, config)
+            typer.echo(f"Updated {top}: {old_val!r} -> {value!r}")
+            return
+        typer.echo(f"Unknown or read-only top-level field: {top}")
+        typer.echo("Settable fields: role_description, or use section.field (e.g. responder_llm.model)")
+        raise typer.Exit(code=1)
+    elif len(parts) == 2:
+        section_name, attr = parts
+        if section_name not in _CONFIG_SECTIONS:
+            typer.echo(f"Unknown config section: {section_name}")
+            typer.echo(f"Available sections: {', '.join(_CONFIG_SECTIONS.keys())}")
+            raise typer.Exit(code=1)
+        section_obj = getattr(config, section_name, None)
+        section_cls = _CONFIG_SECTIONS[section_name]
+        if section_obj is None:
+            section_obj = section_cls()
+        if not hasattr(section_obj, attr):
+            typer.echo(f"Unknown field '{attr}' in section '{section_name}'.")
+            valid = [f.name for f in section_cls.__dataclass_fields__.values()]
+            typer.echo(f"Available fields: {', '.join(valid)}")
+            raise typer.Exit(code=1)
+        # Determine target type from dataclass field annotation
+        field_meta = section_cls.__dataclass_fields__[attr]
+        old_val = getattr(section_obj, attr)
+        coerced = _coerce_value(field_meta.type, value)
+        # Validate provider fields
+        if attr == "provider" and coerced not in ("openai", "ollama"):
+            typer.echo("Provider must be 'openai' or 'ollama'.")
+            raise typer.Exit(code=1)
+        new_section = replace(section_obj, **{attr: coerced})
+        config = replace(config, **{section_name: new_section})
+        save_config(paths.config_path, config)
+        typer.echo(f"Updated {field}: {old_val!r} -> {coerced!r}")
+    else:
+        typer.echo("Field path too deep. Use section.field format (e.g. responder_llm.model).")
+        raise typer.Exit(code=1)
+
+
+@config_app.command("reset")
+def config_reset(
+    field: str = typer.Argument(..., help="Dot-notation path to reset, e.g. autonomy.idle_trigger_seconds"),
+) -> None:
+    """Reset a configuration field to its default value.
+
+    Example:
+      tali agent config reset autonomy.idle_trigger_seconds
+    """
+    parts = field.split(".")
+    if len(parts) != 2:
+        typer.echo("Use section.field format (e.g. autonomy.idle_trigger_seconds).")
+        raise typer.Exit(code=1)
+    section_name, attr = parts
+    if section_name not in _CONFIG_SECTIONS:
+        typer.echo(f"Unknown config section: {section_name}")
+        raise typer.Exit(code=1)
+    section_cls = _CONFIG_SECTIONS[section_name]
+    if attr not in section_cls.__dataclass_fields__:
+        typer.echo(f"Unknown field '{attr}' in section '{section_name}'.")
+        raise typer.Exit(code=1)
+    default_obj = section_cls()
+    default_val = getattr(default_obj, attr)
+    paths, existing = _resolve_paths()
+    config = _load_or_raise_config(paths, existing)
+    section_obj = getattr(config, section_name, None)
+    if section_obj is None:
+        section_obj = section_cls()
+    old_val = getattr(section_obj, attr)
+    new_section = replace(section_obj, **{attr: default_val})
+    config = replace(config, **{section_name: new_section})
+    save_config(paths.config_path, config)
+    typer.echo(f"Reset {field}: {old_val!r} -> {default_val!r} (default)")
+
+
+# ---------------------------------------------------------------------------
+# Memory commands
+# ---------------------------------------------------------------------------
+
+@memory_app.command("search")
+def memory_search(
+    query: str = typer.Argument(..., help="Search query."),
+    limit: int = typer.Option(10, "--limit", help="Max results per category."),
+    facts_only: bool = typer.Option(False, "--facts-only", help="Only search facts."),
+    episodes_only: bool = typer.Option(False, "--episodes-only", help="Only search episodes."),
+    as_json: bool = typer.Option(False, "--json", help="Output raw JSON."),
+) -> None:
+    """Search agent memory for facts and episodes.
+
+    Performs a full-text search across the agent's stored facts and
+    conversation episodes. Results are ranked by relevance.
+
+    Example:
+      tali agent memory search "project deadline"
+    """
+    paths, _ = _resolve_paths()
+    db = _init_db(paths.db_path)
+    fact_rows = [] if episodes_only else db.search_facts(query, limit)
+    episode_rows = [] if facts_only else db.search_episodes(query, limit)
+    if as_json:
+        payload = {
+            "facts": [dict(r) for r in fact_rows],
+            "episodes": [dict(r) for r in episode_rows],
+        }
+        typer.echo(json.dumps(payload, indent=2))
+    else:
+        console = Console()
+        console.print(format_memory_search(fact_rows, episode_rows))
+
+
+# ---------------------------------------------------------------------------
+# Commitment add command
+# ---------------------------------------------------------------------------
+
+@agent_app.command("commitment-add")
+def commitment_add(
+    description: str = typer.Argument(..., help="Commitment description."),
+    due: Optional[str] = typer.Option(None, "--due", help="Due date (YYYY-MM-DD)."),
+    priority: int = typer.Option(3, "--priority", help="Priority (1=highest, 5=lowest)."),
+) -> None:
+    """Add a new commitment for the agent.
+
+    The agent will pick up this commitment during its next cycle.
+
+    Example:
+      tali agent commitment-add "Review pull request #42" --due 2026-03-01
+    """
+    paths, _ = _resolve_paths()
+    db = _init_db(paths.db_path)
+    now = datetime.utcnow().isoformat()
+    cid = str(uuid4())
+    db.insert_commitment(
+        commitment_id=cid,
+        description=description,
+        status="pending",
+        priority=priority,
+        due_date=due,
+        created_at=now,
+        last_touched=now,
+        source_ref="cli",
+    )
+    typer.echo(f"Commitment added: {cid[:8]} - {description}")
+
+
+# ---------------------------------------------------------------------------
+# Preference commands
+# ---------------------------------------------------------------------------
+
+@pref_app.command("list")
+def preferences_list(
+    as_json: bool = typer.Option(False, "--json", help="Output raw JSON."),
+) -> None:
+    """List user preferences.
+
+    Shows all stored preferences with their confidence scores.
+    """
+    paths, _ = _resolve_paths()
+    db = _init_db(paths.db_path)
+    rows = db.list_preferences()
+    if as_json:
+        typer.echo(json.dumps([dict(row) for row in rows], indent=2))
+    else:
+        console = Console()
+        console.print(format_preferences(rows))
+
+
+@pref_app.command("set")
+def preferences_set(
+    key: str = typer.Argument(..., help="Preference key."),
+    value: str = typer.Argument(..., help="Preference value."),
+    confidence: float = typer.Option(0.9, "--confidence", help="Confidence score (0.0-1.0)."),
+) -> None:
+    """Set a user preference.
+
+    Stores or updates a preference in the agent's database.
+
+    Example:
+      tali agent preferences set humor off
+      tali agent preferences set coding_style "functional"
+    """
+    paths, _ = _resolve_paths()
+    db = _init_db(paths.db_path)
+    now = datetime.utcnow().isoformat()
+    db.upsert_preference(
+        key=key,
+        value=value,
+        confidence=confidence,
+        provenance_type="USER_EXPLICIT",
+        source_ref="cli",
+        updated_at=now,
+    )
+    typer.echo(f"Preference set: {key} = {value} (confidence: {confidence})")
+
+
+@pref_app.command("remove")
+def preferences_remove(
+    key: str = typer.Argument(..., help="Preference key to remove."),
+) -> None:
+    """Remove a user preference.
+
+    Deletes a preference from the agent's database.
+    """
+    paths, _ = _resolve_paths()
+    db = _init_db(paths.db_path)
+    db.delete_preference(key)
+    typer.echo(f"Preference removed: {key}")
+
+
+# ---------------------------------------------------------------------------
+# Help command
+# ---------------------------------------------------------------------------
+
+@agent_app.command("help")
+def agent_help() -> None:
+    """Show common workflows and a quick reference guide.
+
+    Displays a cheat-sheet of the most useful Tali commands grouped
+    by category.
+    """
+    console = Console()
+    console.print(format_help_guide())
+
+
 @app.command("setup")
 def setup() -> None:
-    """Walk through configuration and install dependencies."""
+    """Walk through configuration and install dependencies.
+
+    Interactive wizard that configures LLM provider, model, API keys,
+    embedding settings, and verifies connectivity.
+    """
     root, agent_name, existing_config = resolve_agent(prompt_fn=typer.prompt, allow_create_config=True)
     paths = load_paths(root, agent_name)
     typer.echo("Setting up Tali configuration.")

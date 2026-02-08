@@ -8,12 +8,16 @@ import re
 Tier = str
 
 
+QueryType = str  # "coding", "conversational", "general"
+
+
 @dataclass(frozen=True)
 class ScoringResult:
     score: float
     tier: Tier | None
     confidence: float
     signals: list[str]
+    query_type: QueryType = "general"
 
 
 @dataclass(frozen=True)
@@ -195,6 +199,36 @@ def classify_request(
     return _classify_by_rules(prompt, system_prompt, token_estimate, cfg)
 
 
+_FILE_PATH_RE = re.compile(
+    r"(?:[a-zA-Z]:\\|/)[^\s]+\.\w{1,6}"  # Windows or Unix paths with extension
+    r"|[a-zA-Z_]\w*\.\w{1,6}(?=\s|$|[,;)\]])"  # file.ext pattern
+)
+
+
+def _detect_query_type(
+    prompt: str,
+    dimensions: list[_DimensionScore],
+) -> QueryType:
+    """Determine whether a prompt is coding, conversational, or general."""
+    dim_scores = {d.name: d.score for d in dimensions}
+    code_score = dim_scores.get("codePresence", 0.0)
+    technical_score = dim_scores.get("technicalTerms", 0.0)
+    simple_score = dim_scores.get("simpleIndicators", 0.0)
+    reasoning_score = dim_scores.get("reasoningMarkers", 0.0)
+
+    # Strong code signals: code keywords, triple backticks, or file paths
+    has_code_block = "```" in prompt
+    has_file_path = bool(_FILE_PATH_RE.search(prompt))
+    if code_score >= 0.5 or has_code_block or (has_file_path and technical_score > 0):
+        return "coding"
+
+    # Conversational: simple indicators active, no technical/reasoning signals
+    if simple_score <= -0.5 and technical_score <= 0 and reasoning_score <= 0 and code_score <= 0:
+        return "conversational"
+
+    return "general"
+
+
 def _classify_by_rules(
     prompt: str,
     system_prompt: str | None,
@@ -311,6 +345,7 @@ def _classify_by_rules(
     for d in dimensions:
         weight = config.dimension_weights.get(d.name, 0.0)
         weighted_score += d.score * weight
+    query_type = _detect_query_type(prompt, dimensions)
     reasoning_matches = _count_keyword_matches(text, config.reasoning_keywords)
     if reasoning_matches >= 2:
         confidence = _calibrate_confidence(max(weighted_score, 0.3), config.confidence_steepness)
@@ -319,6 +354,7 @@ def _classify_by_rules(
             tier="REASONING",
             confidence=max(confidence, 0.85),
             signals=signals,
+            query_type=query_type,
         )
     tier, distance = _map_to_tier(
         weighted_score,
@@ -328,8 +364,20 @@ def _classify_by_rules(
     )
     confidence = _calibrate_confidence(distance, config.confidence_steepness)
     if confidence < config.confidence_threshold:
-        return ScoringResult(score=weighted_score, tier=None, confidence=confidence, signals=signals)
-    return ScoringResult(score=weighted_score, tier=tier, confidence=confidence, signals=signals)
+        return ScoringResult(
+            score=weighted_score,
+            tier=None,
+            confidence=confidence,
+            signals=signals,
+            query_type=query_type,
+        )
+    return ScoringResult(
+        score=weighted_score,
+        tier=tier,
+        confidence=confidence,
+        signals=signals,
+        query_type=query_type,
+    )
 
 
 @dataclass(frozen=True)

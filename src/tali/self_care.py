@@ -137,7 +137,7 @@ def run_auto_sleep(
         output_path = run_sleep(db, output_dir, llm=sleep_llm)
         snapshot = create_snapshot(data_dir)
         payload = load_sleep_output(output_path)
-        result = apply_sleep_changes(db, payload, SleepPolicy())
+        result = apply_sleep_changes(db, payload, SleepPolicy(), hook_manager=hook_manager)
         for fact_id in result.inserted_fact_ids:
             facts = db.fetch_facts_by_ids([fact_id])
             if facts:
@@ -353,6 +353,88 @@ def _parse_confirmation(user_input: str) -> bool | None:
     }:
         return False
     return None
+
+
+def resolve_contradiction_answer(
+    db: Database,
+    user_input: str,
+    reason_json: dict[str, Any],
+    source_ref: str,
+) -> bool:
+    """Resolve a contradiction based on the user's answer.
+
+    The user is expected to have been asked which of two conflicting
+    statements is correct.  We parse their answer, lower the confidence
+    of the rejected fact, and record a resolution link.
+
+    Returns True if the contradiction was resolved, False otherwise.
+    """
+    new_fact_id: str | None = reason_json.get("new_fact_id")
+    existing_fact_id: str = reason_json.get("existing_fact_id", "")
+    new_statement: str = reason_json.get("new_statement", "")
+    existing_statement: str = reason_json.get("existing_statement", "")
+
+    if not existing_fact_id:
+        return False
+
+    normalized = user_input.strip().lower()
+
+    # Determine which fact the user chose.
+    # Heuristic: if the answer contains tokens from one statement or
+    # explicit ordinal references ("first", "second", "new", "old"),
+    # pick that one.  Fall back to simple yes/no (yes = new is correct).
+    keep_new: bool | None = None
+    if any(kw in normalized for kw in ("first", "new", "the new")):
+        keep_new = True
+    elif any(kw in normalized for kw in ("second", "old", "the old", "existing", "original")):
+        keep_new = False
+    elif new_statement and new_statement.lower() in normalized:
+        keep_new = True
+    elif existing_statement and existing_statement.lower() in normalized:
+        keep_new = False
+    else:
+        # Fall back to yes/no parsing (yes = the new statement is correct)
+        confirmation = _parse_confirmation(user_input)
+        if confirmation is True:
+            keep_new = True
+        elif confirmation is False:
+            keep_new = False
+
+    if keep_new is None:
+        return False
+
+    now = datetime.utcnow().isoformat()
+
+    if keep_new:
+        # Lower confidence of the existing (rejected) fact
+        db.update_fact_confidence(existing_fact_id, 0.05)
+        db.clear_fact_contested(existing_fact_id)
+        if new_fact_id:
+            db.clear_fact_contested(new_fact_id)
+            db.insert_fact_link(
+                link_id=str(uuid.uuid4()),
+                fact_id=new_fact_id,
+                related_fact_id=existing_fact_id,
+                episode_id=source_ref,
+                link_type="resolved_by_user",
+                created_at=now,
+            )
+    else:
+        # Lower confidence of the new (rejected) fact
+        if new_fact_id:
+            db.update_fact_confidence(new_fact_id, 0.05)
+            db.clear_fact_contested(new_fact_id)
+            db.insert_fact_link(
+                link_id=str(uuid.uuid4()),
+                fact_id=existing_fact_id,
+                related_fact_id=new_fact_id,
+                episode_id=source_ref,
+                link_type="resolved_by_user",
+                created_at=now,
+            )
+        db.clear_fact_contested(existing_fact_id)
+
+    return True
 
 
 def _stage_sleep_error(db: Database, error: str) -> None:

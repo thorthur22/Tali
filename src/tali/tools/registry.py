@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import difflib
 import os
 import re
 import shlex
 import shutil
+import subprocess
 from urllib.parse import quote
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,7 +50,7 @@ class ToolRegistry:
         lines: list[str] = []
         for tool in self.list_tools():
             args_desc = ", ".join(f"{key}: {value}" for key, value in tool.args_schema.items()) or "none"
-            lines.append(f"- {tool.name}: {tool.description} (args: {args_desc})")
+            lines.append(f"- {tool.name} [{tool.risk_level}]: {tool.description} (args: {args_desc})")
         return "\n".join(lines)
 
 
@@ -234,6 +236,27 @@ def _validate_shell_run(args: dict[str, Any]) -> tuple[bool, str | None, list[st
         if len(tokens) != 2:
             return False, "cat/type requires a single path argument", [], None
         return True, None, [], "needs_approval"
+    # Additional read-only commands
+    if verb in {"grep", "rg"}:
+        return True, None, [], "needs_approval"
+    if verb == "find":
+        return True, None, [], "needs_approval"
+    if verb == "wc":
+        return True, None, [], "needs_approval"
+    if verb in {"head", "tail"}:
+        return True, None, [], "needs_approval"
+    if verb in {"which", "where"}:
+        return True, None, [], "needs_approval"
+    if verb == "tree":
+        return True, None, [], "needs_approval"
+    if verb in {"python", "python3"}:
+        if len(tokens) == 2 and tokens[1] == "--version":
+            return True, None, [], "needs_approval"
+        return False, "only python --version is allowed via shell", [], "destructive"
+    if verb == "pip":
+        if len(tokens) >= 2 and tokens[1].lower() in {"list", "show"}:
+            return True, None, [], "needs_approval"
+        return False, "only pip list/show are allowed via shell", [], "destructive"
     return False, f"command not allowed: {verb}", [], "destructive"
 
 
@@ -258,6 +281,51 @@ def _validate_python_eval(args: dict[str, Any]) -> tuple[bool, str | None, list[
     if not isinstance(code, str) or not code.strip():
         return False, "code must be a non-empty string", [], None
     return True, None, [], "needs_approval"
+
+
+def _validate_project_run_tests(args: dict[str, Any]) -> tuple[bool, str | None, list[str], str | None]:
+    command = args.get("command", "pytest")
+    if not isinstance(command, str) or not command.strip():
+        return False, "command must be a non-empty string", [], None
+    forbidden = ["|", ">", "<", "&&", ";", "||", "&"]
+    for token in forbidden:
+        if token in command:
+            return False, f"command contains forbidden token: {token}", [], "destructive"
+    tokens = shlex.split(command, posix=False)
+    if not tokens:
+        return False, "command is empty", [], None
+    base = tokens[0].lower()
+    allowed_bases = {"pytest", "python"}
+    if base not in allowed_bases:
+        return False, f"test command base not allowed: {base}", [], "destructive"
+    if base == "python":
+        if len(tokens) < 3 or tokens[1] != "-m" or tokens[2].lower() != "pytest":
+            return False, "python commands must be 'python -m pytest ...'", [], "destructive"
+    if "path" in args:
+        ok, err = _validate_path_arg(args, "path")
+        if not ok:
+            return ok, err, [], None
+    return True, None, [], "needs_approval"
+
+
+def _validate_fs_diff(args: dict[str, Any]) -> tuple[bool, str | None, list[str], str | None]:
+    ok, err = _validate_path_arg(args, "path")
+    if not ok:
+        return ok, err, [], None
+    if "other_path" in args:
+        ok, err = _validate_path_arg(args, "other_path")
+        if not ok:
+            return ok, err, [], None
+    return True, None, [], None
+
+
+def _validate_web_fetch_text(args: dict[str, Any]) -> tuple[bool, str | None, list[str], str | None]:
+    url = args.get("url")
+    if not isinstance(url, str) or not url.strip():
+        return False, "url must be a non-empty string", [], None
+    if not (url.startswith("http://") or url.startswith("https://")):
+        return False, "url must start with http:// or https://", [], None
+    return True, None, [], None
 
 
 def _signature_shell(args: dict[str, Any]) -> str | None:
@@ -483,8 +551,6 @@ def build_default_registry(paths: Paths, settings: ToolSettings) -> ToolRegistry
         tokens = shlex.split(command, posix=False)
         verb = tokens[0].lower()
         if verb == "git":
-            import subprocess
-
             result = subprocess.run(
                 tokens,
                 capture_output=True,
@@ -503,6 +569,19 @@ def build_default_registry(paths: Paths, settings: ToolSettings) -> ToolRegistry
             path = _resolve_root(fs_root, tokens[1])
             data = path.read_text(encoding="utf-8", errors="replace")
             return f"Read {path}", data
+        # Extended read-only commands via subprocess
+        if verb in {"grep", "rg", "find", "wc", "head", "tail", "which", "where",
+                     "tree", "python", "python3", "pip"}:
+            result = subprocess.run(
+                tokens,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=settings.max_tool_seconds,
+                cwd=str(fs_root),
+            )
+            output = result.stdout + result.stderr
+            return f"{verb} exited {result.returncode}", output.strip()
         raise ValueError("command not allowed")
 
     def web_fetch(args: dict[str, Any]) -> tuple[str, str]:
@@ -564,6 +643,92 @@ def build_default_registry(paths: Paths, settings: ToolSettings) -> ToolRegistry
         code = args["code"]
         return "Python eval requested", code
 
+    def project_run_tests(args: dict[str, Any]) -> tuple[str, str]:
+        command = args.get("command", "pytest")
+        tokens = shlex.split(command, posix=False)
+        cwd = str(fs_root)
+        if "path" in args:
+            cwd = str(_resolve_root(fs_root, args["path"]))
+        result = subprocess.run(
+            tokens,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=settings.max_tool_seconds,
+            cwd=cwd,
+        )
+        output = result.stdout + result.stderr
+        passed = result.returncode == 0
+        summary = f"Tests {'PASSED' if passed else 'FAILED'} (exit {result.returncode})"
+        return summary, output.strip()
+
+    def fs_diff(args: dict[str, Any]) -> tuple[str, str]:
+        path = _resolve_root(fs_root, args["path"])
+        other_path_str = args.get("other_path")
+        if other_path_str:
+            other_path = _resolve_root(fs_root, other_path_str)
+            a_lines = path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+            b_lines = other_path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+            diff = difflib.unified_diff(a_lines, b_lines, fromfile=str(path), tofile=str(other_path))
+            diff_text = "".join(diff)
+            if not diff_text:
+                return f"Diff {path} vs {other_path}", "Files are identical."
+            return f"Diff {path} vs {other_path}", diff_text
+        else:
+            result = subprocess.run(
+                ["git", "diff", "--", str(path)],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=settings.max_tool_seconds,
+                cwd=str(fs_root),
+            )
+            diff_text = result.stdout.strip()
+            if not diff_text:
+                return f"Diff {path}", "No uncommitted changes."
+            return f"Diff {path}", diff_text
+
+    def _strip_html(html_text: str) -> str:
+        text = re.sub(r"<script[^>]*>.*?</script>", " ", html_text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"<style[^>]*>.*?</style>", " ", text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"&nbsp;", " ", text)
+        text = re.sub(r"&amp;", "&", text)
+        text = re.sub(r"&lt;", "<", text)
+        text = re.sub(r"&gt;", ">", text)
+        text = re.sub(r"&quot;", '"', text)
+        text = re.sub(r"&#39;", "'", text)
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
+
+    def web_fetch_text(args: dict[str, Any]) -> tuple[str, str]:
+        import httpx
+
+        url = args["url"]
+        timeout = settings.web_timeout_s
+        max_bytes = settings.web_max_bytes
+        max_redirects = settings.web_max_redirects
+
+        current = url
+        for _ in range(max_redirects + 1):
+            with httpx.Client(timeout=timeout, follow_redirects=False) as client:
+                response = client.get(current)
+            if response.status_code in {301, 302, 303, 307, 308}:
+                location = response.headers.get("location")
+                if not location:
+                    break
+                current = location
+                continue
+            content = response.content[: max_bytes + 1]
+            truncated = len(content) > max_bytes
+            raw_text = content[:max_bytes].decode("utf-8", errors="replace")
+            cleaned = _strip_html(raw_text)
+            if truncated:
+                cleaned += "\n[truncated]"
+            summary = f"Fetched text from {current} status={response.status_code}"
+            return summary, cleaned
+        raise ValueError("too many redirects")
+
     registry.register(
         ToolDefinition(
             name="fs.read",
@@ -618,7 +783,7 @@ def build_default_registry(paths: Paths, settings: ToolSettings) -> ToolRegistry
                 "glob": "string (optional)",
                 "max_results": "int (optional)",
             },
-            risk_level="needs_approval",
+            risk_level="safe",
             validate_args=_validate_fs_search,
             handle=fs_search,
             signature=_signature_default,
@@ -629,7 +794,7 @@ def build_default_registry(paths: Paths, settings: ToolSettings) -> ToolRegistry
             name="fs.glob",
             description=f"Find files matching a glob under root {fs_root}",
             args_schema={"pattern": "string", "path": "string (optional)"},
-            risk_level="needs_approval",
+            risk_level="safe",
             validate_args=_validate_fs_glob,
             handle=fs_glob,
             signature=_signature_default,
@@ -640,7 +805,7 @@ def build_default_registry(paths: Paths, settings: ToolSettings) -> ToolRegistry
             name="fs.tree",
             description=f"List a directory tree under root {fs_root}",
             args_schema={"path": "string (optional)", "max_depth": "int (optional)"},
-            risk_level="needs_approval",
+            risk_level="safe",
             validate_args=_validate_fs_tree,
             handle=fs_tree,
             signature=_signature_default,
@@ -651,7 +816,7 @@ def build_default_registry(paths: Paths, settings: ToolSettings) -> ToolRegistry
             name="fs.read_lines",
             description=f"Read a range of lines from a file under root {fs_root}",
             args_schema={"path": "string", "start": "int (optional)", "limit": "int (optional)"},
-            risk_level="needs_approval",
+            risk_level="safe",
             validate_args=_validate_fs_read_lines,
             handle=fs_read_lines,
             signature=_signature_default,
@@ -737,11 +902,44 @@ def build_default_registry(paths: Paths, settings: ToolSettings) -> ToolRegistry
     registry.register(
         ToolDefinition(
             name="python.eval",
-            description="Evaluate Python code in a sandbox (disabled by default)",
+            description="Evaluate Python code in a sandbox",
             args_schema={"code": "string"},
             risk_level="needs_approval",
             validate_args=_validate_python_eval,
             handle=python_eval,
+            signature=_signature_default,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="project.run_tests",
+            description="Run project tests (pytest) and return pass/fail results",
+            args_schema={"command": "string (optional, default: pytest)", "path": "string (optional, working dir)"},
+            risk_level="needs_approval",
+            validate_args=_validate_project_run_tests,
+            handle=project_run_tests,
+            signature=_signature_default,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="fs.diff",
+            description=f"Show diff for a file (git diff or compare two files) under root {fs_root}",
+            args_schema={"path": "string", "other_path": "string (optional)"},
+            risk_level="safe",
+            validate_args=_validate_fs_diff,
+            handle=fs_diff,
+            signature=_signature_default,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="web.fetch_text",
+            description="Fetch a URL and return cleaned text (HTML tags stripped)",
+            args_schema={"url": "string"},
+            risk_level="safe",
+            validate_args=_validate_web_fetch_text,
+            handle=web_fetch_text,
             signature=_signature_default,
         )
     )

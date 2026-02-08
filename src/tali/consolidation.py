@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 
 from tali.db import Database
 from tali.models import FORBIDDEN_FACT_TYPES, ProvenanceType
+from tali.questions import queue_question
 
 
 CONFIDENCE_DEFAULTS: dict[str, float] = {
@@ -44,6 +45,7 @@ def apply_sleep_changes(
     db: Database,
     payload: dict[str, object],
     policy: SleepPolicy | None = None,
+    hook_manager: object | None = None,
 ) -> ConsolidationResult:
     policy = policy or SleepPolicy()
     fact_candidates = payload.get("fact_candidates", [])
@@ -157,6 +159,20 @@ def apply_sleep_changes(
                             source_ref=source_ref,
                         )
                     )
+                    _queue_contradiction_question(
+                        db,
+                        new_statement=statement,
+                        existing_statement=str(row["statement"]),
+                        new_fact_id=None,
+                        existing_fact_id=str(row["id"]),
+                    )
+                    if hook_manager and hasattr(hook_manager, "run"):
+                        hook_manager.run("on_contradiction_detected", {
+                            "new_statement": statement,
+                            "existing_statement": str(row["statement"]),
+                            "new_fact_id": None,
+                            "existing_fact_id": str(row["id"]),
+                        })
                     skipped_candidates.append("contradiction_high_confidence")
                     blocked_by_contradiction = True
                     break
@@ -190,6 +206,22 @@ def apply_sleep_changes(
                     created_at=datetime.utcnow().isoformat(),
                 )
                 db.mark_fact_contested(related_id)
+                existing_rows = db.fetch_facts_by_ids([related_id])
+                existing_stmt = str(existing_rows[0]["statement"]) if existing_rows else ""
+                _queue_contradiction_question(
+                    db,
+                    new_statement=statement,
+                    existing_statement=existing_stmt,
+                    new_fact_id=fact_id,
+                    existing_fact_id=related_id,
+                )
+                if hook_manager and hasattr(hook_manager, "run"):
+                    hook_manager.run("on_contradiction_detected", {
+                        "new_statement": statement,
+                        "existing_statement": existing_stmt,
+                        "new_fact_id": fact_id,
+                        "existing_fact_id": related_id,
+                    })
 
     for candidate in commitment_updates:
         if not isinstance(candidate, dict):
@@ -409,6 +441,28 @@ def _coerce_confidence(value: object, default: float) -> float:
         except ValueError:
             return default
     return default
+
+
+def _queue_contradiction_question(
+    db: Database,
+    new_statement: str,
+    existing_statement: str,
+    new_fact_id: str | None,
+    existing_fact_id: str,
+) -> str:
+    """Queue a high-priority question asking the user to resolve a contradiction."""
+    question = (
+        f"I found conflicting information: \"{new_statement}\" vs "
+        f"\"{existing_statement}\". Which is correct?"
+    )
+    reason = json.dumps({
+        "type": "contradiction",
+        "new_statement": new_statement,
+        "existing_statement": existing_statement,
+        "new_fact_id": new_fact_id,
+        "existing_fact_id": existing_fact_id,
+    })
+    return queue_question(db, question=question, reason=reason, priority=5)
 
 
 def _normalize(text: str) -> str:

@@ -124,11 +124,13 @@ CREATE INDEX IF NOT EXISTS idx_staged_kind ON staged_items (kind);
 CREATE TABLE IF NOT EXISTS runs (
   id TEXT PRIMARY KEY,
   created_at DATETIME NOT NULL,
+  updated_at DATETIME,
   status TEXT NOT NULL,
   user_prompt TEXT NOT NULL,
   run_summary TEXT,
   current_task_id TEXT,
-  last_error TEXT
+  last_error TEXT,
+  origin TEXT DEFAULT 'user'
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -180,6 +182,7 @@ CREATE TABLE IF NOT EXISTS patch_proposals (
   diff_text TEXT NOT NULL,
   status TEXT NOT NULL,
   test_results TEXT,
+  review_json TEXT,
   rollback_ref TEXT
 );
 
@@ -244,12 +247,33 @@ class Database:
         with self.connect() as connection:
             connection.executescript(SCHEMA)
             self._ensure_run_summary_column(connection)
+            self._ensure_run_origin_column(connection)
+            self._ensure_run_updated_at_column(connection)
+            self._ensure_patch_review_json_column(connection)
 
     def _ensure_run_summary_column(self, connection: sqlite3.Connection) -> None:
         cursor = connection.execute("PRAGMA table_info(runs)")
         columns = {row["name"] for row in cursor.fetchall()}
         if "run_summary" not in columns:
             connection.execute("ALTER TABLE runs ADD COLUMN run_summary TEXT")
+
+    def _ensure_run_origin_column(self, connection: sqlite3.Connection) -> None:
+        cursor = connection.execute("PRAGMA table_info(runs)")
+        columns = {row["name"] for row in cursor.fetchall()}
+        if "origin" not in columns:
+            connection.execute("ALTER TABLE runs ADD COLUMN origin TEXT DEFAULT 'user'")
+
+    def _ensure_run_updated_at_column(self, connection: sqlite3.Connection) -> None:
+        cursor = connection.execute("PRAGMA table_info(runs)")
+        columns = {row["name"] for row in cursor.fetchall()}
+        if "updated_at" not in columns:
+            connection.execute("ALTER TABLE runs ADD COLUMN updated_at DATETIME")
+
+    def _ensure_patch_review_json_column(self, connection: sqlite3.Connection) -> None:
+        cursor = connection.execute("PRAGMA table_info(patch_proposals)")
+        columns = {row["name"] for row in cursor.fetchall()}
+        if "review_json" not in columns:
+            connection.execute("ALTER TABLE patch_proposals ADD COLUMN review_json TEXT")
 
     def insert_episode(
         self,
@@ -494,6 +518,10 @@ class Database:
                 """,
                 (key, value, confidence, provenance_type, source_ref, updated_at),
             )
+
+    def delete_preference(self, key: str) -> None:
+        with self.connect() as connection:
+            connection.execute("DELETE FROM preferences WHERE key = ?", (key,))
 
     def fetch_recent_episodes(self, limit: int) -> list[sqlite3.Row]:
         with self.connect() as connection:
@@ -887,14 +915,15 @@ class Database:
         run_summary: str | None = None,
         current_task_id: str | None = None,
         last_error: str | None = None,
+        origin: str = "user",
     ) -> None:
         with self.connect() as connection:
             connection.execute(
                 """
-                INSERT INTO runs (id, created_at, status, user_prompt, run_summary, current_task_id, last_error)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO runs (id, created_at, updated_at, status, user_prompt, run_summary, current_task_id, last_error, origin)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (run_id, created_at, status, user_prompt, run_summary, current_task_id, last_error),
+                (run_id, created_at, created_at, status, user_prompt, run_summary, current_task_id, last_error, origin),
             )
 
     def update_run_status(
@@ -908,10 +937,10 @@ class Database:
             connection.execute(
                 """
                 UPDATE runs
-                SET status = ?, current_task_id = ?, last_error = ?
+                SET status = ?, current_task_id = ?, last_error = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (status, current_task_id, last_error, run_id),
+                (status, current_task_id, last_error, datetime.utcnow().isoformat(), run_id),
             )
 
     def update_run_summary(self, run_id: str, run_summary: str) -> None:
@@ -941,6 +970,33 @@ class Database:
                 """
             )
             return cursor.fetchone()
+
+    def fetch_autonomous_active_run(self) -> sqlite3.Row | None:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                SELECT * FROM runs
+                WHERE status IN ('active', 'blocked')
+                  AND origin = 'autonomous'
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            )
+            return cursor.fetchone()
+
+    def fetch_pending_commitments(self) -> list[sqlite3.Row]:
+        now = datetime.utcnow().isoformat()
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                SELECT * FROM commitments
+                WHERE status = 'pending'
+                   OR (due_date IS NOT NULL AND due_date <= ? AND status NOT IN ('done', 'failed', 'cancelled'))
+                ORDER BY priority ASC, due_date ASC, last_touched DESC
+                """,
+                (now,),
+            )
+            return cursor.fetchall()
 
     def list_runs(self, limit: int = 20) -> list[sqlite3.Row]:
         with self.connect() as connection:
@@ -1367,3 +1423,74 @@ class Database:
                 (correlation_id,),
             )
             return cursor.fetchone()
+
+    # --- Persistence & Recovery ---
+
+    def heartbeat_run(self, run_id: str) -> None:
+        """Touch the updated_at timestamp on a run to signal liveness."""
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE runs SET updated_at = ? WHERE id = ?",
+                (datetime.utcnow().isoformat(), run_id),
+            )
+
+    def fetch_stale_runs(self, timeout_minutes: int = 30) -> list[sqlite3.Row]:
+        """Return runs in 'active' status whose updated_at is older than timeout."""
+        from datetime import timedelta
+        cutoff = (datetime.utcnow() - timedelta(minutes=timeout_minutes)).isoformat()
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                SELECT * FROM runs
+                WHERE status = 'active'
+                  AND updated_at IS NOT NULL
+                  AND updated_at < ?
+                ORDER BY created_at DESC
+                """,
+                (cutoff,),
+            )
+            return cursor.fetchall()
+
+    def fetch_incomplete_runs(self) -> list[sqlite3.Row]:
+        """Return all runs with status in ('active', 'blocked')."""
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                SELECT * FROM runs
+                WHERE status IN ('active', 'blocked')
+                ORDER BY created_at DESC
+                """
+            )
+            return cursor.fetchall()
+
+    # --- Patch Review ---
+
+    def update_patch_review(self, proposal_id: str, review_json: str, status: str) -> None:
+        """Store the LLM review result and optionally update patch status."""
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE patch_proposals
+                SET review_json = ?, status = ?
+                WHERE id = ?
+                """,
+                (review_json, status, proposal_id),
+            )
+
+    # --- Fact Confidence Updates ---
+
+    def update_fact_confidence(self, fact_id: str, confidence: float) -> None:
+        """Update the confidence score for a fact."""
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE facts SET confidence = ? WHERE id = ?",
+                (confidence, fact_id),
+            )
+
+    def clear_fact_contested(self, fact_id: str) -> None:
+        """Remove the contested flag from a fact."""
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE facts SET contested = 0 WHERE id = ?",
+                (fact_id,),
+            )

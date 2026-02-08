@@ -31,6 +31,12 @@ agent create
 The setup flow writes `~/.tali/<agent_name>/config.json` with the LLM and embedding provider settings.
 Supported providers: OpenAI-compatible APIs (`openai`) and Ollama (`ollama`).
 
+Enable shell tab-completion for faster command entry:
+
+```bash
+tali --install-completion
+```
+
 ### Local models (Ollama)
 
 Tali talks to a running Ollama server via its local HTTP API (the SDK is just a client).
@@ -120,6 +126,75 @@ Idle jobs (in order):
 * Clarifying questions: queues at most one question per idle cycle.
 * Patch proposals: drafts gated code changes (never auto-applied).
 
+## Autonomy mode
+
+By default agents only act in response to user commands. When autonomy is
+enabled, the agent can self-start tasks and continue multi-step runs without
+waiting for explicit prompts.
+
+### Enabling autonomy
+
+Use the CLI to enable autonomy without editing JSON:
+
+```bash
+agent config set autonomy.enabled true
+agent config set autonomy.auto_continue true
+```
+
+Or add an `"autonomy"` section to `config.json` directly:
+
+```json
+{
+  "autonomy": {
+    "enabled": true,
+    "auto_continue": true,
+    "execute_commitments": true,
+    "idle_trigger_seconds": 300,
+    "idle_min_interval_seconds": 1800,
+    "autonomous_idle_delay_seconds": 30,
+    "max_autonomous_llm_calls_per_turn": 20
+  }
+}
+```
+
+All fields are optional and default to the values shown above (except
+`enabled` and `auto_continue` which default to `false`).
+
+### What autonomy does
+
+* **Commitment execution**: When the agent is idle it checks the commitments
+  table for pending items (or commitments whose `due_date` has elapsed). The
+  highest-priority commitment is picked up, marked active, and executed via the
+  task runner as if the user had typed the commitment description. When the run
+  finishes the commitment is marked done; on failure it is marked failed.
+* **Auto-continue**: If a self-initiated run is left in a blocked or active
+  state the idle scheduler automatically resumes it by sending a `"continue"`
+  turn, looping until the run completes or hits budget limits.
+* **Configurable timing**: `idle_trigger_seconds` and
+  `idle_min_interval_seconds` replace the hardcoded 5-minute and 30-minute
+  defaults, letting you tune how quickly the agent starts autonomous work.
+  `autonomous_idle_delay_seconds` controls the minimum idle time before the
+  agent picks up a commitment or resumes a blocked run (default 30 s).
+
+### Run origin tracking
+
+Runs created by the autonomy system are tagged with `origin = 'autonomous'`
+in the `runs` table, distinguishing them from user-initiated runs
+(`origin = 'user'`). This allows the idle scheduler to manage only its own
+runs without interfering with user work.
+
+### Safety and interruption
+
+* Autonomous runs use `auto_approve_safe` tool approval semantics. Any tool
+  call that would normally require explicit user approval is denied
+  automatically.
+* User input always takes priority. When the user sends a message,
+  `update_activity()` sets the interrupt event **and** pauses any in-progress
+  autonomous run (setting it to `blocked` with `interrupted_by_user`). The
+  commitment is reverted to `pending` if it was interrupted mid-execution.
+* All autonomous work is bounded by the same `TaskRunnerSettings` budgets
+  (max tasks, LLM calls, steps) as user-initiated runs.
+
 ## Question queue
 
 Idle jobs can queue clarifying questions. At most one question is asked per
@@ -150,6 +225,58 @@ Hooks are optional plugins loaded from `src/tali/hooks/`. Each hook declares:
 Hooks run in a time-bounded sandbox and use safe APIs for staging items or
 queuing questions. They cannot directly write facts.
 
+## Configuration management
+
+View and update agent configuration from the CLI without editing JSON files:
+
+```bash
+agent config show               # display all settings in grouped panels
+agent config show --json        # raw JSON for scripting
+agent config set responder_llm.model gemma-3b-v2
+agent config set tools.approval_mode auto_approve_safe
+agent config set autonomy.idle_trigger_seconds 600
+agent config reset autonomy.idle_trigger_seconds   # restore default
+```
+
+Dot-notation paths follow the config sections: `planner_llm`, `responder_llm`,
+`embeddings`, `tools`, `task_runner`, `autonomy`.
+
+## Memory search
+
+Search across the agent's stored facts and conversation episodes:
+
+```bash
+agent memory search "project deadline"
+agent memory search "deployment" --facts-only --limit 5
+agent memory search "error logs" --episodes-only --json
+```
+
+## Commitments
+
+List existing commitments or add new ones from the CLI:
+
+```bash
+agent commitments
+agent commitment-add "Review pull request #42" --due 2026-03-01 --priority 2
+```
+
+Commitments added via CLI are picked up automatically by the agent during
+its next cycle (especially when autonomy is enabled).
+
+## Preferences
+
+Manage user preferences that influence agent behaviour:
+
+```bash
+agent preferences list
+agent preferences set humor off
+agent preferences set coding_style "functional" --confidence 0.95
+agent preferences remove humor
+```
+
+Preferences set via CLI use `USER_EXPLICIT` provenance with configurable
+confidence scores.
+
 ## Patch proposals (gated)
 
 Idle jobs may draft patch proposals, but they are never auto-applied. Proposals
@@ -173,8 +300,13 @@ Quick commands:
 logs --limit 20
 dashboard --duration 30
 run list
+run show <run_id>
 run timeline <run_id>
 ```
+
+The `dashboard` command shows a live-updating Rich panel with agent state
+(active/idle), unread inbox count, pending commitments, memory stats, run
+metrics, current tasks, and recent logs.
 
 ## A2A (agent-to-agent)
 
@@ -190,6 +322,21 @@ swarm "Coordinate a multi-step task"
 
 All A2A messages are stored as message logs and tagged as `RECEIVED_AGENT`.
 They are never promoted to facts without explicit verification.
+
+## CLI output formatting
+
+All data-listing commands default to human-friendly Rich tables and panels.
+Add `--json` to any command for machine-readable JSON output suitable for
+scripting or piping:
+
+```bash
+agent facts               # Rich table
+agent facts --json        # raw JSON
+agent inbox --json | jq .
+agent run list --json
+```
+
+Run `agent help` for a quick-reference guide of common workflows.
 
 ## Core invariants
 

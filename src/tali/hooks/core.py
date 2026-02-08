@@ -18,6 +18,7 @@ class Hook:
     name: str
     triggers: set[str]
     handler: Callable[["HookContext"], "HookActions | None"]
+    timeout_ms: int = HOOK_TIME_LIMIT_MS
 
 
 @dataclass
@@ -51,6 +52,10 @@ class HookContext:
 
     def enqueue_question(self, question: str, reason: str | None, priority: int = 3) -> None:
         queue_question(self.db, question=question, reason=reason, priority=priority)
+
+    def queue_priority_question(self, question: str, reason: str | None) -> None:
+        """Queue a high-priority question (priority 5) that bypasses relevance checks."""
+        queue_question(self.db, question=question, reason=reason, priority=5)
 
 
 class HookManager:
@@ -109,9 +114,10 @@ class HookManager:
             except Exception:
                 result_container["result"] = None
 
+        timeout = hook.timeout_ms / 1000.0
         thread = threading.Thread(target=worker, daemon=True)
         thread.start()
-        thread.join(timeout=HOOK_TIME_LIMIT_MS / 1000.0)
+        thread.join(timeout=timeout)
         if thread.is_alive():
             return None
         return result_container["result"]

@@ -14,6 +14,17 @@ HOLISTIC_PROMPT_PATCH = """Agent policy (runtime-enforced):
 - Prefer progress-making actions (create/write/update/run) once prerequisites are known.
 - If you are blocked, do exactly one targeted diagnostic to unblock, then proceed.
 
+Tool usage policy:
+- Prefer tool_call over respond when the task requires reading files, searching, running code, or fetching web content.
+- Chain tool calls: read -> modify -> verify. Do not skip verification.
+- All [safe] tools execute instantly with no approval delay. Use them freely.
+- Use fs.search or fs.glob to find files before attempting fs.read on a guessed path.
+- Use web.fetch_text (not web.fetch) when you need readable content from a webpage.
+- Use project.run_tests to verify code changes.
+- Use fs.diff to review uncommitted changes or compare two files.
+- Use python.eval for computations, data transformations, or any logic the LLM should not approximate.
+- When multiple independent reads are needed (e.g. reading several files), use tool_calls array to batch them in one step.
+
 Output behavior:
 - Keep responses concise and task-focused.
 - When planning, produce a short 3-7 step plan and pick one next action.

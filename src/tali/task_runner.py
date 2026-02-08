@@ -92,6 +92,7 @@ class TaskRunner:
         agent_context: str = "",
         status_fn: Callable[[str], None] | None = None,
         settings: TaskRunnerSettings | None = None,
+        responder_strengths: str | None = None,
     ) -> None:
         self.db = db
         self.llm = llm
@@ -106,16 +107,45 @@ class TaskRunner:
         self.agent_context = agent_context
         self.status_fn = status_fn
         self.settings = settings or TaskRunnerSettings()
+        self.responder_strengths = responder_strengths
+        self._current_classification: ScoringResult | None = None
 
     def run_turn(
         self,
         user_input: str,
         prompt_fn: Callable[[str], str],
         show_plans: bool = False,
+        origin: str = "user",
     ) -> TaskRunnerResult:
         active_run = self.db.fetch_active_run()
+        # Detect stale active runs (process may have crashed mid-execution)
+        if active_run is not None and active_run["status"] == "active":
+            updated_at = active_run["updated_at"]
+            if updated_at:
+                try:
+                    last_update = datetime.fromisoformat(str(updated_at))
+                    from datetime import timedelta
+                    if datetime.utcnow() - last_update > timedelta(minutes=30):
+                        # Stale run: mark as blocked so user can resume or cancel
+                        self.db.update_run_status(
+                            str(active_run["id"]),
+                            status="blocked",
+                            last_error="stale_run_recovered",
+                        )
+                        active_run = self.db.fetch_active_run()
+                except (ValueError, TypeError):
+                    pass
         resume_intent = self._is_resume_intent(user_input)
         classification = self._classify_request(user_input)
+        self._current_classification = classification
+        if self.status_fn:
+            signals_str = ", ".join(classification.signals[:5]) if classification.signals else "none"
+            self.status_fn(
+                f"Classification: tier={classification.tier}, "
+                f"query_type={classification.query_type}, "
+                f"confidence={classification.confidence:.2f}, "
+                f"signals=[{signals_str}]"
+            )
         effective_prompt = user_input
         if active_run is not None and active_run["status"] == "active" and resume_intent:
             effective_prompt = str(active_run["user_prompt"])
@@ -162,6 +192,8 @@ class TaskRunner:
                 tool_results=[],
                 run_summary=None,
                 planner_message=None,
+                response_llm=self._select_response_llm(classification),
+                temperature=self._temperature_for_query(classification.query_type),
             )
             guarded = self.guardrails.enforce(response, retrieval_context.bundle)
             return TaskRunnerResult(
@@ -184,6 +216,7 @@ class TaskRunner:
                 user_prompt=user_input,
                 current_task_id=None,
                 last_error=None,
+                origin=origin,
             )
             tasks, error = self._decompose_and_persist(
                 run_id, user_input, memory_context
@@ -298,59 +331,136 @@ class TaskRunner:
             memory_context = format_retrieval_context(retrieval_context.bundle)
             skill_context = self._build_skill_context(list(retrieval_context.bundle.skills))
         run_summary = self._refresh_run_summary(run_id, tasks_rows)
-        completed_this_turn = 0
-        while (
-            completed_this_turn < self.settings.max_tasks_per_turn
-            and steps < self.settings.max_total_steps_per_turn
-            and llm_calls < self.settings.max_total_llm_calls_per_run_per_turn
-        ):
-            next_task = self._select_next_task(tasks_rows, tasks_by_ordinal)
-            if next_task is None:
-                break
-            task_result = self._run_task(
-                run_id=run_id,
-                task_row=next_task,
-                user_prompt=str(self.db.fetch_run(run_id)["user_prompt"]),
-                prompt_fn=prompt_fn,
-                memory_context=memory_context,
-                working_memory=working_memory,
-                run_summary=run_summary,
-                skill_context=skill_context,
-                llm_calls_remaining=self.settings.max_total_llm_calls_per_run_per_turn - llm_calls,
-                steps_remaining=self.settings.max_total_steps_per_turn - steps,
-            )
-            llm_calls += task_result.llm_calls
-            steps += task_result.steps
-            tool_records.extend(task_result.tool_records)
-            tool_results.extend(task_result.tool_results)
-            if task_result.user_message:
-                messages.append(task_result.user_message)
-            if task_result.blocked:
-                self.db.update_run_status(run_id, status="blocked", current_task_id=next_task["id"])
-                break
-            completed_this_turn += 1
-            tasks_rows = self.db.fetch_tasks_for_run(run_id)
-            tasks_by_ordinal = {int(row["ordinal"]): row for row in tasks_rows}
-            run_summary = self._refresh_run_summary(run_id, tasks_rows)
 
-        if self._all_tasks_complete(tasks_rows):
-            review_message, review_llm_calls, review_steps = self._completion_review(
-                run_id=run_id,
-                user_prompt=str(self.db.fetch_run(run_id)["user_prompt"]),
-                tasks_rows=tasks_rows,
-                memory_context=memory_context,
+        # --- Circuit breaker: detect repeated review_incomplete across turns ---
+        run_row = self.db.fetch_run(run_id)
+        prior_last_error = str(run_row["last_error"] or "") if run_row else ""
+        prior_review_incomplete = prior_last_error.startswith("review_incomplete")
+        if prior_review_incomplete and not created_run:
+            incomplete_count = self._count_consecutive_review_incompletes(run_id)
+            if incomplete_count >= 2:
+                remaining_msg = self._build_remaining_tasks_message(tasks_rows)
+                stuck_message = (
+                    "I've attempted this request multiple times but cannot fully complete it. "
+                    f"Here's what remains:\n{remaining_msg}\n"
+                    "Please provide additional guidance so I can finish."
+                )
+                self.db.update_run_status(run_id, status="blocked", last_error="stuck_review_incomplete")
+                guarded = self.guardrails.enforce(stuck_message, retrieval_context.bundle)
+                return TaskRunnerResult(
+                    message=guarded.safe_output,
+                    tool_records=tool_records,
+                    tool_results=tool_results,
+                    run_id=run_id,
+                    llm_calls=llm_calls,
+                    steps=steps,
+                    tool_calls=len(tool_results),
+                )
+
+        # --- Main task execution loop with auto-continue on incomplete review ---
+        max_review_retries = 2
+        review_retries = 0
+
+        while True:
+            completed_this_turn = 0
+            has_budget = (
+                steps < self.settings.max_total_steps_per_turn
+                and llm_calls < self.settings.max_total_llm_calls_per_run_per_turn
             )
-            llm_calls += review_llm_calls
-            steps += review_steps
-            if review_message:
-                messages.append(review_message)
-        else:
-            if steps >= self.settings.max_total_steps_per_turn or llm_calls >= self.settings.max_total_llm_calls_per_run_per_turn:
-                messages.append("Progress saved. Continuing next turn.")
+            while (
+                completed_this_turn < self.settings.max_tasks_per_turn
+                and steps < self.settings.max_total_steps_per_turn
+                and llm_calls < self.settings.max_total_llm_calls_per_run_per_turn
+            ):
+                self.db.heartbeat_run(run_id)
+                next_task = self._select_next_task(tasks_rows, tasks_by_ordinal)
+                if next_task is None:
+                    break
+                task_result = self._run_task(
+                    run_id=run_id,
+                    task_row=next_task,
+                    user_prompt=str(self.db.fetch_run(run_id)["user_prompt"]),
+                    prompt_fn=prompt_fn,
+                    memory_context=memory_context,
+                    working_memory=working_memory,
+                    run_summary=run_summary,
+                    skill_context=skill_context,
+                    llm_calls_remaining=self.settings.max_total_llm_calls_per_run_per_turn - llm_calls,
+                    steps_remaining=self.settings.max_total_steps_per_turn - steps,
+                )
+                llm_calls += task_result.llm_calls
+                steps += task_result.steps
+                tool_records.extend(task_result.tool_records)
+                tool_results.extend(task_result.tool_results)
+                if task_result.user_message:
+                    messages.append(task_result.user_message)
+                if task_result.blocked:
+                    self.db.update_run_status(run_id, status="blocked", current_task_id=next_task["id"])
+                    break
+                completed_this_turn += 1
+                tasks_rows = self.db.fetch_tasks_for_run(run_id)
+                tasks_by_ordinal = {int(row["ordinal"]): row for row in tasks_rows}
+                run_summary = self._refresh_run_summary(run_id, tasks_rows)
+
+            if self._all_tasks_complete(tasks_rows):
+                review_message, review_llm_calls, review_steps = self._completion_review(
+                    run_id=run_id,
+                    user_prompt=str(self.db.fetch_run(run_id)["user_prompt"]),
+                    tasks_rows=tasks_rows,
+                    memory_context=memory_context,
+                )
+                llm_calls += review_llm_calls
+                steps += review_steps
+                if review_message:
+                    # Route the planner's review message through the responder for
+                    # polishing, ensuring consistent tone and style.
+                    cls = getattr(self, "_current_classification", None)
+                    resp_llm = self._select_response_llm(cls) if cls else self.responder_llm
+                    resp_temp = self._temperature_for_query(cls.query_type) if cls else None
+                    polished = self._generate_response(
+                        user_prompt=str(self.db.fetch_run(run_id)["user_prompt"]),
+                        memory_context=memory_context,
+                        working_memory_summary=working_memory.summary_for_prompt(),
+                        tool_results=tool_results,
+                        run_summary=run_summary,
+                        planner_message=review_message,
+                        response_llm=resp_llm,
+                        temperature=resp_temp,
+                    )
+                    llm_calls += 1
+                    messages.append(polished)
+                    break
+                else:
+                    # Incomplete review -- retry if budget allows
+                    review_retries += 1
+                    if review_retries > max_review_retries:
+                        messages.append(self._build_remaining_tasks_message(tasks_rows))
+                        break
+                    # Refresh tasks (missing tasks were appended by _completion_review)
+                    tasks_rows = self.db.fetch_tasks_for_run(run_id)
+                    tasks_by_ordinal = {int(row["ordinal"]): row for row in tasks_rows}
+                    run_summary = self._refresh_run_summary(run_id, tasks_rows)
+                    # Check if budget allows continuation
+                    if (
+                        steps >= self.settings.max_total_steps_per_turn
+                        or llm_calls >= self.settings.max_total_llm_calls_per_run_per_turn
+                    ):
+                        messages.append(self._build_remaining_tasks_message(tasks_rows))
+                        break
+                    continue
+            else:
+                # Budget exhausted or blocked before all tasks complete
+                if (
+                    steps >= self.settings.max_total_steps_per_turn
+                    or llm_calls >= self.settings.max_total_llm_calls_per_run_per_turn
+                ):
+                    messages.append(self._build_remaining_tasks_message(tasks_rows))
+                break
 
         final_message = "\n\n".join(msg for msg in messages if msg.strip())
         if not final_message:
-            final_message = "Working on it."
+            remaining = self._build_remaining_tasks_message(tasks_rows)
+            final_message = remaining if remaining else "Working on it."
         self._refresh_run_summary(run_id, tasks_rows)
         guarded = self.guardrails.enforce(final_message, retrieval_context.bundle)
         return TaskRunnerResult(
@@ -562,6 +672,33 @@ class TaskRunner:
             lines.append("Clarifications: " + " | ".join(clarifications))
         if run_row["last_error"]:
             lines.append(f"Last error: {run_row['last_error']}")
+        # Enriched task outcomes for responder context
+        done_rows = [r for r in tasks_rows if r["status"] == "done"]
+        if done_rows:
+            lines.append("Task outcomes:")
+            for row in done_rows[-5:]:
+                title = row["title"] or "Untitled"
+                outcome = ""
+                if row["outputs_json"]:
+                    try:
+                        payload = json.loads(row["outputs_json"])
+                        # Extract meaningful outcome data, skip internal metadata
+                        outcome_parts = []
+                        for key, val in payload.items():
+                            if key in ("blocked_question", "blocked_answer", "skills_used"):
+                                continue
+                            snippet = str(val)
+                            if len(snippet) > 150:
+                                snippet = snippet[:150] + "..."
+                            outcome_parts.append(f"{key}={snippet}")
+                        outcome = "; ".join(outcome_parts[:3])
+                    except json.JSONDecodeError:
+                        outcome = row["outputs_json"][:200]
+                ordinal = int(row["ordinal"]) + 1
+                if outcome:
+                    lines.append(f"- Task {ordinal} ({title}): {outcome}")
+                else:
+                    lines.append(f"- Task {ordinal} ({title}): completed")
         return "\n".join(lines)
 
     def _select_next_task(
@@ -686,7 +823,7 @@ class TaskRunner:
                     blocked=False,
                 )
             action = plan.next_action_type
-            requires_tools = bool(task_row.get("requires_tools"))
+            requires_tools = bool(task_row["requires_tools"])
             if (
                 action == "respond"
                 and plan.message
@@ -773,6 +910,7 @@ class TaskRunner:
                             delegate_to=plan.delegate_to,
                             delegate_task=plan.delegate_task,
                             skill_name=plan.skill_name,
+                            tool_calls=plan.tool_calls,
                         )
                 signature = json.dumps(
                     {"name": plan.tool_name, "args": plan.tool_args or {}},
@@ -829,7 +967,13 @@ class TaskRunner:
                     if self.hook_manager:
                         self.hook_manager.run(
                             "on_task_end",
-                            {"task_id": task_id, "run_id": run_id, "status": "blocked"},
+                            {
+                                "task_id": task_id,
+                                "run_id": run_id,
+                                "status": "blocked",
+                                "inputs_json": task_row["inputs_json"],
+                                "outputs_json": updated_outputs,
+                            },
                         )
                     return TaskExecutionResult(
                         llm_calls=llm_calls,
@@ -839,27 +983,48 @@ class TaskRunner:
                         user_message=question,
                         blocked=True,
                     )
-                if self.status_fn:
-                    self.status_fn(f"Executing tool call: {plan.tool_name}")
-                tool_call = ToolCall(
-                    id=f"tc_{uuid.uuid4().hex}",
-                    name=plan.tool_name,
-                    args=plan.tool_args,
-                    purpose=plan.tool_purpose,
-                )
-                self._log_task_event(
-                    task_id,
-                    "tool_call",
-                    {"name": tool_call.name, "args": tool_call.args, "purpose": tool_call.purpose},
-                )
-                results, records = self.tool_runner.run([tool_call], prompt_fn=prompt_fn)
+                # Build tool call list (single or batched)
+                calls_to_run: list[ToolCall] = []
+                if plan.tool_calls:
+                    if self.status_fn:
+                        self.status_fn(f"Executing {len(plan.tool_calls)} batched tool calls")
+                    for tc in plan.tool_calls:
+                        tc_obj = ToolCall(
+                            id=f"tc_{uuid.uuid4().hex}",
+                            name=tc["tool_name"],
+                            args=tc.get("tool_args") or {},
+                            purpose=tc.get("tool_purpose", ""),
+                        )
+                        calls_to_run.append(tc_obj)
+                        self._log_task_event(
+                            task_id,
+                            "tool_call",
+                            {"name": tc_obj.name, "args": tc_obj.args, "purpose": tc_obj.purpose},
+                        )
+                else:
+                    if self.status_fn:
+                        self.status_fn(f"Executing tool call: {plan.tool_name}")
+                    tc_obj = ToolCall(
+                        id=f"tc_{uuid.uuid4().hex}",
+                        name=plan.tool_name,
+                        args=plan.tool_args,
+                        purpose=plan.tool_purpose,
+                    )
+                    calls_to_run.append(tc_obj)
+                    self._log_task_event(
+                        task_id,
+                        "tool_call",
+                        {"name": tc_obj.name, "args": tc_obj.args, "purpose": tc_obj.purpose},
+                    )
+                results, records = self.tool_runner.run(calls_to_run, prompt_fn=prompt_fn)
                 tool_records.extend(records)
                 tool_results.extend(results)
                 tool_calls += len(results)
                 combined_obs: list[str] = []
                 combined_durable: dict[str, Any] = {}
                 progress_made = False
-                for result in results:
+                for idx, result in enumerate(results):
+                    corresponding_call = calls_to_run[idx] if idx < len(calls_to_run) else calls_to_run[-1]
                     if self.status_fn and result.status == "ok" and result.result_raw:
                         raw = result.result_raw
                         preview = raw if len(raw) <= 200 else f"{raw[:200]}...[truncated]"
@@ -887,7 +1052,7 @@ class TaskRunner:
                         )
                     stage_tool_result_fact(self.db, result)
                     observations, durable = summarize_tool_result(
-                        tool_call.name, tool_call.args, result
+                        corresponding_call.name, corresponding_call.args, result
                     )
                     combined_obs.extend(observations)
                     for key, value in durable.items():
@@ -900,17 +1065,20 @@ class TaskRunner:
                             combined_durable[key] = list(dict.fromkeys(combined))
                         else:
                             combined_durable[key] = value
+                    call_args_hash = WorkingMemory.args_hash(corresponding_call.args or {})
                     working_memory.record_tool_call(
-                        tool_call.name, args_hash, result.status
+                        corresponding_call.name, call_args_hash, result.status
                     )
-                    if is_stateful_progress(tool_call.name, result) or durable:
+                    if is_stateful_progress(corresponding_call.name, result) or durable:
                         progress_made = True
                 working_memory.note_observations(combined_obs, combined_durable)
+                primary_call = calls_to_run[0] if calls_to_run else None
+                primary_name = primary_call.name if primary_call else plan.tool_name or "unknown"
                 if progress_made:
                     working_memory.note_progress(
                         "tool_call",
                         {
-                            "tool": tool_call.name,
+                            "tool": primary_name,
                             "args_hash": args_hash,
                             "durable_facts": combined_durable,
                         },
@@ -918,7 +1086,7 @@ class TaskRunner:
                     self._log_task_event(
                         task_id,
                         "note",
-                        {"reason": "progress_recorded", "tool": tool_call.name},
+                        {"reason": "progress_recorded", "tool": primary_name},
                     )
                 else:
                     working_memory.steps_since_progress += 1
@@ -927,7 +1095,7 @@ class TaskRunner:
                         "note",
                         {
                             "reason": "no_progress",
-                            "tool": tool_call.name,
+                            "tool": primary_name,
                             "steps_since_progress": working_memory.steps_since_progress,
                         },
                     )
@@ -1017,22 +1185,33 @@ class TaskRunner:
                         blocked=False,
                     )
                 agent = self.a2a_client.select_agent(preferred_name=plan.delegate_to)
+                if not agent and plan.delegate_to:
+                    # delegate_to might be a capability keyword rather than an agent name
+                    agent = self.a2a_client.select_agent(capability=plan.delegate_to)
                 if not agent:
-                    self._log_task_event(task_id, "block", {"reason": "no_agent_available"})
+                    # Graceful fallback: reset task to pending so the planner
+                    # can retry with a non-delegate action on the next iteration.
+                    capability_hint = (
+                        f" with capability '{plan.delegate_to}'" if plan.delegate_to else ""
+                    )
+                    fallback_note = (
+                        f"Delegation failed: no agent available{capability_hint}. "
+                        "Handle this task locally or ask the user to create a new agent."
+                    )
+                    self._log_task_event(
+                        task_id, "note", {"delegation_fallback": fallback_note}
+                    )
+                    updated_outputs = self._merge_outputs(
+                        task_row["outputs_json"],
+                        {"delegation_fallback": fallback_note},
+                    )
                     self.db.update_task_status(
                         task_id,
-                        status="blocked",
-                        outputs_json=task_row["outputs_json"],
+                        status="pending",
+                        outputs_json=updated_outputs,
                         updated_at=datetime.utcnow().isoformat(),
                     )
-                    return TaskExecutionResult(
-                        llm_calls=llm_calls,
-                        steps=steps,
-                        tool_records=tool_records,
-                        tool_results=tool_results,
-                        user_message="No eligible agent available for delegation.",
-                        blocked=True,
-                    )
+                    continue
                 correlation_id = str(uuid.uuid4())
                 payload = {
                     "type": "task_request",
@@ -1126,7 +1305,13 @@ class TaskRunner:
                     if self.hook_manager:
                         self.hook_manager.run(
                             "on_task_end",
-                            {"task_id": task_id, "run_id": run_id, "status": "blocked"},
+                            {
+                                "task_id": task_id,
+                                "run_id": run_id,
+                                "status": "blocked",
+                                "inputs_json": task_row["inputs_json"],
+                                "outputs_json": updated_block,
+                            },
                         )
                     return TaskExecutionResult(
                         llm_calls=llm_calls,
@@ -1143,6 +1328,9 @@ class TaskRunner:
                 self._log_task_event(task_id, "note", {"outputs_json": plan.outputs_json or {}})
                 continue
             if action == "respond":
+                cls = getattr(self, "_current_classification", None)
+                resp_llm = self._select_response_llm(cls) if cls else self.responder_llm
+                resp_temp = self._temperature_for_query(cls.query_type) if cls else None
                 response = self._generate_response(
                     user_prompt=user_prompt,
                     memory_context=memory_context,
@@ -1150,6 +1338,8 @@ class TaskRunner:
                     tool_results=tool_results,
                     run_summary=run_summary,
                     planner_message=plan.message,
+                    response_llm=resp_llm,
+                    temperature=resp_temp,
                 )
                 llm_calls += 1
                 if response:
@@ -1166,7 +1356,13 @@ class TaskRunner:
                 if self.hook_manager:
                     self.hook_manager.run(
                         "on_task_end",
-                        {"task_id": task_id, "run_id": run_id, "status": "done"},
+                        {
+                            "task_id": task_id,
+                            "run_id": run_id,
+                            "status": "done",
+                            "inputs_json": task_row["inputs_json"],
+                            "outputs_json": task_row["outputs_json"],
+                        },
                     )
                 return TaskExecutionResult(
                     llm_calls=llm_calls,
@@ -1189,7 +1385,13 @@ class TaskRunner:
                 if self.hook_manager:
                     self.hook_manager.run(
                         "on_task_end",
-                        {"task_id": task_id, "run_id": run_id, "status": "blocked"},
+                        {
+                            "task_id": task_id,
+                            "run_id": run_id,
+                            "status": "blocked",
+                            "inputs_json": task_row["inputs_json"],
+                            "outputs_json": updated_outputs,
+                        },
                     )
                 return TaskExecutionResult(
                     llm_calls=llm_calls,
@@ -1210,7 +1412,13 @@ class TaskRunner:
                 if self.hook_manager:
                     self.hook_manager.run(
                         "on_task_end",
-                        {"task_id": task_id, "run_id": run_id, "status": "blocked"},
+                        {
+                            "task_id": task_id,
+                            "run_id": run_id,
+                            "status": "blocked",
+                            "inputs_json": task_row["inputs_json"],
+                            "outputs_json": updated_outputs,
+                        },
                     )
                 return TaskExecutionResult(
                     llm_calls=llm_calls,
@@ -1231,7 +1439,13 @@ class TaskRunner:
                 if self.hook_manager:
                     self.hook_manager.run(
                         "on_task_end",
-                        {"task_id": task_id, "run_id": run_id, "status": "done"},
+                        {
+                            "task_id": task_id,
+                            "run_id": run_id,
+                            "status": "done",
+                            "inputs_json": task_row["inputs_json"],
+                            "outputs_json": updated_outputs,
+                        },
                     )
                 return TaskExecutionResult(
                     llm_calls=llm_calls,
@@ -1250,7 +1464,13 @@ class TaskRunner:
                 if self.hook_manager:
                     self.hook_manager.run(
                         "on_task_end",
-                        {"task_id": task_id, "run_id": run_id, "status": "failed"},
+                        {
+                            "task_id": task_id,
+                            "run_id": run_id,
+                            "status": "failed",
+                            "inputs_json": task_row["inputs_json"],
+                            "outputs_json": task_row["outputs_json"],
+                        },
                     )
                 return TaskExecutionResult(
                     llm_calls=llm_calls,
@@ -1277,7 +1497,13 @@ class TaskRunner:
         if self.hook_manager:
             self.hook_manager.run(
                 "on_task_end",
-                {"task_id": task_id, "run_id": run_id, "status": "pending"},
+                {
+                    "task_id": task_id,
+                    "run_id": run_id,
+                    "status": "pending",
+                    "inputs_json": task_row["inputs_json"],
+                    "outputs_json": updated_outputs,
+                },
             )
         return TaskExecutionResult(
             llm_calls=llm_calls,
@@ -1328,6 +1554,7 @@ class TaskRunner:
             run_summary=run_summary,
             stuck_context=stuck_context,
             skill_context=skill_context,
+            responder_strengths=self.responder_strengths,
         )
         if self.status_fn:
             self.status_fn("Planning next action")
@@ -1518,6 +1745,41 @@ class TaskRunner:
             payload=json.dumps(payload),
         )
 
+    def _build_remaining_tasks_message(self, tasks_rows: list[Any]) -> str:
+        """Build a user-facing message listing tasks that are still pending."""
+        pending = [
+            row for row in tasks_rows
+            if row["status"] not in {"done", "skipped"}
+        ]
+        if not pending:
+            return "Progress saved. Continuing next turn."
+        items = "\n".join(
+            f"  {i + 1}) {row['title']}" for i, row in enumerate(pending)
+        )
+        return (
+            f"I've made progress but still need to:\n{items}\n"
+            "I will continue in the next turn."
+        )
+
+    def _count_consecutive_review_incompletes(self, run_id: str) -> int:
+        """Return the consecutive review_incomplete count from the run's last_error field.
+
+        The last_error field stores ``review_incomplete:N`` where N is the count.
+        Returns 0 if no review_incomplete history exists.
+        """
+        run_row = self.db.fetch_run(run_id)
+        if not run_row:
+            return 0
+        last_error = str(run_row["last_error"] or "")
+        if last_error.startswith("review_incomplete:"):
+            try:
+                return int(last_error.split(":")[1])
+            except (IndexError, ValueError):
+                return 1 if "review_incomplete" in last_error else 0
+        if last_error == "review_incomplete":
+            return 1
+        return 0
+
     def _all_tasks_complete(self, tasks_rows: list[Any]) -> bool:
         for row in tasks_rows:
             if row["status"] not in {"done", "skipped"}:
@@ -1533,7 +1795,9 @@ class TaskRunner:
                 {
                     "ordinal": row["ordinal"],
                     "title": row["title"],
+                    "description": row["description"],
                     "status": row["status"],
+                    "inputs_json": row["inputs_json"],
                     "outputs_json": row["outputs_json"],
                 }
             )
@@ -1549,7 +1813,12 @@ class TaskRunner:
             return "Completion review failed; will continue next turn.", 1, 1
         if review.overall_status == "incomplete":
             self._append_missing_tasks(run_id, review.missing_items)
-            self.db.update_run_status(run_id, status="active", last_error="review_incomplete")
+            # Track consecutive review_incomplete count in last_error field.
+            current_count = self._count_consecutive_review_incompletes(run_id)
+            self.db.update_run_status(
+                run_id, status="active",
+                last_error=f"review_incomplete:{current_count + 1}",
+            )
             return None, 1, 1
         self.db.update_run_status(run_id, status="done", current_task_id=None, last_error=None)
         return review.user_message, 1, 1
@@ -1562,14 +1831,14 @@ class TaskRunner:
         now = datetime.utcnow().isoformat()
         for idx, item in enumerate(missing_items):
             title = item.strip() or "Address missing item"
-            inputs_json = json.dumps({"verification": "Validate completion of missing item", "dependencies": []})
+            inputs_json = json.dumps({"verification": f"Verify: {title}", "dependencies": []})
             self.db.insert_task(
                 task_id=str(uuid.uuid4()),
                 run_id=run_id,
                 parent_task_id=None,
                 ordinal=start_ordinal + idx,
                 title=title,
-                description=f"Address missing item: {title}",
+                description=f"Previous attempt missed this requirement: {title}. Address it now.",
                 status="pending",
                 inputs_json=inputs_json,
                 outputs_json=None,
@@ -1605,7 +1874,27 @@ class TaskRunner:
         return classify_request(user_input)
 
     def _should_use_responder_only(self, classification: ScoringResult) -> bool:
-        return classification.tier == "SIMPLE"
+        if classification.tier == "SIMPLE":
+            return True
+        # Conversational MEDIUM queries don't need the planner
+        if classification.tier == "MEDIUM" and classification.query_type == "conversational":
+            return True
+        return False
+
+    def _select_response_llm(self, classification: ScoringResult) -> LLMClient:
+        """Pick the best LLM for generating the user-facing response."""
+        if classification.query_type == "coding":
+            return self.planner_llm
+        return self.responder_llm
+
+    @staticmethod
+    def _temperature_for_query(query_type: str) -> float:
+        """Return an appropriate temperature for the query type."""
+        if query_type == "coding":
+            return 0.15
+        if query_type == "conversational":
+            return 0.55
+        return 0.3
 
     def _is_prompt_related_to_run(self, user_input: str, run_row: Any) -> bool:
         tasks = self.db.fetch_tasks_for_run(str(run_row["id"]))
@@ -1644,6 +1933,9 @@ class TaskRunner:
         working_memory: WorkingMemory,
         active_run: Any,
     ) -> TaskRunnerResult:
+        cls = getattr(self, "_current_classification", None)
+        resp_llm = self._select_response_llm(cls) if cls else self.responder_llm
+        resp_temp = self._temperature_for_query(cls.query_type) if cls else None
         response = self._generate_response(
             user_prompt=user_input,
             memory_context=format_retrieval_context(retrieval_context.bundle),
@@ -1651,6 +1943,8 @@ class TaskRunner:
             tool_results=[],
             run_summary=None,
             planner_message=None,
+            response_llm=resp_llm,
+            temperature=resp_temp,
         )
         guarded = self.guardrails.enforce(response, retrieval_context.bundle)
         return TaskRunnerResult(
@@ -1663,6 +1957,26 @@ class TaskRunner:
             tool_calls=0,
         )
 
+    @staticmethod
+    def _response_needs_retry(response_text: str, planner_message: str | None) -> bool:
+        """Check if the responder output looks incomplete and should be retried."""
+        if not planner_message:
+            return False
+        text = response_text.strip()
+        if not text:
+            return True
+        if len(text) < 20:
+            return True
+        low = text.lower()
+        uncertain_phrases = [
+            "i'm not sure",
+            "i don't have enough information",
+            "i cannot determine",
+            "i don't know",
+            "unable to provide",
+        ]
+        return any(phrase in low for phrase in uncertain_phrases)
+
     def _generate_response(
         self,
         user_prompt: str,
@@ -1671,7 +1985,10 @@ class TaskRunner:
         tool_results: list[ToolResult],
         run_summary: str | None,
         planner_message: str | None,
+        response_llm: LLMClient | None = None,
+        temperature: float | None = None,
     ) -> str:
+        llm = response_llm or self.responder_llm
         summaries = [
             f"- {result.name} status={result.status} summary={result.result_summary}"
             for result in tool_results[-5:]
@@ -1694,12 +2011,37 @@ class TaskRunner:
             run_summary=run_summary,
         )
         try:
-            response = self.responder_llm.generate(prompt)
+            response = llm.generate(prompt, temperature=temperature)
         except httpx.HTTPStatusError as exc:
             error_message = _format_llm_http_error(exc)
             return planner_message or f"I hit a response error: {error_message}"
         except Exception as exc:
             return planner_message or f"I hit a response error: {exc}"
+
+        # Feedback loop: if the response looks incomplete and we have planner
+        # context, retry once with an augmented prompt.
+        if self._response_needs_retry(response.content, planner_message):
+            if self.status_fn:
+                self.status_fn("Response quality check failed; retrying with augmented context")
+            augmented_prompt = build_response_prompt(
+                user_prompt=user_prompt,
+                memory_context=memory_context,
+                working_memory_summary=working_memory_summary,
+                agent_context=self.agent_context,
+                planner_message=(
+                    f"AUTHORITATIVE PLANNER ANSWER (use as primary source):\n{planner_message}"
+                ),
+                recent_tool_summaries=summaries,
+                recent_tool_outputs=outputs,
+                run_summary=run_summary,
+            )
+            try:
+                retry_response = llm.generate(augmented_prompt, temperature=temperature)
+                return retry_response.content
+            except Exception:
+                # Fall through to original response on retry failure
+                pass
+
         return response.content
 
 

@@ -209,6 +209,53 @@ def summarize_tool_result(
         if path:
             observations.append(f"Deleted: {path}")
             durable.setdefault("deleted_paths", []).append(path)
+    elif tool_name in {"web.fetch", "web.fetch_text"}:
+        observations.append(f"Fetched URL: {summary}")
+        # Store first 500 chars of content as observation
+        if raw:
+            preview = raw[:500]
+            if len(raw) > 500:
+                preview += "...[truncated]"
+            observations.append(f"Content preview: {preview}")
+        url = args.get("url", "")
+        if url:
+            durable.setdefault("fetched_urls", []).append(url)
+    elif tool_name == "web.search":
+        query = args.get("query", "")
+        observations.append(f"Web search for: {query}")
+        if raw and raw != "No results found.":
+            # Store search results as observation
+            result_lines = [line.strip() for line in raw.splitlines() if line.strip()][:5]
+            observations.append(f"Results: {'; '.join(result_lines)}")
+        if query:
+            durable.setdefault("search_queries", []).append(query)
+    elif tool_name == "python.eval":
+        if "ok" in summary.lower():
+            preview = raw[:500] if raw else "(no output)"
+            if len(raw) > 500:
+                preview += "...[truncated]"
+            observations.append(f"Python output: {preview}")
+        else:
+            observations.append(f"Python error: {raw[:300]}" if raw else f"Python failed: {summary}")
+    elif tool_name == "project.run_tests":
+        observations.append(f"Test result: {summary}")
+        if "PASSED" in summary:
+            durable["last_test_result"] = "pass"
+        elif "FAILED" in summary:
+            durable["last_test_result"] = "fail"
+        if raw:
+            # Extract last few lines (usually the summary)
+            tail_lines = raw.strip().splitlines()[-5:]
+            observations.append(f"Test output tail: {'; '.join(tail_lines)}")
+    elif tool_name == "fs.diff":
+        observations.append(f"Diff result: {summary}")
+        if raw and raw not in {"No uncommitted changes.", "Files are identical."}:
+            # Count lines added/removed
+            added = sum(1 for line in raw.splitlines() if line.startswith("+") and not line.startswith("+++"))
+            removed = sum(1 for line in raw.splitlines() if line.startswith("-") and not line.startswith("---"))
+            observations.append(f"Diff stats: +{added} -{removed} lines")
+        elif raw:
+            observations.append(raw)
 
     return observations[:7], durable
 
@@ -224,6 +271,7 @@ def is_stateful_progress(tool_name: str, result: ToolResult) -> bool:
         "fs.delete",
         "shell.run",
         "python.eval",
+        "project.run_tests",
     }
 
 

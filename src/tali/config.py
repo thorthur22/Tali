@@ -100,6 +100,7 @@ class LLMSettings:
     model: str
     base_url: str
     api_key: str | None = None
+    strengths: list[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -138,6 +139,17 @@ class TaskRunnerConfig:
 
 
 @dataclass(frozen=True)
+class AutonomyConfig:
+    enabled: bool = False
+    auto_continue: bool = False
+    execute_commitments: bool = True
+    idle_trigger_seconds: int = 300
+    idle_min_interval_seconds: int = 1800
+    autonomous_idle_delay_seconds: int = 30
+    max_autonomous_llm_calls_per_turn: int = 20
+
+
+@dataclass(frozen=True)
 class AppConfig:
     agent_id: str
     agent_name: str
@@ -149,6 +161,7 @@ class AppConfig:
     embeddings: EmbeddingSettings | None
     tools: ToolSettings | None
     task_runner: TaskRunnerConfig | None
+    autonomy: AutonomyConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -158,6 +171,19 @@ class SharedSettings:
     embeddings: EmbeddingSettings
     tools: ToolSettings
     task_runner: TaskRunnerConfig | None = None
+    autonomy: AutonomyConfig | None = None
+
+
+def infer_model_strengths(settings: LLMSettings) -> list[str]:
+    """Return configured strengths or infer defaults from the model name."""
+    if settings.strengths:
+        return settings.strengths
+    model_lower = settings.model.lower()
+    if any(tag in model_lower for tag in ("qwen", "codellama", "deepseek-coder", "starcoder", "codestral")):
+        return ["coding", "multi-step reasoning", "structured output"]
+    if any(tag in model_lower for tag in ("gemma", "mistral", "llama")):
+        return ["conversation", "fluency", "summarization"]
+    return ["general"]
 
 
 def load_paths(root_dir: Path, agent_name: str) -> Paths:
@@ -172,6 +198,7 @@ def load_config(path: Path) -> AppConfig:
     embeddings = payload.get("embeddings", {})
     tools = payload.get("tools", {})
     task_runner = payload.get("task_runner", {})
+    autonomy = payload.get("autonomy", {})
     return AppConfig(
         agent_id=agent.get("agent_id", ""),
         agent_name=agent.get("agent_name", ""),
@@ -183,6 +210,7 @@ def load_config(path: Path) -> AppConfig:
             model=planner_llm["model"],
             base_url=planner_llm["base_url"],
             api_key=planner_llm.get("api_key"),
+            strengths=planner_llm.get("strengths"),
         )
         if planner_llm
         else None,
@@ -191,6 +219,7 @@ def load_config(path: Path) -> AppConfig:
             model=responder_llm["model"],
             base_url=responder_llm["base_url"],
             api_key=responder_llm.get("api_key"),
+            strengths=responder_llm.get("strengths"),
         )
         if responder_llm
         else None,
@@ -212,24 +241,37 @@ def load_config(path: Path) -> AppConfig:
             web_timeout_s=float(tools.get("web_timeout_s", 20.0)),
             web_max_redirects=int(tools.get("web_max_redirects", 5)),
             python_enabled=bool(tools.get("python_enabled", False)),
-            python_timeout_s=float(tools.get("python_timeout_s", 5.0)),
-            max_tool_calls_per_turn=int(tools.get("max_tool_calls_per_turn", 3)),
-            max_tool_seconds=float(tools.get("max_tool_seconds", 20.0)),
-            max_calls_per_tool=int(tools.get("max_calls_per_tool", 2)),
-            tool_result_max_bytes=int(tools.get("tool_result_max_bytes", 10000)),
+            python_timeout_s=float(tools.get("python_timeout_s", 30.0)),
+            max_tool_calls_per_turn=int(tools.get("max_tool_calls_per_turn", 30)),
+            max_tool_seconds=float(tools.get("max_tool_seconds", 60.0)),
+            max_calls_per_tool=int(tools.get("max_calls_per_tool", 100)),
+            tool_result_max_bytes=int(tools.get("tool_result_max_bytes", 1_000_000)),
         )
         if tools
         else None,
         task_runner=TaskRunnerConfig(
-            max_tasks_per_turn=int(task_runner.get("max_tasks_per_turn", 5)),
-            max_llm_calls_per_task=int(task_runner.get("max_llm_calls_per_task", 3)),
-            max_tool_calls_per_task=int(task_runner.get("max_tool_calls_per_task", 5)),
+            max_tasks_per_turn=int(task_runner.get("max_tasks_per_turn", 50)),
+            max_llm_calls_per_task=int(task_runner.get("max_llm_calls_per_task", 30)),
+            max_tool_calls_per_task=int(task_runner.get("max_tool_calls_per_task", 50)),
             max_total_llm_calls_per_run_per_turn=int(
-                task_runner.get("max_total_llm_calls_per_run_per_turn", 10)
+                task_runner.get("max_total_llm_calls_per_run_per_turn", 100)
             ),
-            max_total_steps_per_turn=int(task_runner.get("max_total_steps_per_turn", 30)),
+            max_total_steps_per_turn=int(task_runner.get("max_total_steps_per_turn", 100)),
         )
         if task_runner
+        else None,
+        autonomy=AutonomyConfig(
+            enabled=bool(autonomy.get("enabled", False)),
+            auto_continue=bool(autonomy.get("auto_continue", False)),
+            execute_commitments=bool(autonomy.get("execute_commitments", True)),
+            idle_trigger_seconds=int(autonomy.get("idle_trigger_seconds", 300)),
+            idle_min_interval_seconds=int(autonomy.get("idle_min_interval_seconds", 1800)),
+            autonomous_idle_delay_seconds=int(autonomy.get("autonomous_idle_delay_seconds", 30)),
+            max_autonomous_llm_calls_per_turn=int(
+                autonomy.get("max_autonomous_llm_calls_per_turn", 20)
+            ),
+        )
+        if autonomy
         else None,
     )
 
@@ -245,18 +287,21 @@ def load_shared_settings(path: Path) -> SharedSettings | None:
     embeddings = payload.get("embeddings", {})
     tools = payload.get("tools", {})
     task_runner = payload.get("task_runner", {})
+    autonomy = payload.get("autonomy", {})
     return SharedSettings(
         planner_llm=LLMSettings(
             provider=planner_llm["provider"],
             model=planner_llm["model"],
             base_url=planner_llm["base_url"],
             api_key=planner_llm.get("api_key"),
+            strengths=planner_llm.get("strengths"),
         ),
         responder_llm=LLMSettings(
             provider=responder_llm["provider"],
             model=responder_llm["model"],
             base_url=responder_llm["base_url"],
             api_key=responder_llm.get("api_key"),
+            strengths=responder_llm.get("strengths"),
         ),
         embeddings=EmbeddingSettings(
             provider=embeddings["provider"],
@@ -274,22 +319,35 @@ def load_shared_settings(path: Path) -> SharedSettings | None:
             web_timeout_s=float(tools.get("web_timeout_s", 20.0)),
             web_max_redirects=int(tools.get("web_max_redirects", 5)),
             python_enabled=bool(tools.get("python_enabled", False)),
-            python_timeout_s=float(tools.get("python_timeout_s", 5.0)),
-            max_tool_calls_per_turn=int(tools.get("max_tool_calls_per_turn", 3)),
-            max_tool_seconds=float(tools.get("max_tool_seconds", 20.0)),
-            max_calls_per_tool=int(tools.get("max_calls_per_tool", 2)),
-            tool_result_max_bytes=int(tools.get("tool_result_max_bytes", 10000)),
+            python_timeout_s=float(tools.get("python_timeout_s", 30.0)),
+            max_tool_calls_per_turn=int(tools.get("max_tool_calls_per_turn", 30)),
+            max_tool_seconds=float(tools.get("max_tool_seconds", 60.0)),
+            max_calls_per_tool=int(tools.get("max_calls_per_tool", 100)),
+            tool_result_max_bytes=int(tools.get("tool_result_max_bytes", 1_000_000)),
         ),
         task_runner=TaskRunnerConfig(
-            max_tasks_per_turn=int(task_runner.get("max_tasks_per_turn", 5)),
-            max_llm_calls_per_task=int(task_runner.get("max_llm_calls_per_task", 3)),
-            max_tool_calls_per_task=int(task_runner.get("max_tool_calls_per_task", 5)),
+            max_tasks_per_turn=int(task_runner.get("max_tasks_per_turn", 50)),
+            max_llm_calls_per_task=int(task_runner.get("max_llm_calls_per_task", 30)),
+            max_tool_calls_per_task=int(task_runner.get("max_tool_calls_per_task", 50)),
             max_total_llm_calls_per_run_per_turn=int(
-                task_runner.get("max_total_llm_calls_per_run_per_turn", 10)
+                task_runner.get("max_total_llm_calls_per_run_per_turn", 100)
             ),
-            max_total_steps_per_turn=int(task_runner.get("max_total_steps_per_turn", 30)),
+            max_total_steps_per_turn=int(task_runner.get("max_total_steps_per_turn", 100)),
         )
         if task_runner
+        else None,
+        autonomy=AutonomyConfig(
+            enabled=bool(autonomy.get("enabled", False)),
+            auto_continue=bool(autonomy.get("auto_continue", False)),
+            execute_commitments=bool(autonomy.get("execute_commitments", True)),
+            idle_trigger_seconds=int(autonomy.get("idle_trigger_seconds", 300)),
+            idle_min_interval_seconds=int(autonomy.get("idle_min_interval_seconds", 1800)),
+            autonomous_idle_delay_seconds=int(autonomy.get("autonomous_idle_delay_seconds", 30)),
+            max_autonomous_llm_calls_per_turn=int(
+                autonomy.get("max_autonomous_llm_calls_per_turn", 20)
+            ),
+        )
+        if autonomy
         else None,
     )
 
@@ -306,19 +364,25 @@ def save_config(path: Path, config: AppConfig) -> None:
         }
     }
     if config.planner_llm:
-        payload["planner_llm"] = {
+        planner_dict: dict = {
             "provider": config.planner_llm.provider,
             "model": config.planner_llm.model,
             "base_url": config.planner_llm.base_url,
             "api_key": config.planner_llm.api_key,
         }
+        if config.planner_llm.strengths:
+            planner_dict["strengths"] = config.planner_llm.strengths
+        payload["planner_llm"] = planner_dict
     if config.responder_llm:
-        payload["responder_llm"] = {
+        responder_dict: dict = {
             "provider": config.responder_llm.provider,
             "model": config.responder_llm.model,
             "base_url": config.responder_llm.base_url,
             "api_key": config.responder_llm.api_key,
         }
+        if config.responder_llm.strengths:
+            responder_dict["strengths"] = config.responder_llm.strengths
+        payload["responder_llm"] = responder_dict
     if config.embeddings:
         payload["embeddings"] = {
             "provider": config.embeddings.provider,
@@ -351,24 +415,40 @@ def save_config(path: Path, config: AppConfig) -> None:
             "max_total_llm_calls_per_run_per_turn": config.task_runner.max_total_llm_calls_per_run_per_turn,
             "max_total_steps_per_turn": config.task_runner.max_total_steps_per_turn,
         }
+    if config.autonomy:
+        payload["autonomy"] = {
+            "enabled": config.autonomy.enabled,
+            "auto_continue": config.autonomy.auto_continue,
+            "execute_commitments": config.autonomy.execute_commitments,
+            "idle_trigger_seconds": config.autonomy.idle_trigger_seconds,
+            "idle_min_interval_seconds": config.autonomy.idle_min_interval_seconds,
+            "autonomous_idle_delay_seconds": config.autonomy.autonomous_idle_delay_seconds,
+            "max_autonomous_llm_calls_per_turn": config.autonomy.max_autonomous_llm_calls_per_turn,
+        }
     path.write_text(json.dumps(payload, indent=2))
 
 
 def save_shared_settings(path: Path, settings: SharedSettings) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    planner_dict: dict = {
+        "provider": settings.planner_llm.provider,
+        "model": settings.planner_llm.model,
+        "base_url": settings.planner_llm.base_url,
+        "api_key": settings.planner_llm.api_key,
+    }
+    if settings.planner_llm.strengths:
+        planner_dict["strengths"] = settings.planner_llm.strengths
+    responder_dict: dict = {
+        "provider": settings.responder_llm.provider,
+        "model": settings.responder_llm.model,
+        "base_url": settings.responder_llm.base_url,
+        "api_key": settings.responder_llm.api_key,
+    }
+    if settings.responder_llm.strengths:
+        responder_dict["strengths"] = settings.responder_llm.strengths
     payload = {
-        "planner_llm": {
-            "provider": settings.planner_llm.provider,
-            "model": settings.planner_llm.model,
-            "base_url": settings.planner_llm.base_url,
-            "api_key": settings.planner_llm.api_key,
-        },
-        "responder_llm": {
-            "provider": settings.responder_llm.provider,
-            "model": settings.responder_llm.model,
-            "base_url": settings.responder_llm.base_url,
-            "api_key": settings.responder_llm.api_key,
-        },
+        "planner_llm": planner_dict,
+        "responder_llm": responder_dict,
         "embeddings": {
             "provider": settings.embeddings.provider,
             "model": settings.embeddings.model,
@@ -400,4 +480,14 @@ def save_shared_settings(path: Path, settings: SharedSettings) -> None:
         "max_total_llm_calls_per_run_per_turn": task_runner.max_total_llm_calls_per_run_per_turn,
         "max_total_steps_per_turn": task_runner.max_total_steps_per_turn,
     }
+    if settings.autonomy:
+        payload["autonomy"] = {
+            "enabled": settings.autonomy.enabled,
+            "auto_continue": settings.autonomy.auto_continue,
+            "execute_commitments": settings.autonomy.execute_commitments,
+            "idle_trigger_seconds": settings.autonomy.idle_trigger_seconds,
+            "idle_min_interval_seconds": settings.autonomy.idle_min_interval_seconds,
+            "autonomous_idle_delay_seconds": settings.autonomy.autonomous_idle_delay_seconds,
+            "max_autonomous_llm_calls_per_turn": settings.autonomy.max_autonomous_llm_calls_per_turn,
+        }
     path.write_text(json.dumps(payload, indent=2))

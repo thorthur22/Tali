@@ -28,6 +28,7 @@ class ActionPlan:
     delegate_to: str | None
     delegate_task: dict[str, Any] | None
     skill_name: str | None
+    tool_calls: list[dict[str, Any]] | None = None
 
 
 @dataclass(frozen=True)
@@ -37,6 +38,28 @@ class ReviewResult:
     missing_items: list[str]
     assumptions: list[str]
     user_message: str
+
+
+def build_swarm_context(a2a_client: Any, self_name: str) -> str:
+    """Build a description of peer agents from the shared registry.
+
+    Returns an empty string when no A2A client is available or no peers exist.
+    """
+    if not a2a_client:
+        return ""
+    try:
+        agents = a2a_client.registry.list_agents()
+    except Exception:  # noqa: BLE001
+        return ""
+    peers = [a for a in agents if a.get("agent_name") != self_name]
+    if not peers:
+        return "No other agents are currently registered in the swarm."
+    lines = ["Other agents available for delegation:"]
+    for a in peers:
+        caps = ", ".join(a.get("capabilities", [])) or "general"
+        status = a.get("status", "unknown")
+        lines.append(f'- Agent "{a["agent_name"]}": capabilities=[{caps}], status={status}')
+    return "\n".join(lines)
 
 
 def build_decomposition_prompt(
@@ -58,6 +81,7 @@ def build_decomposition_prompt(
             "Do NOT use tools for greetings or small talk.",
             "Set requires_tools=true for any task needing files, shell, web, or python tools.",
             "Respect preferences from memory context as constraints.",
+            "Some tasks may be delegated to other agents in the swarm during execution if better-suited agents are available. Plan tasks at a level where delegation boundaries are natural.",
             "Required JSON schema:",
             "{",
             '  "tasks": [',
@@ -147,6 +171,7 @@ def build_action_plan_prompt(
     run_summary: str | None,
     stuck_context: str | None,
     skill_context: str | None,
+    responder_strengths: str | None = None,
 ) -> str:
     clarifications = ""
     if run_summary:
@@ -162,6 +187,13 @@ def build_action_plan_prompt(
         "Choose the single next action for this task.",
         "Valid next_action_type values:",
         '"respond", "tool_call", "ask_user", "store_output", "mark_done", "block", "fail", "delegate", "execute_skill"',
+        "Delegation rules:",
+        '- If another agent is better suited for this task (see Team resources in Agent context), use next_action_type="delegate".',
+        '- Set delegate_to to the agent\'s name for a specific agent, or to a capability keyword (e.g. "coding") to auto-select an agent with that skill.',
+        "- Provide delegate_task with title, description, inputs (dict), and requested_outputs (list of strings).",
+        "- After delegating, the task will block until the other agent responds.",
+        "- Only delegate when another agent has a clearly relevant capability you lack; prefer doing the work yourself when possible.",
+        f"When choosing 'respond', note that the response model excels at: {responder_strengths or 'general conversation'}. Provide detailed factual content and citations in your message so the responder can phrase it well.",
         "If asking the user, keep it to ONE minimal question.",
         "If using a tool, provide tool_name and tool_args.",
         "If executing a skill, provide skill_name and use the skill steps to guide actions.",
@@ -176,7 +208,7 @@ def build_action_plan_prompt(
         "If you reference memory in message, cite it with [fact:ID], [commitment:ID], [preference:KEY], or [episode:ID].",
         "Only use tool_name values that appear in Available tools; never invent tools.",
         "For fs.list, omit the path to list the root; never pass an empty string path.",
-        "Avoid shell.run unless using allowed read-only commands (git status/diff/log, ls/dir, cat/type).",
+        "Avoid shell.run unless using allowed read-only commands (git status/diff/log, ls/dir, cat/type, grep/rg, find, wc, head/tail, which/where, python --version, pip list/show, tree).",
         "To find the Desktop, use fs.list with {} to list the root and locate 'Desktop'. If no Desktop entry exists, ask the user for a path.",
         "Use the OS info from agent context to avoid OS-specific assumptions.",
         "JSON schema:",
@@ -190,8 +222,12 @@ def build_action_plan_prompt(
         '  "block_reason": "optional",',
         '  "delegate_to": "optional agent name",',
         '  "delegate_task": { "title": "...", "description": "...", "inputs": {...}, "requested_outputs": ["..."] },',
-        '  "skill_name": "optional skill name"',
+        '  "skill_name": "optional skill name",',
+        '  "tool_calls": [{"tool_name": "...", "tool_args": {...}, "tool_purpose": "..."}]  // optional: batch multiple independent tool calls in one step',
         "}",
+        'For batched tool calls, use "tool_calls" array instead of single tool_name/tool_args. Use this when multiple independent reads are needed.',
+        'Example action (for reference only, do not copy verbatim):',
+        '{"next_action_type":"tool_call","tool_name":"fs.search","tool_args":{"query":"TODO"},"tool_purpose":"Find all files containing TODO markers"}',
         "User request:",
         user_prompt,
         "Task:",
@@ -299,6 +335,27 @@ def parse_action_plan(text: str) -> tuple[ActionPlan | None, str | None]:
         return None, "delegate_task must be object"
     if skill_name is not None and not isinstance(skill_name, str):
         return None, "skill_name must be string"
+    # Parse optional batched tool_calls
+    tool_calls_raw = payload.get("tool_calls")
+    tool_calls: list[dict[str, Any]] | None = None
+    if tool_calls_raw is not None:
+        if not isinstance(tool_calls_raw, list):
+            return None, "tool_calls must be array"
+        tool_calls = []
+        for idx, tc in enumerate(tool_calls_raw):
+            if not isinstance(tc, dict):
+                return None, f"tool_calls[{idx}] must be object"
+            tc_name = tc.get("tool_name")
+            tc_args = tc.get("tool_args")
+            if not isinstance(tc_name, str):
+                return None, f"tool_calls[{idx}].tool_name must be string"
+            if tc_args is not None and not isinstance(tc_args, dict):
+                return None, f"tool_calls[{idx}].tool_args must be object"
+            tool_calls.append({
+                "tool_name": tc_name,
+                "tool_args": tc_args or {},
+                "tool_purpose": tc.get("tool_purpose", ""),
+            })
     return (
         ActionPlan(
             next_action_type=next_action_type,
@@ -311,6 +368,7 @@ def parse_action_plan(text: str) -> tuple[ActionPlan | None, str | None]:
             delegate_to=delegate_to,
             delegate_task=delegate_task,
             skill_name=skill_name,
+            tool_calls=tool_calls,
         ),
         None,
     )
@@ -324,6 +382,7 @@ def build_completion_review_prompt(
             "You are the completion reviewer. Return STRICT JSON ONLY. No reasoning.",
             HOLISTIC_PROMPT_PATCH,
             "Validate whether the tasks fully satisfy the user request.",
+            "For each task, compare the 'verification' field in inputs_json against the actual outputs in outputs_json. Mark 'missing' if the verification criteria are not demonstrably met by the outputs.",
             "If you reference memory in user_message, cite it with [fact:ID], [commitment:ID], [preference:KEY], or [episode:ID].",
             "JSON schema:",
             "{",

@@ -11,6 +11,14 @@ from pathlib import Path
 from typing import Any
 
 from tali.db import Database
+from tali.llm import LLMClient
+
+
+@dataclass(frozen=True)
+class PatchReviewResult:
+    approved: bool
+    issues: list[str]
+    reviewer_prompt: str
 
 
 @dataclass(frozen=True)
@@ -73,6 +81,54 @@ def store_patch_proposal(db: Database, proposal: PatchProposal) -> str:
         test_results=test_payload,
     )
     return proposal_id
+
+
+def review_patch(llm: LLMClient, proposal: PatchProposal) -> PatchReviewResult:
+    """Run a second-agent LLM review of a patch proposal for safety and correctness."""
+    prompt = _build_review_prompt(proposal)
+    response = llm.generate(prompt)
+    return _parse_review_result(response.content, prompt)
+
+
+def _build_review_prompt(proposal: PatchProposal) -> str:
+    return "\n".join([
+        "You are a code safety reviewer. Your ONLY job is to critique the",
+        "following code diff for safety, correctness, and adherence to best practices.",
+        "You must NOT rubber-stamp changes. Look for:",
+        "  - Security risks (credential leaks, injection, unsafe file ops)",
+        "  - Logic errors or regressions",
+        "  - Violations of the invariant: the LLM must never train itself",
+        "  - Modifications to core runtime behavior that could break the agent",
+        "  - Unsafe system calls or shell commands",
+        "",
+        "Return STRICT JSON only with this schema:",
+        '{"approved": true/false, "issues": ["issue 1", "issue 2"]}',
+        "",
+        f"Title: {proposal.title}",
+        f"Rationale: {proposal.rationale}",
+        f"Files affected: {', '.join(proposal.files)}",
+        "",
+        "Diff:",
+        proposal.diff_text,
+    ])
+
+
+def _parse_review_result(text: str, prompt: str) -> PatchReviewResult:
+    raw = text.strip()
+    if not raw:
+        return PatchReviewResult(approved=False, issues=["empty review response"], reviewer_prompt=prompt)
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return PatchReviewResult(approved=False, issues=["invalid json in review response"], reviewer_prompt=prompt)
+    if not isinstance(payload, dict):
+        return PatchReviewResult(approved=False, issues=["review response must be object"], reviewer_prompt=prompt)
+    approved = bool(payload.get("approved", False))
+    issues = payload.get("issues", [])
+    if not isinstance(issues, list):
+        issues = [str(issues)]
+    issues = [str(i) for i in issues]
+    return PatchReviewResult(approved=approved, issues=issues, reviewer_prompt=prompt)
 
 
 def run_patch_tests(tests: list[str], cwd: Path) -> str:

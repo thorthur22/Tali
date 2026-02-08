@@ -202,18 +202,33 @@ class ToolRunner:
             status = "ok"
             summary = ""
             raw = ""
-            try:
-                if call.name == "python.eval":
-                    summary, raw = self._run_python_eval(call.args["code"])
-                else:
-                    definition = self.registry.get(call.name)
-                    if definition is None:
-                        raise ValueError("tool not found")
-                    summary, raw = definition.handle(call.args)
-            except Exception as exc:
-                status = "error"
-                summary = f"{exc}"
-                raw = ""
+            retryable_tools = {"web.fetch", "web.fetch_text", "web.search"}
+            max_attempts = 2 if call.name in retryable_tools else 1
+            for attempt in range(max_attempts):
+                try:
+                    if call.name == "python.eval":
+                        summary, raw = self._run_python_eval(call.args["code"])
+                    else:
+                        definition = self.registry.get(call.name)
+                        if definition is None:
+                            raise ValueError("tool not found")
+                        summary, raw = definition.handle(call.args)
+                    status = "ok"
+                    break
+                except Exception as exc:
+                    is_transient = False
+                    try:
+                        import httpx
+                        is_transient = isinstance(exc, (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError))
+                    except ImportError:
+                        pass
+                    if is_transient and attempt < max_attempts - 1:
+                        time.sleep(2)
+                        continue
+                    status = "error"
+                    summary = f"{exc}"
+                    raw = ""
+                    break
             ended_at = datetime.utcnow().isoformat()
             result_ref = f"tool_call:{call.id}"
             result_json, result_hash, result_path = self._store_result(call.id, summary, raw)
@@ -303,6 +318,20 @@ class ToolRunner:
         truncated = json.dumps({"summary": summary, "raw": "[truncated]"})
         return truncated, result_hash, str(path)
 
+    @staticmethod
+    def _safe_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        """Restricted __import__ that only allows a whitelist of safe modules."""
+        allowed_modules = {
+            "math", "json", "re", "datetime", "collections", "itertools",
+            "functools", "string", "textwrap", "difflib", "hashlib", "base64",
+            "urllib.parse", "statistics", "decimal", "fractions", "dataclasses",
+            "copy", "operator", "pprint", "csv", "io",
+        }
+        top_level = name.split(".")[0]
+        if top_level not in allowed_modules and name not in allowed_modules:
+            raise ImportError(f"import of '{name}' is not allowed in sandbox")
+        return __builtins__["__import__"](name, *args, **kwargs) if isinstance(__builtins__, dict) else __import__(name, *args, **kwargs)
+
     def _run_python_eval(self, code: str) -> tuple[str, str]:
         if not self.settings.python_enabled:
             raise ValueError("python.eval is disabled")
@@ -312,16 +341,105 @@ class ToolRunner:
             import traceback
             from contextlib import redirect_stderr, redirect_stdout
 
+            _allowed_modules = {
+                "math", "json", "re", "datetime", "collections", "itertools",
+                "functools", "string", "textwrap", "difflib", "hashlib", "base64",
+                "urllib.parse", "statistics", "decimal", "fractions", "dataclasses",
+                "copy", "operator", "pprint", "csv", "io",
+            }
+
+            def _safe_import(name: str, *args, **kwargs) -> object:
+                top_level = name.split(".")[0]
+                if top_level not in _allowed_modules and name not in _allowed_modules:
+                    raise ImportError(f"import of '{name}' is not allowed in sandbox")
+                return __import__(name, *args, **kwargs)
+
             safe_builtins = {
+                # I/O
                 "print": print,
+                # Type constructors
+                "str": str,
+                "int": int,
+                "float": float,
+                "bool": bool,
+                "list": list,
+                "dict": dict,
+                "tuple": tuple,
+                "set": set,
+                "frozenset": frozenset,
+                "bytes": bytes,
+                "bytearray": bytearray,
+                "complex": complex,
+                "object": object,
+                # Numeric
                 "len": len,
                 "range": range,
                 "sum": sum,
                 "min": min,
                 "max": max,
+                "abs": abs,
+                "round": round,
+                "pow": pow,
+                "divmod": divmod,
+                "hex": hex,
+                "oct": oct,
+                "bin": bin,
+                # Iteration
+                "sorted": sorted,
+                "enumerate": enumerate,
+                "zip": zip,
+                "map": map,
+                "filter": filter,
+                "reversed": reversed,
+                "iter": iter,
+                "next": next,
+                # Aggregation
+                "any": any,
+                "all": all,
+                # Introspection
+                "isinstance": isinstance,
+                "issubclass": issubclass,
+                "type": type,
+                "hasattr": hasattr,
+                "getattr": getattr,
+                "setattr": setattr,
+                "callable": callable,
+                "repr": repr,
+                "id": id,
+                "dir": dir,
+                "vars": vars,
+                # String / char
+                "chr": chr,
+                "ord": ord,
+                "format": format,
+                "hash": hash,
+                # Import (restricted)
+                "__import__": _safe_import,
+                # Exceptions (needed for try/except)
+                "Exception": Exception,
+                "ValueError": ValueError,
+                "TypeError": TypeError,
+                "KeyError": KeyError,
+                "IndexError": IndexError,
+                "AttributeError": AttributeError,
+                "ImportError": ImportError,
+                "StopIteration": StopIteration,
+                "RuntimeError": RuntimeError,
+                "ZeroDivisionError": ZeroDivisionError,
+                # Boolean constants
+                "True": True,
+                "False": False,
+                "None": None,
+                # Other utilities
+                "slice": slice,
+                "property": property,
+                "staticmethod": staticmethod,
+                "classmethod": classmethod,
+                "super": super,
+                "input": lambda *_: "",
             }
             globals_dict = {"__builtins__": safe_builtins}
-            locals_dict: dict[str, Any] = {}
+            locals_dict: dict = {}
             stdout = io.StringIO()
             stderr = io.StringIO()
             try:

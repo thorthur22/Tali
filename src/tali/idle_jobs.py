@@ -9,7 +9,7 @@ from typing import Any, Callable
 from tali.db import Database
 from tali.knowledge_sources import KnowledgeSourceRegistry
 from tali.models import ProvenanceType
-from tali.patches import PatchProposal, parse_patch_proposal, store_patch_proposal
+from tali.patches import PatchProposal, parse_patch_proposal, review_patch, store_patch_proposal
 from tali.questions import queue_question
 
 
@@ -32,11 +32,13 @@ class IdleJobRunner:
         llm: Any,
         sources: KnowledgeSourceRegistry,
         should_stop: Callable[[], bool],
+        hook_manager: Any | None = None,
     ) -> None:
         self.db = db
         self.llm = llm
         self.sources = sources
         self.should_stop = should_stop
+        self.hook_manager = hook_manager
 
     def run_cycle(self) -> IdleJobResult:
         messages: list[str] = []
@@ -168,8 +170,41 @@ class IdleJobRunner:
         proposal, error = parse_patch_proposal(response.content)
         if error or not proposal:
             return IdleJobResult(messages=["Idle: patch proposal skipped (invalid response)."], llm_calls=1)
-        store_patch_proposal(self.db, proposal)
-        return IdleJobResult(messages=["Idle: patch proposal stored."], llm_calls=1)
+        proposal_id = store_patch_proposal(self.db, proposal)
+        # Two-agent review: use the LLM as a safety reviewer
+        review_result = review_patch(self.llm, proposal)
+        review_status = "proposed" if review_result.approved else "review_failed"
+        self.db.update_patch_review(
+            proposal_id=proposal_id,
+            review_json=json.dumps({
+                "approved": review_result.approved,
+                "issues": review_result.issues,
+                "reviewer_prompt": review_result.reviewer_prompt,
+            }),
+            status=review_status,
+        )
+        # Fire hook event for extensibility
+        if self.hook_manager:
+            self.hook_manager.run("on_patch_proposed", {
+                "proposal_id": proposal_id,
+                "proposal": {
+                    "title": proposal.title,
+                    "rationale": proposal.rationale,
+                    "files": proposal.files,
+                    "diff_text": proposal.diff_text,
+                    "tests": proposal.tests,
+                },
+                "review_approved": review_result.approved,
+                "review_issues": review_result.issues,
+                "llm": self.llm,
+            })
+        if review_result.approved:
+            return IdleJobResult(messages=["Idle: patch proposal stored and review passed."], llm_calls=2)
+        issues_summary = "; ".join(review_result.issues[:3]) if review_result.issues else "no details"
+        return IdleJobResult(
+            messages=[f"Idle: patch proposal stored but review FAILED: {issues_summary}"],
+            llm_calls=2,
+        )
 
 
 def _build_skill_review_prompt(skills: list[Any], episodes: list[Any]) -> str:
