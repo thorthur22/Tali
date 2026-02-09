@@ -6,6 +6,7 @@ from unittest.mock import patch
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 
 from tali import cli
+from tali.config import TaskRunnerConfig
 
 
 class CliSpawnTests(unittest.TestCase):
@@ -40,6 +41,21 @@ class CliSpawnTests(unittest.TestCase):
         args = popen.call_args.args[0]
         self.assertEqual(args[0], "gnome-terminal")
         self.assertIn("TALI_AGENT_SPAWNED=1 tali agent chat", args[-1])
+
+    def test_relaxed_task_runner_settings_floor_overrides_low_config(self) -> None:
+        low = TaskRunnerConfig(
+            max_tasks_per_turn=1,
+            max_llm_calls_per_task=1,
+            max_tool_calls_per_task=1,
+            max_total_llm_calls_per_run_per_turn=1,
+            max_total_steps_per_turn=1,
+        )
+        settings = cli._build_relaxed_task_runner_settings(low)
+        self.assertGreaterEqual(settings.max_tasks_per_turn, 200)
+        self.assertGreaterEqual(settings.max_llm_calls_per_task, 120)
+        self.assertGreaterEqual(settings.max_tool_calls_per_task, 200)
+        self.assertGreaterEqual(settings.max_total_llm_calls_per_run_per_turn, 2000)
+        self.assertGreaterEqual(settings.max_total_steps_per_turn, 2000)
 
 
 if __name__ == "__main__":

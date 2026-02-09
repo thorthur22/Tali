@@ -59,11 +59,11 @@ def _format_llm_http_error(exc: httpx.HTTPStatusError) -> str:
 
 @dataclass(frozen=True)
 class TaskRunnerSettings:
-    max_tasks_per_turn: int = 5
-    max_llm_calls_per_task: int = 3
-    max_tool_calls_per_task: int = 5
-    max_total_llm_calls_per_run_per_turn: int = 10
-    max_total_steps_per_turn: int = 30
+    max_tasks_per_turn: int = 200
+    max_llm_calls_per_task: int = 120
+    max_tool_calls_per_task: int = 200
+    max_total_llm_calls_per_run_per_turn: int = 2000
+    max_total_steps_per_turn: int = 2000
 
 
 @dataclass
@@ -148,7 +148,7 @@ class TaskRunner:
                 f"signals=[{signals_str}]"
             )
         effective_prompt = user_input
-        if active_run is not None and active_run["status"] == "active" and resume_intent:
+        if active_run is not None and resume_intent:
             effective_prompt = str(active_run["user_prompt"])
         retrieval_context = self.retriever.retrieve(effective_prompt)
         memory_context = format_retrieval_context(retrieval_context.bundle)
@@ -187,14 +187,61 @@ class TaskRunner:
             else:
                 existing_tasks = self.db.fetch_tasks_for_run(str(active_run["id"]))
                 if not existing_tasks:
-                    self.db.update_run_status(
-                        str(active_run["id"]), status="failed", last_error="no_tasks"
-                    )
-                    active_run = None
+                    if resume_intent:
+                        retry_prompt = self._resolve_resume_prompt(active_run)
+                        if not retry_prompt:
+                            return TaskRunnerResult(
+                                message=(
+                                    "I couldn't recover a previous concrete task prompt for this run. "
+                                    "Give me a concrete request (for example: 'build the app')."
+                                ),
+                                tool_records=[],
+                                tool_results=[],
+                                run_id=str(active_run["id"]),
+                                llm_calls=0,
+                                steps=0,
+                                tool_calls=0,
+                            )
+                        tasks, error = self._decompose_and_persist(
+                            str(active_run["id"]), retry_prompt, memory_context
+                        )
+                        llm_calls += 1
+                        if error or not tasks:
+                            self.db.update_run_status(
+                                str(active_run["id"]),
+                                status="blocked",
+                                last_error=error or "decomposition_failed",
+                            )
+                            question = (
+                                f"LLM request failed ({error}). "
+                                "Check your LLM server (for Ollama: ensure it is running and the base URL is correct)."
+                                if error and error.startswith("llm_error:")
+                                else "I couldn't break this into tasks. Could you rephrase or clarify the request?"
+                            )
+                            guarded = self.guardrails.enforce(question, retrieval_context.bundle)
+                            return TaskRunnerResult(
+                                message=guarded.safe_output,
+                                tool_records=[],
+                                tool_results=[],
+                                run_id=str(active_run["id"]),
+                                llm_calls=llm_calls,
+                                steps=steps,
+                                tool_calls=0,
+                            )
+                        if show_plans:
+                            messages.append(self._format_plan(tasks))
+                        self.db.update_run_status(
+                            str(active_run["id"]), status="active", last_error=None
+                        )
+                    else:
+                        self.db.update_run_status(
+                            str(active_run["id"]), status="failed", last_error="no_tasks"
+                        )
+                        active_run = None
                 else:
                     self._resolve_blocked_task_response(active_run, user_input)
 
-        if active_run is None and self._should_use_responder_only(classification):
+        if active_run is None and self._should_use_responder_only(classification, user_input):
             response = self._generate_response(
                 user_prompt=user_input,
                 memory_context=memory_context,
@@ -341,6 +388,15 @@ class TaskRunner:
             memory_context = format_retrieval_context(retrieval_context.bundle)
             skill_context = self._build_skill_context(list(retrieval_context.bundle.skills))
         run_summary = self._refresh_run_summary(run_id, tasks_rows)
+        persist_until_done = self._should_persist_until_done(
+            user_input=user_input,
+            resume_intent=resume_intent,
+            has_active_run=active_run is not None,
+        )
+        budget_multiplier = 20 if persist_until_done else 1
+        max_turn_steps = self.settings.max_total_steps_per_turn * budget_multiplier
+        max_turn_llm_calls = self.settings.max_total_llm_calls_per_run_per_turn * budget_multiplier
+        max_tasks_this_turn = self.settings.max_tasks_per_turn * budget_multiplier
 
         # --- Circuit breaker: detect repeated review_incomplete across turns ---
         run_row = self.db.fetch_run(run_id)
@@ -373,14 +429,10 @@ class TaskRunner:
 
         while True:
             completed_this_turn = 0
-            has_budget = (
-                steps < self.settings.max_total_steps_per_turn
-                and llm_calls < self.settings.max_total_llm_calls_per_run_per_turn
-            )
             while (
-                completed_this_turn < self.settings.max_tasks_per_turn
-                and steps < self.settings.max_total_steps_per_turn
-                and llm_calls < self.settings.max_total_llm_calls_per_run_per_turn
+                completed_this_turn < max_tasks_this_turn
+                and steps < max_turn_steps
+                and llm_calls < max_turn_llm_calls
             ):
                 self.db.heartbeat_run(run_id)
                 next_task = self._select_next_task(tasks_rows, tasks_by_ordinal)
@@ -395,14 +447,17 @@ class TaskRunner:
                     working_memory=working_memory,
                     run_summary=run_summary,
                     skill_context=skill_context,
-                    llm_calls_remaining=self.settings.max_total_llm_calls_per_run_per_turn - llm_calls,
-                    steps_remaining=self.settings.max_total_steps_per_turn - steps,
+                    llm_calls_remaining=max_turn_llm_calls - llm_calls,
+                    steps_remaining=max_turn_steps - steps,
                 )
                 llm_calls += task_result.llm_calls
                 steps += task_result.steps
                 tool_records.extend(task_result.tool_records)
                 tool_results.extend(task_result.tool_results)
-                if task_result.user_message:
+                if task_result.user_message and not (
+                    persist_until_done
+                    and task_result.user_message.startswith("Task paused due to budget")
+                ):
                     messages.append(task_result.user_message)
                 if task_result.blocked:
                     self.db.update_run_status(run_id, status="blocked", current_task_id=next_task["id"])
@@ -452,8 +507,8 @@ class TaskRunner:
                     run_summary = self._refresh_run_summary(run_id, tasks_rows)
                     # Check if budget allows continuation
                     if (
-                        steps >= self.settings.max_total_steps_per_turn
-                        or llm_calls >= self.settings.max_total_llm_calls_per_run_per_turn
+                        steps >= max_turn_steps
+                        or llm_calls >= max_turn_llm_calls
                     ):
                         messages.append(self._build_remaining_tasks_message(tasks_rows))
                         break
@@ -461,8 +516,8 @@ class TaskRunner:
             else:
                 # Budget exhausted or blocked before all tasks complete
                 if (
-                    steps >= self.settings.max_total_steps_per_turn
-                    or llm_calls >= self.settings.max_total_llm_calls_per_run_per_turn
+                    steps >= max_turn_steps
+                    or llm_calls >= max_turn_llm_calls
                 ):
                     messages.append(self._build_remaining_tasks_message(tasks_rows))
                     break
@@ -515,7 +570,12 @@ class TaskRunner:
             return None, f"llm_error: {exc}"
         tasks, error = parse_decomposition(response.content)
         if error or not tasks:
-            return None, error
+            fallback = self._fallback_decomposition_tasks(user_prompt, error)
+            if not fallback:
+                return None, error
+            tasks = fallback
+            if self.status_fn:
+                self.status_fn("Decomposition parse failed; using fallback task decomposition")
         if self.status_fn:
             self.status_fn(f"Decomposition ok: {len(tasks)} tasks")
         if self.status_fn:
@@ -541,6 +601,37 @@ class TaskRunner:
                 updated_at=now,
             )
         return tasks, None
+
+    def _fallback_decomposition_tasks(
+        self, user_prompt: str, parse_error: str | None
+    ) -> list[TaskSpec] | None:
+        if not self._is_actionable_followup(user_prompt):
+            return None
+        cleaned = " ".join(user_prompt.strip().split())
+        if not cleaned:
+            return None
+        title = cleaned[:70]
+        if len(cleaned) > 70:
+            title += "..."
+        description = (
+            "Execute the user request directly with available tools and produce concrete "
+            f"artifacts. Original request: {cleaned}"
+        )
+        verification = (
+            "At least one concrete deliverable is produced or updated, and outputs_json "
+            "summarizes changed files and completion evidence."
+        )
+        if parse_error:
+            description += f" (fallback due to decomposition error: {parse_error})"
+        return [
+            TaskSpec(
+                title=f"Execute request: {title}",
+                description=description,
+                requires_tools=True,
+                verification=verification,
+                dependencies=[],
+            )
+        ]
 
     def _format_plan(self, tasks: list[TaskSpec]) -> str:
         lines = ["Here’s what I’ll do:"]
@@ -809,6 +900,7 @@ class TaskRunner:
         stuck_replans = 0
         action_replans = 0
         invalid_tool_replans = 0
+        planner_failures = 0
         stuck_context: str | None = None
         tool_records: list[ToolRecord] = []
         tool_results: list[ToolResult] = self._hydrate_task_state(task_row, working_memory)
@@ -835,16 +927,46 @@ class TaskRunner:
             llm_calls += 1
             stuck_context = None
             if plan is None:
-                self._log_task_event(task_id, "fail", {"reason": "action_plan_invalid"})
-                self.db.update_task_status(task_id, status="failed", outputs_json=task_row["outputs_json"], updated_at=datetime.utcnow().isoformat())
-                return TaskExecutionResult(
-                    llm_calls=llm_calls,
-                    steps=steps,
-                    tool_records=tool_records,
-                    tool_results=tool_results,
-                    user_message="I hit a planning error and will retry next turn.",
-                    blocked=False,
+                planner_failures += 1
+                self._log_task_event(
+                    task_id,
+                    "note",
+                    {"reason": "action_plan_invalid", "attempt": planner_failures},
                 )
+                if self.status_fn:
+                    self.status_fn(
+                        f"Planning output invalid (attempt {planner_failures}/3); retrying."
+                    )
+                if planner_failures < 3:
+                    stuck_context = (
+                        "Previous planning call failed. Retry planning and continue execution."
+                    )
+                    continue
+                if (
+                    bool(task_row["requires_tools"])
+                    and not self._has_successful_tool_result(tool_results)
+                    and self.tool_runner.registry.get("fs.list") is not None
+                ):
+                    if self.status_fn:
+                        self.status_fn(
+                            "Planner is stuck; forcing bootstrap tool call: fs.list {}"
+                        )
+                    plan = ActionPlan(
+                        next_action_type="tool_call",
+                        message=None,
+                        tool_name="fs.list",
+                        tool_args={},
+                        tool_purpose="Bootstrap workspace context to unblock planning.",
+                        outputs_json=None,
+                        block_reason=None,
+                        delegate_to=None,
+                        delegate_task=None,
+                        skill_name=None,
+                    )
+                    planner_failures = 0
+                else:
+                    break
+            planner_failures = 0
             action = plan.next_action_type
             requires_tools = bool(task_row["requires_tools"])
             if (
@@ -866,6 +988,25 @@ class TaskRunner:
                     continue
             if (
                 action == "respond"
+                and self._is_actionable_followup(user_prompt)
+                and not self._has_successful_tool_result(tool_results)
+                and plan.message
+                and self._is_plan_chatter(plan.message)
+            ):
+                if action_replans < 2:
+                    action_replans += 1
+                    stuck_context = (
+                        "Do not narrate a plan or next action. Perform concrete work now via "
+                        "tool_call/store_output/mark_done."
+                    )
+                    self._log_task_event(
+                        task_id,
+                        "note",
+                        {"reason": "respond_plan_chatter", "message": plan.message},
+                    )
+                    continue
+            if (
+                action == "respond"
                 and requires_tools
                 and not self._has_successful_tool_result(tool_results)
             ):
@@ -875,12 +1016,33 @@ class TaskRunner:
                         "Task requires tools but no successful tool results exist yet. "
                         "Choose tool_call or ask_user to proceed."
                     )
+                    if self.status_fn:
+                        self.status_fn(
+                            "Replanning: respond chosen before any successful tool result."
+                        )
                     self._log_task_event(
                         task_id,
                         "note",
                         {"reason": "respond_before_tool_use", "message": plan.message or ""},
                     )
                     continue
+                if self.tool_runner.registry.get("fs.list") is not None:
+                    if self.status_fn:
+                        self.status_fn(
+                            "Forcing bootstrap tool call: fs.list {} (respond-before-tools loop)"
+                        )
+                    plan = ActionPlan(
+                        next_action_type="tool_call",
+                        message=None,
+                        tool_name="fs.list",
+                        tool_args={},
+                        tool_purpose="Bootstrap workspace context to unblock execution.",
+                        outputs_json=None,
+                        block_reason=None,
+                        delegate_to=None,
+                        delegate_task=None,
+                        skill_name=None,
+                    )
             if action == "tool_call":
                 if plan.tool_name and self.tool_runner.registry.get(plan.tool_name) is None:
                     if invalid_tool_replans < 2:
@@ -1593,6 +1755,13 @@ class TaskRunner:
             return None
         plan, error = parse_action_plan(response.content)
         if error or not plan:
+            if self.status_fn:
+                snippet = response.content.strip().replace("\n", " ")
+                if len(snippet) > 140:
+                    snippet = snippet[:140] + "...[truncated]"
+                self.status_fn(
+                    f"Planning output invalid: {error or 'unknown parse error'} | raw={snippet}"
+                )
             return None
         if self.status_fn:
             tool_line = ""
@@ -1627,6 +1796,19 @@ class TaskRunner:
             "run the tool",
             "execute tool",
             "execute the tool",
+        ]
+        return any(marker in lowered for marker in markers)
+
+    def _is_plan_chatter(self, message: str) -> bool:
+        lowered = message.lower()
+        markers = [
+            "plan:",
+            "next action:",
+            "i'll",
+            "i will",
+            "here's what i'll do",
+            "here is what i'll do",
+            "let's start by",
         ]
         return any(marker in lowered for marker in markers)
 
@@ -1694,6 +1876,7 @@ class TaskRunner:
         actionable_markers = (
             "do ",
             "make ",
+            "work on ",
             "build ",
             "create ",
             "implement ",
@@ -1713,6 +1896,61 @@ class TaskRunner:
             normalized.startswith(actionable_markers)
             or any(f" {marker}" in normalized for marker in actionable_markers)
         )
+
+    @staticmethod
+    def _is_smalltalk_message(user_input: str) -> bool:
+        normalized = user_input.strip().lower()
+        if not normalized:
+            return True
+        smalltalk = {
+            "thanks",
+            "thank you",
+            "thx",
+            "ok",
+            "okay",
+            "cool",
+            "nice",
+            "great",
+            "got it",
+            "hello",
+            "hi",
+            "hey",
+            "sup",
+            "yo",
+            "bye",
+        }
+        if normalized in smalltalk:
+            return True
+        return len(normalized.split()) <= 2 and normalized.endswith(("!", "."))
+
+    def _should_persist_until_done(
+        self, user_input: str, resume_intent: bool, has_active_run: bool
+    ) -> bool:
+        if resume_intent:
+            return True
+        if self._is_actionable_followup(user_input):
+            return True
+        if has_active_run and not self._is_run_status_query(user_input):
+            return True
+        return False
+
+    def _resolve_resume_prompt(self, run_row: Any) -> str | None:
+        direct = str(run_row["user_prompt"] or "").strip()
+        if direct and not self._is_resume_intent(direct):
+            return direct
+        run_id = str(run_row["id"])
+        for row in self.db.list_runs(limit=50):
+            if str(row["id"]) == run_id:
+                continue
+            candidate = str(row["user_prompt"] or "").strip()
+            if not candidate:
+                continue
+            if self._is_resume_intent(candidate):
+                continue
+            if self._is_smalltalk_message(candidate):
+                continue
+            return candidate
+        return None
 
     def _hydrate_task_state(
         self, task_row: Any, working_memory: WorkingMemory
@@ -2044,9 +2282,17 @@ class TaskRunner:
     def _classify_request(self, user_input: str) -> ScoringResult:
         return classify_request(user_input)
 
-    def _should_use_responder_only(self, classification: ScoringResult) -> bool:
+    def _should_use_responder_only(
+        self, classification: ScoringResult, user_input: str
+    ) -> bool:
         if classification.tier == "SIMPLE":
-            return True
+            if self._is_actionable_followup(user_input):
+                return False
+            if self._is_smalltalk_message(user_input):
+                return True
+            # Route non-conversational SIMPLE prompts through tasking so
+            # short project updates (e.g. "we are making X") can drive execution.
+            return classification.query_type == "conversational"
         # Conversational MEDIUM queries don't need the planner
         if classification.tier == "MEDIUM" and classification.query_type == "conversational":
             return True

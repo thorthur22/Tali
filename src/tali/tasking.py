@@ -7,6 +7,46 @@ from typing import Any
 from tali.prompts import HOLISTIC_PROMPT_PATCH
 
 
+def _strip_markdown_fence(raw: str) -> str:
+    stripped = raw.strip()
+    if not stripped.startswith("```"):
+        return stripped
+    lines = stripped.splitlines()
+    if not lines:
+        return stripped
+    if lines[0].startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip().startswith("```"):
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def _load_json_relaxed(text: str) -> tuple[Any | None, str | None]:
+    raw = text.strip()
+    if not raw:
+        return None, "empty response"
+    candidates = [raw]
+    de_fenced = _strip_markdown_fence(raw)
+    if de_fenced and de_fenced != raw:
+        candidates.append(de_fenced)
+    for candidate in candidates:
+        try:
+            return json.loads(candidate), None
+        except json.JSONDecodeError:
+            start = candidate.find("{")
+            end = candidate.rfind("}")
+            if start != -1 and end > start:
+                try:
+                    return json.loads(candidate[start : end + 1]), None
+                except json.JSONDecodeError:
+                    pass
+    try:
+        json.loads(candidates[-1])
+    except json.JSONDecodeError as exc:
+        return None, f"invalid json: {exc}"
+    return None, "invalid json"
+
+
 @dataclass(frozen=True)
 class TaskSpec:
     title: str
@@ -107,13 +147,9 @@ def build_decomposition_prompt(
 
 
 def parse_decomposition(text: str) -> tuple[list[TaskSpec] | None, str | None]:
-    raw = text.strip()
-    if not raw:
-        return None, "empty response"
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        return None, f"invalid json: {exc}"
+    payload, error = _load_json_relaxed(text)
+    if error:
+        return None, error
     if not isinstance(payload, dict):
         return None, "payload must be object"
     tasks_raw = payload.get("tasks")
@@ -293,13 +329,9 @@ def build_response_prompt(
 
 
 def parse_action_plan(text: str) -> tuple[ActionPlan | None, str | None]:
-    raw = text.strip()
-    if not raw:
-        return None, "empty response"
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        return None, f"invalid json: {exc}"
+    payload, error = _load_json_relaxed(text)
+    if error:
+        return None, error
     if not isinstance(payload, dict):
         return None, "payload must be object"
     next_action_type = payload.get("next_action_type")
@@ -403,13 +435,9 @@ def build_completion_review_prompt(
 
 
 def parse_completion_review(text: str) -> tuple[ReviewResult | None, str | None]:
-    raw = text.strip()
-    if not raw:
-        return None, "empty response"
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        return None, f"invalid json: {exc}"
+    payload, error = _load_json_relaxed(text)
+    if error:
+        return None, error
     if not isinstance(payload, dict):
         return None, "payload must be object"
     overall_status = payload.get("overall_status")

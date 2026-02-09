@@ -2,12 +2,14 @@ import json
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 
 from tali.db import Database
 from tali.guardrails import Guardrails
+from tali.classifier import ScoringResult
 from tali.llm import LLMResponse
 from tali.retrieval import Retriever
 from tali.task_runner import TaskRunner, TaskRunnerSettings
@@ -28,6 +30,23 @@ class FakeLLM:
         content = self.responses[self.calls]
         self.calls += 1
         return LLMResponse(content=content, model="fake")
+
+
+class ScriptedLLM:
+    def __init__(self, script: list[object]) -> None:
+        self.script = script
+        self.calls = 0
+        self.prompts: list[str] = []
+
+    def generate(self, prompt: str, *, temperature: float | None = None) -> LLMResponse:
+        self.prompts.append(prompt)
+        if self.calls >= len(self.script):
+            raise AssertionError("LLM called more than expected")
+        item = self.script[self.calls]
+        self.calls += 1
+        if isinstance(item, Exception):
+            raise item
+        return LLMResponse(content=str(item), model="fake")
 
 
 class _FakeRegistry:
@@ -174,6 +193,9 @@ class TaskRunnerTests(unittest.TestCase):
             tool_descriptions="none",
             settings=settings,
         )
+        runner._should_persist_until_done = (  # type: ignore[method-assign]
+            lambda user_input, resume_intent, has_active_run: False
+        )
         runner.run_turn(
             "First implement the algorithm, then optimize the database",
             prompt_fn=lambda _: "",
@@ -291,6 +313,209 @@ class TaskRunnerTests(unittest.TestCase):
         self.assertEqual([row["status"] for row in after], ["done", "pending"])
         self.assertIn("Run in progress", result.message)
         self.assertIn("continue", result.message.lower())
+
+    def test_simple_actionable_prompt_starts_task_execution(self) -> None:
+        decomposition = {
+            "tasks": [
+                {
+                    "title": "Build app skeleton",
+                    "description": "Create initial app files.",
+                    "requires_tools": False,
+                    "verification": "Skeleton exists.",
+                    "dependencies": [],
+                }
+            ]
+        }
+        llm = FakeLLM([json.dumps(decomposition)])
+        settings = TaskRunnerSettings(max_total_llm_calls_per_run_per_turn=1)
+        runner = TaskRunner(
+            db=self.db,
+            llm=llm,
+            retriever=self.retriever,
+            guardrails=self.guardrails,
+            tool_runner=FakeToolRunner(),
+            tool_descriptions="none",
+            settings=settings,
+        )
+        result = runner.run_turn("work on the app", prompt_fn=lambda _: "")
+        self.assertIsNotNone(result.run_id)
+        run = self.db.fetch_active_run()
+        self.assertIsNotNone(run)
+        tasks = self.db.fetch_tasks_for_run(run["id"])
+        self.assertEqual(len(tasks), 1)
+
+    def test_simple_non_actionable_prompt_uses_responder_only(self) -> None:
+        llm = FakeLLM(["You're welcome."])
+        runner = TaskRunner(
+            db=self.db,
+            llm=llm,
+            retriever=self.retriever,
+            guardrails=self.guardrails,
+            tool_runner=FakeToolRunner(),
+            tool_descriptions="none",
+        )
+        result = runner.run_turn("thanks", prompt_fn=lambda _: "")
+        self.assertIsNone(result.run_id)
+        self.assertIsNone(self.db.fetch_active_run())
+
+    def test_simple_general_prompt_routes_to_tasking(self) -> None:
+        decomposition = {
+            "tasks": [
+                {
+                    "title": "Start app work",
+                    "description": "Initialize the app workstream.",
+                    "requires_tools": False,
+                    "verification": "Workstream initialized.",
+                    "dependencies": [],
+                }
+            ]
+        }
+        llm = FakeLLM([json.dumps(decomposition)])
+        settings = TaskRunnerSettings(max_total_llm_calls_per_run_per_turn=1)
+        runner = TaskRunner(
+            db=self.db,
+            llm=llm,
+            retriever=self.retriever,
+            guardrails=self.guardrails,
+            tool_runner=FakeToolRunner(),
+            tool_descriptions="none",
+            settings=settings,
+        )
+        runner._classify_request = lambda _text: ScoringResult(
+            score=-0.2,
+            tier="SIMPLE",
+            confidence=0.95,
+            signals=["short"],
+            query_type="general",
+        )
+        result = runner.run_turn(
+            "we are making an alpaca options trading bot ui using flask",
+            prompt_fn=lambda _: "",
+        )
+        self.assertIsNotNone(result.run_id)
+        self.assertIsNotNone(self.db.fetch_active_run())
+
+    def test_actionable_prompt_falls_back_when_decomposition_json_invalid(self) -> None:
+        llm = FakeLLM(["not-json"])
+        settings = TaskRunnerSettings(max_total_llm_calls_per_run_per_turn=1)
+        runner = TaskRunner(
+            db=self.db,
+            llm=llm,
+            retriever=self.retriever,
+            guardrails=self.guardrails,
+            tool_runner=FakeToolRunner(),
+            tool_descriptions="none",
+            settings=settings,
+        )
+        result = runner.run_turn("work on the app", prompt_fn=lambda _: "")
+        self.assertIsNotNone(result.run_id)
+        run = self.db.fetch_active_run()
+        self.assertIsNotNone(run)
+        tasks = self.db.fetch_tasks_for_run(run["id"])
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0]["requires_tools"], 1)
+
+    def test_continue_retries_blocked_run_decomposition_with_original_prompt(self) -> None:
+        decomposition = {
+            "tasks": [
+                {
+                    "title": "Build app",
+                    "description": "Create app files.",
+                    "requires_tools": False,
+                    "verification": "App exists.",
+                    "dependencies": [],
+                }
+            ]
+        }
+        action_done = {"next_action_type": "mark_done", "outputs_json": {"ok": True}}
+        review = {
+            "overall_status": "complete",
+            "checks": [{"task_ordinal": 0, "status": "ok", "note": ""}],
+            "missing_items": [],
+            "assumptions": [],
+            "user_message": "Done.",
+        }
+        llm = ScriptedLLM(
+            [
+                TimeoutError("timed out"),  # first decomposition attempt fails
+                json.dumps(decomposition),  # continue retries decomposition
+                json.dumps(action_done),
+                json.dumps(review),
+                "Done.",
+            ]
+        )
+        runner = TaskRunner(
+            db=self.db,
+            llm=llm,
+            retriever=self.retriever,
+            guardrails=self.guardrails,
+            tool_runner=FakeToolRunner(),
+            tool_descriptions="none",
+        )
+        first = runner.run_turn("build the app", prompt_fn=lambda _: "")
+        self.assertIn("LLM request failed", first.message)
+        run = self.db.fetch_active_run()
+        self.assertIsNotNone(run)
+        self.assertEqual(run["status"], "blocked")
+
+        second = runner.run_turn("continue", prompt_fn=lambda _: "")
+        self.assertIn("Done", second.message)
+        self.assertIsNone(self.db.fetch_active_run())
+        with self.db.connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS count FROM runs WHERE user_prompt = ?",
+                ("continue",),
+            ).fetchone()
+        self.assertEqual(int(row["count"]), 0)
+
+    def test_resume_recovers_prompt_from_recent_runs_when_current_is_continue(self) -> None:
+        older = (datetime.utcnow() - timedelta(minutes=2)).isoformat()
+        newer = datetime.utcnow().isoformat()
+        self.db.insert_run(
+            run_id="run-older",
+            created_at=older,
+            status="failed",
+            user_prompt="build the app",
+            current_task_id=None,
+            last_error="x",
+            origin="user",
+        )
+        self.db.insert_run(
+            run_id="run-continue",
+            created_at=newer,
+            status="blocked",
+            user_prompt="continue",
+            current_task_id=None,
+            last_error="decomposition_failed",
+            origin="user",
+        )
+        decomposition = {
+            "tasks": [
+                {
+                    "title": "Build app",
+                    "description": "Create app files.",
+                    "requires_tools": False,
+                    "verification": "App exists.",
+                    "dependencies": [],
+                }
+            ]
+        }
+        llm = FakeLLM([json.dumps(decomposition)])
+        runner = TaskRunner(
+            db=self.db,
+            llm=llm,
+            retriever=self.retriever,
+            guardrails=self.guardrails,
+            tool_runner=FakeToolRunner(),
+            tool_descriptions="none",
+            settings=TaskRunnerSettings(max_total_llm_calls_per_run_per_turn=1),
+        )
+        result = runner.run_turn("resume", prompt_fn=lambda _: "")
+        self.assertEqual(result.run_id, "run-continue")
+        tasks = self.db.fetch_tasks_for_run("run-continue")
+        self.assertEqual(len(tasks), 1)
+        run = self.db.fetch_run("run-continue")
+        self.assertEqual(run["status"], "active")
 
     def test_blocked_task_asks_one_question(self) -> None:
         decomposition = {
@@ -672,6 +897,103 @@ class TaskRunnerTests(unittest.TestCase):
         self.assertEqual(len(tasks), 2)
         statuses = [row["status"] for row in tasks]
         self.assertEqual(statuses, ["done", "done"])
+
+    def test_action_planning_error_retries_within_same_turn(self) -> None:
+        decomposition = {
+            "tasks": [
+                {
+                    "title": "Build app",
+                    "description": "Create initial app structure.",
+                    "requires_tools": False,
+                    "verification": "App skeleton exists.",
+                    "dependencies": [],
+                }
+            ]
+        }
+        action_done = {"next_action_type": "mark_done", "outputs_json": {"ok": True}}
+        review = {
+            "overall_status": "complete",
+            "checks": [{"task_ordinal": 0, "status": "ok", "note": ""}],
+            "missing_items": [],
+            "assumptions": [],
+            "user_message": "Done.",
+        }
+        llm = FakeLLM(
+            [
+                json.dumps(decomposition),
+                "not-json",  # first action-plan attempt fails
+                json.dumps(action_done),  # retry succeeds
+                json.dumps(review),
+                "Done.",
+            ]
+        )
+        runner = TaskRunner(
+            db=self.db,
+            llm=llm,
+            retriever=self.retriever,
+            guardrails=self.guardrails,
+            tool_runner=FakeToolRunner(),
+            tool_descriptions="none",
+        )
+        result = runner.run_turn("build the app", prompt_fn=lambda _: "")
+        self.assertNotIn("planning error", result.message.lower())
+        self.assertIn("Done", result.message)
+        self.assertIsNone(self.db.fetch_active_run())
+
+    def test_planner_invalid_loop_forces_bootstrap_tool_call(self) -> None:
+        decomposition = {
+            "tasks": [
+                {
+                    "title": "Build app",
+                    "description": "Create initial app structure.",
+                    "requires_tools": True,
+                    "verification": "App skeleton exists.",
+                    "dependencies": [],
+                }
+            ]
+        }
+        action_done = {"next_action_type": "mark_done", "outputs_json": {"ok": True}}
+        review = {
+            "overall_status": "complete",
+            "checks": [{"task_ordinal": 0, "status": "ok", "note": ""}],
+            "missing_items": [],
+            "assumptions": [],
+            "user_message": "Done.",
+        }
+        llm = FakeLLM(
+            [
+                json.dumps(decomposition),
+                "bad-json-1",
+                "bad-json-2",
+                "bad-json-3",
+                json.dumps(action_done),
+                json.dumps(review),
+                "Done.",
+            ]
+        )
+        tool_result = ToolResult(
+            id="tc_bootstrap",
+            name="fs.list",
+            status="ok",
+            started_at="",
+            ended_at="",
+            result_ref="tool_call:tc_bootstrap",
+            result_summary="Listed root",
+            result_raw="src\nREADME.md",
+        )
+        tool_runner = FakeToolRunner(results_by_call=[[tool_result]])
+        runner = TaskRunner(
+            db=self.db,
+            llm=llm,
+            retriever=self.retriever,
+            guardrails=self.guardrails,
+            tool_runner=tool_runner,
+            tool_descriptions="none",
+        )
+        result = runner.run_turn("build the app", prompt_fn=lambda _: "")
+        self.assertIn("Done", result.message)
+        self.assertGreaterEqual(len(tool_runner.tool_calls), 1)
+        self.assertEqual(tool_runner.tool_calls[0].name, "fs.list")
 
     def test_build_remaining_tasks_message(self) -> None:
         """_build_remaining_tasks_message should list pending tasks."""

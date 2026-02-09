@@ -5,11 +5,14 @@ import os
 import platform
 import subprocess
 import re
+import sys
 import shlex
 import shutil
+import signal
 import time
+import threading
 from urllib.parse import urlparse
-from datetime import datetime
+from datetime import datetime, timedelta
 from uuid import uuid4
 from pathlib import Path
 from typing import Optional
@@ -89,6 +92,7 @@ from tali.cli_format import (
     format_config,
     format_help_guide,
 )
+from tali.web_ui import run_web_ui
 
 app = typer.Typer(help="Tali agent CLI \u2014 run 'tali --install-completion' for shell tab-completion.")
 agent_app = typer.Typer(help="Manage agents")
@@ -164,7 +168,23 @@ def main(ctx: typer.Context) -> None:
     if ctx.invoked_subcommand is not None:
         return
     _bootstrap_first_agent(start_chat=False)
-    _sync_all_agent_worktrees()
+    _restart_running_agent_services_after_sync()
+    run_web_ui(host="127.0.0.1", port=8765, open_browser=True)
+
+
+@app.command("web")
+def web(
+    host: str = typer.Option("127.0.0.1", "--host", help="Bind host."),
+    port: int = typer.Option(8765, "--port", help="Bind port."),
+    open_browser: bool = typer.Option(True, "--open-browser/--no-open-browser", help="Open the default browser."),
+) -> None:
+    """Launch the local web UI dashboard."""
+    run_web_ui(host=host, port=port, open_browser=open_browser)
+
+
+@app.command("shell")
+def shell() -> None:
+    """Open the legacy interactive CLI shell."""
     _management_shell()
 
 
@@ -181,6 +201,22 @@ def _sync_all_agent_worktrees() -> None:
         _ensure_agent_worktree(paths)
 
 
+def _restart_running_agent_services_after_sync() -> None:
+    root = Path.home() / ".tali"
+    running_names: list[str] = []
+    for agent_home in _list_agent_dirs(root):
+        paths = load_paths(root, agent_home.name)
+        if _is_agent_service_pid(paths, _read_agent_service_pid(paths)):
+            running_names.append(agent_home.name)
+            typer.echo(_stop_agent_service_process(paths, agent_home.name))
+    _sync_all_agent_worktrees()
+    if not running_names:
+        return
+    for name in running_names:
+        paths = load_paths(root, name)
+        typer.echo(_start_agent_service_process(paths, name))
+
+
 def _resolve_paths(agent_name: str | None = None) -> tuple[Paths, AppConfig | None]:
     if agent_name:
         root = Path.home() / ".tali"
@@ -192,6 +228,15 @@ def _resolve_paths(agent_name: str | None = None) -> tuple[Paths, AppConfig | No
         config_path = agent_home / "config.json"
         config = load_config(config_path) if config_path.exists() else None
         return paths, config
+    env_agent_name = os.environ.get("TALI_AGENT_NAME", "").strip()
+    if env_agent_name:
+        root = Path.home() / ".tali"
+        agent_home = root / env_agent_name
+        if agent_home.exists() and (agent_home / "config.json").exists():
+            paths = load_paths(root, env_agent_name)
+            config_path = agent_home / "config.json"
+            config = load_config(config_path) if config_path.exists() else None
+            return paths, config
     root, resolved_name, config = resolve_agent(
         prompt_fn=typer.prompt, allow_create_config=False
     )
@@ -270,15 +315,64 @@ def _load_or_raise_config(paths: Paths, existing: AppConfig | None = None) -> Ap
 
 
 def _build_llm_client(settings: LLMSettings):
+    timeout_override: float | None = None
+    timeout_env = os.environ.get("TALI_LLM_TIMEOUT_S")
+    if settings.provider == "ollama":
+        timeout_env = os.environ.get("TALI_OLLAMA_TIMEOUT_S", timeout_env)
+    if timeout_env:
+        try:
+            timeout_override = float(timeout_env)
+        except ValueError:
+            timeout_override = None
     if settings.provider == "openai":
         if not settings.api_key and not _is_local_base_url(settings.base_url):
             typer.echo("OpenAI API key is required for non-local endpoints.")
             raise typer.Exit(code=1)
-        return OpenAIClient(base_url=settings.base_url, api_key=settings.api_key, model=settings.model)
+        kwargs = {}
+        if timeout_override and timeout_override > 0:
+            kwargs["timeout_s"] = timeout_override
+        return OpenAIClient(
+            base_url=settings.base_url,
+            api_key=settings.api_key,
+            model=settings.model,
+            **kwargs,
+        )
     if settings.provider == "ollama":
-        return OllamaClient(base_url=settings.base_url, model=settings.model)
+        kwargs = {}
+        if timeout_override and timeout_override > 0:
+            kwargs["timeout_s"] = timeout_override
+        return OllamaClient(base_url=settings.base_url, model=settings.model, **kwargs)
     typer.echo(f"Unsupported LLM provider: {settings.provider}")
     raise typer.Exit(code=1)
+
+
+def _build_relaxed_task_runner_settings(configured: TaskRunnerConfig | None) -> TaskRunnerSettings:
+    # Completion-first defaults: avoid small legacy config caps from throttling execution.
+    floors = TaskRunnerSettings(
+        max_tasks_per_turn=200,
+        max_llm_calls_per_task=120,
+        max_tool_calls_per_task=200,
+        max_total_llm_calls_per_run_per_turn=2000,
+        max_total_steps_per_turn=2000,
+    )
+    if configured is None:
+        return floors
+    return TaskRunnerSettings(
+        max_tasks_per_turn=max(configured.max_tasks_per_turn, floors.max_tasks_per_turn),
+        max_llm_calls_per_task=max(
+            configured.max_llm_calls_per_task, floors.max_llm_calls_per_task
+        ),
+        max_tool_calls_per_task=max(
+            configured.max_tool_calls_per_task, floors.max_tool_calls_per_task
+        ),
+        max_total_llm_calls_per_run_per_turn=max(
+            configured.max_total_llm_calls_per_run_per_turn,
+            floors.max_total_llm_calls_per_run_per_turn,
+        ),
+        max_total_steps_per_turn=max(
+            configured.max_total_steps_per_turn, floors.max_total_steps_per_turn
+        ),
+    )
 
 
 def _build_embedder(settings: EmbeddingSettings):
@@ -369,6 +463,179 @@ def _spawn_agent_terminal(agent_name: str, code_dir: Path) -> bool:
             subprocess.Popen([term, "-e", f"bash -lc '{shell_command}'"], env=env)
             return True
     return False
+
+
+def _agent_service_pid_path(paths: Paths) -> Path:
+    return paths.agent_home / "agent_service.pid"
+
+
+def _agent_service_log_path(paths: Paths) -> Path:
+    paths.logs_dir.mkdir(parents=True, exist_ok=True)
+    return paths.logs_dir / "agent_service.log"
+
+
+def _read_agent_service_pid(paths: Paths) -> int | None:
+    pid_path = _agent_service_pid_path(paths)
+    if not pid_path.exists():
+        return None
+    try:
+        payload = json.loads(pid_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    pid = payload.get("pid")
+    try:
+        return int(pid)
+    except Exception:
+        return None
+
+
+def _is_pid_running(pid: int | None) -> bool:
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _pid_command(pid: int) -> str:
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except Exception:
+        return ""
+    return (result.stdout or "").strip()
+
+
+def _find_agent_service_pids(paths: Paths) -> list[int]:
+    expected = f"agent chat {paths.agent_name}"
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,command="],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except Exception:
+        return []
+    pids: list[int] = []
+    for raw in (result.stdout or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        pid_raw, cmd = parts
+        if expected not in cmd or "--service-mode" not in cmd:
+            continue
+        try:
+            pid = int(pid_raw)
+        except ValueError:
+            continue
+        if _is_pid_running(pid):
+            pids.append(pid)
+    return sorted(set(pids))
+
+
+def _is_agent_service_pid(paths: Paths, pid: int | None) -> bool:
+    if not pid or not _is_pid_running(pid):
+        return False
+    return pid in _find_agent_service_pids(paths)
+
+
+def _write_agent_service_pid(paths: Paths, pid: int) -> None:
+    _agent_service_pid_path(paths).write_text(
+        json.dumps({"pid": pid, "started_at": datetime.utcnow().isoformat()}),
+        encoding="utf-8",
+    )
+
+
+def _clear_agent_service_pid(paths: Paths) -> None:
+    pid_path = _agent_service_pid_path(paths)
+    if pid_path.exists():
+        pid_path.unlink()
+
+
+def _start_agent_service_process(paths: Paths, agent_name: str) -> str:
+    _ensure_agent_worktree(paths)
+    running = _find_agent_service_pids(paths)
+    if running:
+        keep = running[0]
+        for dup in running[1:]:
+            try:
+                os.kill(dup, signal.SIGTERM)
+            except OSError:
+                continue
+        _write_agent_service_pid(paths, keep)
+        return f"Agent '{agent_name}' is already running (pid={keep})."
+    existing_pid = _read_agent_service_pid(paths)
+    if _is_agent_service_pid(paths, existing_pid):
+        return f"Agent '{agent_name}' is already running (pid={existing_pid})."
+    _clear_agent_service_pid(paths)
+    log_path = _agent_service_log_path(paths)
+    env = os.environ.copy()
+    env["TALI_HEADLESS"] = "1"
+    env["TALI_AGENT_SPAWNED"] = "1"
+    if paths.code_dir.exists():
+        agent_src = str(paths.code_dir / "src")
+        current_pp = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = f"{agent_src}:{current_pp}" if current_pp else agent_src
+    cmd = [sys.executable, "-m", "tali.cli", "agent", "chat", agent_name, "--service-mode"]
+    with log_path.open("a", encoding="utf-8") as stream:
+        process = subprocess.Popen(
+            cmd,
+            cwd=str(paths.code_dir) if paths.code_dir.exists() else str(Path.cwd()),
+            stdout=stream,
+            stderr=stream,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            env=env,
+        )
+    # Ensure we only report success if the child remains alive after boot.
+    time.sleep(0.4)
+    if process.poll() is not None:
+        _clear_agent_service_pid(paths)
+        return (
+            f"Failed to start agent '{agent_name}' (exit={process.returncode}). "
+            f"Check log: {log_path}"
+        )
+    _write_agent_service_pid(paths, process.pid)
+    return f"Started agent '{agent_name}' (pid={process.pid}). Log: {log_path}"
+
+
+def _stop_agent_service_process(paths: Paths, agent_name: str) -> str:
+    pid = _read_agent_service_pid(paths)
+    live_pids = _find_agent_service_pids(paths)
+    if pid and pid not in live_pids and _is_agent_service_pid(paths, pid):
+        live_pids.append(pid)
+    if not live_pids:
+        _clear_agent_service_pid(paths)
+        return f"Agent '{agent_name}' is not running."
+    for live_pid in live_pids:
+        try:
+            os.kill(live_pid, signal.SIGTERM)
+        except OSError:
+            continue
+    for _ in range(200):
+        if not any(_is_pid_running(p) for p in live_pids):
+            break
+        time.sleep(0.1)
+    for live_pid in live_pids:
+        if _is_pid_running(live_pid):
+            try:
+                os.kill(live_pid, signal.SIGKILL)
+            except OSError:
+                pass
+    _clear_agent_service_pid(paths)
+    return f"Stopped agent '{agent_name}' ({len(live_pids)} process(es))."
 
 
 def _is_local_base_url(base_url: str | None) -> bool:
@@ -825,6 +1092,11 @@ def chat(
     ),
     verbose_tools: bool = typer.Option(False, "--verbose-tools", help="Show full tool output."),
     show_plans: bool = typer.Option(False, "--show-plans", help="Show task planning steps."),
+    service_mode: bool = typer.Option(
+        False,
+        "--service-mode",
+        help="Run the agent as a background service loop without interactive chat input.",
+    ),
 ) -> None:
     """Start a chat loop or run a single turn if message is provided.
 
@@ -836,7 +1108,7 @@ def chat(
         message = None
     paths, existing_config = _resolve_paths(agent_name)
     code_dir = _ensure_agent_worktree(paths)
-    if message is None and code_dir and _should_spawn_agent_terminal():
+    if message is None and code_dir and not service_mode and _should_spawn_agent_terminal():
         spawned = _spawn_agent_terminal(paths.agent_name, code_dir)
         if spawned:
             return
@@ -868,6 +1140,16 @@ def chat(
     sources = KnowledgeSourceRegistry()
     sources.register(LocalFileSource(paths.agent_home))
     autonomy_config = config.autonomy if config.autonomy else None
+    if service_mode and (autonomy_config is None or not autonomy_config.enabled):
+        autonomy_config = AutonomyConfig(
+            enabled=True,
+            auto_continue=True,
+            execute_commitments=True,
+            idle_trigger_seconds=5,
+            idle_min_interval_seconds=60,
+            autonomous_idle_delay_seconds=1,
+            max_autonomous_llm_calls_per_turn=20,
+        )
     idle_scheduler = IdleScheduler(
         paths.data_dir,
         db,
@@ -878,9 +1160,14 @@ def chat(
         autonomy_config=autonomy_config,
     )
     idle_scheduler.start()
+    if service_mode:
+        # Kick idle/autonomy work immediately on service startup.
+        idle_scheduler._last_activity = datetime.utcnow() - timedelta(seconds=600)
     console = Console()
     agent_label = _format_agent_label(config.agent_name)
     tool_settings = config.tools if isinstance(config.tools, ToolSettings) else ToolSettings()
+    if os.environ.get("TALI_HEADLESS") == "1" and tool_settings.approval_mode == "prompt":
+        tool_settings = replace(tool_settings, approval_mode="auto_approve_safe")
     if tool_settings.approval_mode not in {"prompt", "auto_approve_safe", "deny"}:
         tool_settings = replace(tool_settings, approval_mode="prompt")
     if tool_settings.fs_root is None or not str(tool_settings.fs_root).strip():
@@ -953,19 +1240,7 @@ def chat(
     task_runner_config = (
         config.task_runner if isinstance(config.task_runner, TaskRunnerConfig) else None
     )
-    task_runner_settings = (
-        TaskRunnerSettings(
-            max_tasks_per_turn=task_runner_config.max_tasks_per_turn,
-            max_llm_calls_per_task=task_runner_config.max_llm_calls_per_task,
-            max_tool_calls_per_task=task_runner_config.max_tool_calls_per_task,
-            max_total_llm_calls_per_run_per_turn=(
-                task_runner_config.max_total_llm_calls_per_run_per_turn
-            ),
-            max_total_steps_per_turn=task_runner_config.max_total_steps_per_turn,
-        )
-        if task_runner_config
-        else None
-    )
+    task_runner_settings = _build_relaxed_task_runner_settings(task_runner_config)
     task_runner = TaskRunner(
         db=db,
         llm=planner_llm,
@@ -1406,12 +1681,63 @@ def chat(
                     return
         _run_task_runner_turn()
 
-    if message:
-        run_turn(message)
+    def _shutdown_runtime() -> None:
         scheduler.stop()
         idle_scheduler.stop()
         poller.stop()
         registry.heartbeat(config.agent_id, status="inactive")
+
+    if message:
+        run_turn(message)
+        _shutdown_runtime()
+        return
+
+    if service_mode:
+        console.print(f"[dim]{agent_label} service mode active (use 'tali agent stop {paths.agent_name}' to stop).[/dim]")
+        stop_event = threading.Event()
+        last_help_offer_at = 0.0
+
+        def _handle_signal(_signum: int, _frame: object) -> None:
+            stop_event.set()
+
+        signal.signal(signal.SIGTERM, _handle_signal)
+        signal.signal(signal.SIGINT, _handle_signal)
+        try:
+            while not stop_event.is_set():
+                active_run = db.fetch_active_run()
+                if active_run and active_run["status"] == "active":
+                    try:
+                        run_turn("continue")
+                    except Exception as exc:
+                        console.print(f"[dim red]Service loop error: {escape(str(exc))}[/dim red]")
+                        time.sleep(1.0)
+                    else:
+                        time.sleep(0.2)
+                    continue
+                now = time.monotonic()
+                if now - last_help_offer_at >= 60:
+                    try:
+                        a2a_client.send(
+                            to_agent_id=None,
+                            to_agent_name=None,
+                            topic="help_offer",
+                            payload={
+                                "type": "help_offer",
+                                "run_state": "idle",
+                                "message": (
+                                    f"{config.agent_name} is idle and available to help. "
+                                    "Send a task_request to delegate work."
+                                ),
+                            },
+                            correlation_id=None,
+                            priority=4,
+                        )
+                    except Exception:
+                        pass
+                    last_help_offer_at = now
+                time.sleep(1.0)
+        finally:
+            _shutdown_runtime()
         return
 
     console.print(f"[dim]{agent_label} chat (type 'exit' to quit)[/dim]")
@@ -1433,10 +1759,7 @@ def chat(
         if user_input.strip().lower() in {"exit", "quit"}:
             break
         run_turn(user_input)
-    scheduler.stop()
-    idle_scheduler.stop()
-    poller.stop()
-    registry.heartbeat(config.agent_id, status="inactive")
+    _shutdown_runtime()
 
 
 @run_app.command("status")
@@ -1907,6 +2230,10 @@ def swarm(prompt: str = typer.Argument(..., help="Swarm task prompt.")) -> None:
     retriever = Retriever(db, RetrievalConfig(), vector_index=vector_index)
     guardrails = Guardrails(GuardrailConfig())
     tool_settings = config.tools if isinstance(config.tools, ToolSettings) else ToolSettings()
+    if os.environ.get("TALI_HEADLESS") == "1" and tool_settings.approval_mode == "prompt":
+        tool_settings = replace(tool_settings, approval_mode="auto_approve_safe")
+    if tool_settings.approval_mode not in {"prompt", "auto_approve_safe", "deny"}:
+        tool_settings = replace(tool_settings, approval_mode="prompt")
     registry = build_default_registry(paths, tool_settings)
     policy = ToolPolicy(tool_settings, registry, paths)
     approvals = ApprovalManager(mode=tool_settings.approval_mode)
@@ -1961,19 +2288,7 @@ def swarm(prompt: str = typer.Argument(..., help="Swarm task prompt.")) -> None:
     task_runner_config = (
         config.task_runner if isinstance(config.task_runner, TaskRunnerConfig) else None
     )
-    task_runner_settings = (
-        TaskRunnerSettings(
-            max_tasks_per_turn=task_runner_config.max_tasks_per_turn,
-            max_llm_calls_per_task=task_runner_config.max_llm_calls_per_task,
-            max_tool_calls_per_task=task_runner_config.max_tool_calls_per_task,
-            max_total_llm_calls_per_run_per_turn=(
-                task_runner_config.max_total_llm_calls_per_run_per_turn
-            ),
-            max_total_steps_per_turn=task_runner_config.max_total_steps_per_turn,
-        )
-        if task_runner_config
-        else None
-    )
+    task_runner_settings = _build_relaxed_task_runner_settings(task_runner_config)
     task_runner = TaskRunner(
         db=db,
         llm=planner_llm,
@@ -2018,6 +2333,20 @@ def delete_agent(agent_name: str = typer.Argument(..., help="Agent name to delet
     if not remaining:
         typer.echo("No agents remain. Launching agent bootstrap.")
         _bootstrap_first_agent(start_chat=False)
+
+
+@agent_app.command("start")
+def start_agent(agent_name: str = typer.Argument(..., help="Agent name to start in background service mode.")) -> None:
+    """Start an agent as a background service process."""
+    paths, _ = _resolve_paths(agent_name)
+    typer.echo(_start_agent_service_process(paths, agent_name))
+
+
+@agent_app.command("stop")
+def stop_agent(agent_name: str = typer.Argument(..., help="Agent name to stop background service.")) -> None:
+    """Stop a background agent service process."""
+    paths, _ = _resolve_paths(agent_name)
+    typer.echo(_stop_agent_service_process(paths, agent_name))
 
 
 @patch_app.command("list")

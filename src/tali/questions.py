@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -101,5 +102,5 @@ def _is_relevant(user_input: str, question: str) -> bool:
     if not user_input or not question:
         return False
     lowered_input = user_input.lower()
-    lowered_question = question.lower()
-    return any(token in lowered_input for token in lowered_question.split()[:6])
+    question_tokens = re.findall(r"[a-z0-9]+", question.lower())[:6]
+    return any(token in lowered_input for token in question_tokens)
