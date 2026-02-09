@@ -189,11 +189,6 @@ CREATE TABLE IF NOT EXISTS patch_proposals (
 CREATE INDEX IF NOT EXISTS idx_questions_status_next ON user_questions (status, next_ask_at);
 CREATE INDEX IF NOT EXISTS idx_patch_status ON patch_proposals (status, created_at);
 
-CREATE TABLE IF NOT EXISTS reflections (
-  id TEXT PRIMARY KEY,
-  payload TEXT NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS agent_messages (
   id TEXT PRIMARY KEY,
   timestamp DATETIME NOT NULL,
@@ -224,6 +219,27 @@ CREATE TABLE IF NOT EXISTS delegations (
 );
 
 CREATE INDEX IF NOT EXISTS idx_delegations_corr ON delegations (correlation_id);
+
+CREATE TABLE IF NOT EXISTS reflections (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  timestamp DATETIME NOT NULL,
+  run_id TEXT NOT NULL,
+  success INTEGER DEFAULT 0,
+  what_worked TEXT,
+  what_failed TEXT,
+  next_time TEXT,
+  metrics_json TEXT,
+  created_at DATETIME NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_reflections_run ON reflections (run_id, timestamp);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS reflections_fts USING fts5(
+  id,
+  what_worked,
+  what_failed,
+  next_time
+);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS episodes_fts USING fts5(
   id,
@@ -1015,6 +1031,88 @@ class Database:
             )
             return cursor.fetchall()
 
+    # --- Reflections ---
+
+    def insert_reflection(
+        self,
+        run_id: str,
+        timestamp: str,
+        success: bool,
+        what_worked: str,
+        what_failed: str,
+        next_time: str,
+        metrics_json: str | None = None,
+    ) -> int:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO reflections (
+                    timestamp, run_id, success, what_worked, what_failed, next_time, metrics_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    timestamp,
+                    run_id,
+                    1 if success else 0,
+                    what_worked,
+                    what_failed,
+                    next_time,
+                    metrics_json,
+                    datetime.utcnow().isoformat(),
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def list_reflections(self, limit: int = 50) -> list[sqlite3.Row]:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                SELECT * FROM reflections
+                ORDER BY timestamp DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            return cursor.fetchall()
+
+    def fetch_recent_reflections(self, limit: int = 20) -> list[sqlite3.Row]:
+        return self.list_reflections(limit=limit)
+
+    def fetch_reflections_by_ids(self, reflection_ids: list[str]) -> list[sqlite3.Row]:
+        if not reflection_ids:
+            return []
+        # reflections.id is integer; accept strings that parse to int
+        ids: list[int] = []
+        for rid in reflection_ids:
+            try:
+                ids.append(int(str(rid)))
+            except ValueError:
+                continue
+        if not ids:
+            return []
+        placeholders = ",".join(["?"] * len(ids))
+        with self.connect() as connection:
+            cursor = connection.execute(
+                f"SELECT * FROM reflections WHERE id IN ({placeholders})",
+                tuple(ids),
+            )
+            return cursor.fetchall()
+
+    def search_reflections(self, query: str, limit: int = 20) -> list[sqlite3.Row]:
+        q = f"%{query}%"
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                SELECT * FROM reflections
+                WHERE what_worked LIKE ? OR what_failed LIKE ? OR next_time LIKE ?
+                ORDER BY timestamp DESC
+                LIMIT ?
+                """,
+                (q, q, q, limit),
+            )
+            return cursor.fetchall()
+
     def insert_task(
         self,
         task_id: str,
@@ -1498,20 +1596,4 @@ class Database:
             connection.execute(
                 "UPDATE facts SET contested = 0 WHERE id = ?",
                 (fact_id,),
-            )
-
-    # --- Reflections ---
-
-    def insert_reflection(self, payload: str) -> None:
-        """
-        Insert a self‑reflection record. A reflection is stored as an opaque
-        JSON payload along with a generated UUID. Consumers can record
-        arbitrary metadata about a run for later analysis.
-        """
-        import uuid
-        reflection_id = str(uuid.uuid4())
-        with self.connect() as connection:
-            connection.execute(
-                "INSERT INTO reflections (id, payload) VALUES (?, ?)",
-                (reflection_id, payload),
             )
