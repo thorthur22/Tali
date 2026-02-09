@@ -168,6 +168,15 @@ class TaskRunner:
                 and not resume_intent
                 and str(active_run["user_prompt"]).strip() != user_input.strip()
             ):
+                if self._is_run_status_query(user_input):
+                    return self._respond_with_active_run_status(active_run)
+                if not self._is_actionable_followup(user_input):
+                    return self._respond_to_unrelated_prompt(
+                        user_input=user_input,
+                        retrieval_context=retrieval_context,
+                        working_memory=working_memory,
+                        active_run=active_run,
+                    )
                 if not self._is_prompt_related_to_run(user_input, active_run):
                     return self._respond_to_unrelated_prompt(
                         user_input=user_input,
@@ -456,7 +465,20 @@ class TaskRunner:
                     or llm_calls >= self.settings.max_total_llm_calls_per_run_per_turn
                 ):
                     messages.append(self._build_remaining_tasks_message(tasks_rows))
-                break
+                    break
+                waiting = any(
+                    row["status"] == "blocked" and self._is_waiting_on_delegation(row)
+                    for row in tasks_rows
+                )
+                if waiting:
+                    messages.append(
+                        "Waiting on a delegated agent. Try again later or check `inbox`."
+                    )
+                    break
+                if completed_this_turn == 0:
+                    messages.append(self._build_remaining_tasks_message(tasks_rows))
+                    break
+                continue
 
         final_message = "\n\n".join(msg for msg in messages if msg.strip())
         if not final_message:
@@ -1641,6 +1663,57 @@ class TaskRunner:
         )
         return normalized.startswith(resume_prefixes)
 
+    @staticmethod
+    def _is_run_status_query(user_input: str) -> bool:
+        normalized = user_input.strip().lower()
+        if not normalized:
+            return False
+        status_markers = (
+            "how we doing",
+            "how are we doing",
+            "status",
+            "progress",
+            "what's left",
+            "what is left",
+            "where are we",
+            "update on",
+            "any update",
+        )
+        if any(marker in normalized for marker in status_markers):
+            return True
+        greeting_prefixes = ("hi", "hey", "hello", "yo")
+        if normalized.endswith("?") and any(normalized.startswith(prefix) for prefix in greeting_prefixes):
+            return True
+        return False
+
+    @staticmethod
+    def _is_actionable_followup(user_input: str) -> bool:
+        normalized = user_input.strip().lower()
+        if not normalized:
+            return False
+        actionable_markers = (
+            "do ",
+            "make ",
+            "build ",
+            "create ",
+            "implement ",
+            "fix ",
+            "update ",
+            "add ",
+            "remove ",
+            "refactor ",
+            "change ",
+            "continue ",
+            "resume ",
+            "please ",
+            "can you ",
+            "could you ",
+        )
+        return (
+            normalized.startswith(actionable_markers)
+            or any(f" {marker}" in normalized for marker in actionable_markers)
+        )
+
     def _hydrate_task_state(
         self, task_row: Any, working_memory: WorkingMemory
     ) -> list[ToolResult]:
@@ -2052,6 +2125,34 @@ class TaskRunner:
             run_id=str(active_run["id"]),
             llm_calls=1,
             steps=1,
+            tool_calls=0,
+        )
+
+    def _respond_with_active_run_status(self, active_run: Any) -> TaskRunnerResult:
+        run_id = str(active_run["id"])
+        tasks = self.db.fetch_tasks_for_run(run_id)
+        done = sum(1 for row in tasks if row["status"] in {"done", "skipped"})
+        total = len(tasks)
+        current = next((row for row in tasks if row["status"] == "active"), None)
+        if current is None and active_run["current_task_id"]:
+            current = next(
+                (row for row in tasks if str(row["id"]) == str(active_run["current_task_id"])),
+                None,
+            )
+        pending_count = sum(1 for row in tasks if row["status"] in {"pending", "blocked", "active"})
+        lines = [f"Run in progress: {done}/{total} tasks complete."]
+        if current is not None:
+            lines.append(f"Current task: {current['title']}")
+        elif pending_count > 0:
+            lines.append("Current task: selecting next pending task.")
+        lines.append("Say `continue` to keep executing, or give a concrete change request.")
+        return TaskRunnerResult(
+            message="\n".join(lines),
+            tool_records=[],
+            tool_results=[],
+            run_id=run_id,
+            llm_calls=0,
+            steps=0,
             tool_calls=0,
         )
 

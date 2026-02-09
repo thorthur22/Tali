@@ -329,9 +329,12 @@ def _spawn_agent_terminal(agent_name: str, code_dir: Path) -> bool:
     env["TALI_AGENT_SPAWNED"] = "1"
     system = platform.system()
     if system == "Windows":
+        code_dir_ps = str(code_dir).replace("'", "''")
+        agent_ps = agent_name.replace("'", "''")
         command = (
-            f'Set-Location -LiteralPath "{code_dir}"; '
-            f'tali agent chat {agent_name}'
+            f"Set-Location -LiteralPath '{code_dir_ps}'; "
+            "$env:TALI_AGENT_SPAWNED='1'; "
+            f"tali agent chat '{agent_ps}'"
         )
         subprocess.Popen(
             ["cmd", "/c", "start", "powershell", "-NoExit", "-Command", command],
@@ -339,14 +342,20 @@ def _spawn_agent_terminal(agent_name: str, code_dir: Path) -> bool:
         )
         return True
     if system == "Darwin":
-        command = f'cd "{code_dir}"; tali agent chat {agent_name}'
+        command = (
+            f"cd {shlex.quote(str(code_dir))}; "
+            f"TALI_AGENT_SPAWNED=1 tali agent chat {shlex.quote(agent_name)}"
+        )
         escaped = command.replace('"', '\\"')
         subprocess.Popen(
             ["osascript", "-e", f'tell application "Terminal" to do script "{escaped}"'],
             env=env,
         )
         return True
-    shell_command = f'cd "{code_dir}" && tali agent chat "{agent_name}"'
+    shell_command = (
+        f"cd {shlex.quote(str(code_dir))} && "
+        f"TALI_AGENT_SPAWNED=1 tali agent chat {shlex.quote(agent_name)}"
+    )
     for term in ["x-terminal-emulator", "gnome-terminal", "konsole", "xfce4-terminal", "xterm"]:
         if not shutil.which(term):
             continue

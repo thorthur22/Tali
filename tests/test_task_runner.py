@@ -164,7 +164,7 @@ class TaskRunnerTests(unittest.TestCase):
                 json.dumps(review),
             ]
         )
-        settings = TaskRunnerSettings(max_tasks_per_turn=1)
+        settings = TaskRunnerSettings(max_tasks_per_turn=1, max_total_llm_calls_per_run_per_turn=2)
         runner = TaskRunner(
             db=self.db,
             llm=llm,
@@ -183,6 +183,114 @@ class TaskRunnerTests(unittest.TestCase):
         tasks = self.db.fetch_tasks_for_run(run["id"])
         statuses = [row["status"] for row in tasks]
         self.assertEqual(statuses, ["done", "pending"])
+
+    def test_continues_across_batches_without_user_continue(self) -> None:
+        decomposition = {
+            "tasks": [
+                {
+                    "title": "Task one",
+                    "description": "First.",
+                    "requires_tools": False,
+                    "verification": "Done.",
+                    "dependencies": [],
+                },
+                {
+                    "title": "Task two",
+                    "description": "Second.",
+                    "requires_tools": False,
+                    "verification": "Done.",
+                    "dependencies": [],
+                },
+            ]
+        }
+        action_done = {"next_action_type": "mark_done", "outputs_json": {"ok": True}}
+        review = {
+            "overall_status": "complete",
+            "checks": [
+                {"task_ordinal": 0, "status": "ok", "note": ""},
+                {"task_ordinal": 1, "status": "ok", "note": ""},
+            ],
+            "missing_items": [],
+            "assumptions": [],
+            "user_message": "Complete.",
+        }
+        llm = FakeLLM(
+            [
+                json.dumps(decomposition),
+                json.dumps(action_done),
+                json.dumps(action_done),
+                json.dumps(review),
+                "Complete.",
+            ]
+        )
+        settings = TaskRunnerSettings(max_tasks_per_turn=1)
+        runner = TaskRunner(
+            db=self.db,
+            llm=llm,
+            retriever=self.retriever,
+            guardrails=self.guardrails,
+            tool_runner=FakeToolRunner(),
+            tool_descriptions="none",
+            settings=settings,
+        )
+        result = runner.run_turn(
+            "First implement the algorithm, then optimize the database",
+            prompt_fn=lambda _: "",
+        )
+        self.assertIn("Complete", result.message)
+        run = self.db.fetch_active_run()
+        self.assertIsNone(run)
+        tasks = self.db.fetch_tasks_for_run(self.db.fetch_run(self._last_run_id())["id"])
+        self.assertEqual([row["status"] for row in tasks], ["done", "done"])
+
+    def test_status_check_does_not_advance_active_run(self) -> None:
+        decomposition = {
+            "tasks": [
+                {
+                    "title": "Task one",
+                    "description": "First.",
+                    "requires_tools": False,
+                    "verification": "Done.",
+                    "dependencies": [],
+                },
+                {
+                    "title": "Task two",
+                    "description": "Second.",
+                    "requires_tools": False,
+                    "verification": "Done.",
+                    "dependencies": [],
+                },
+            ]
+        }
+        action_done = {"next_action_type": "mark_done", "outputs_json": {"ok": True}}
+        llm = FakeLLM([json.dumps(decomposition), json.dumps(action_done)])
+        settings = TaskRunnerSettings(max_tasks_per_turn=1, max_total_llm_calls_per_run_per_turn=2)
+        runner = TaskRunner(
+            db=self.db,
+            llm=llm,
+            retriever=self.retriever,
+            guardrails=self.guardrails,
+            tool_runner=FakeToolRunner(),
+            tool_descriptions="none",
+            settings=settings,
+        )
+        runner.run_turn(
+            "First implement the app skeleton, then optimize the data layer",
+            prompt_fn=lambda _: "",
+        )
+        run = self.db.fetch_active_run()
+        self.assertIsNotNone(run)
+        before = self.db.fetch_tasks_for_run(run["id"])
+        self.assertEqual([row["status"] for row in before], ["done", "pending"])
+
+        result = runner.run_turn(
+            "hi bob how we doing on making our app?",
+            prompt_fn=lambda _: "",
+        )
+        after = self.db.fetch_tasks_for_run(run["id"])
+        self.assertEqual([row["status"] for row in after], ["done", "pending"])
+        self.assertIn("Run in progress", result.message)
+        self.assertIn("continue", result.message.lower())
 
     def test_blocked_task_asks_one_question(self) -> None:
         decomposition = {
