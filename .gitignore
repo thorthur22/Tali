@@ -1,2 +1,7 @@
 /.vev
 /src/tali.egg-info
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so

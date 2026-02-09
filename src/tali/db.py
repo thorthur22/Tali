@@ -189,6 +189,11 @@ CREATE TABLE IF NOT EXISTS patch_proposals (
 CREATE INDEX IF NOT EXISTS idx_questions_status_next ON user_questions (status, next_ask_at);
 CREATE INDEX IF NOT EXISTS idx_patch_status ON patch_proposals (status, created_at);
 
+CREATE TABLE IF NOT EXISTS reflections (
+  id TEXT PRIMARY KEY,
+  payload TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS agent_messages (
   id TEXT PRIMARY KEY,
   timestamp DATETIME NOT NULL,
@@ -1493,4 +1498,20 @@ class Database:
             connection.execute(
                 "UPDATE facts SET contested = 0 WHERE id = ?",
                 (fact_id,),
+            )
+
+    # --- Reflections ---
+
+    def insert_reflection(self, payload: str) -> None:
+        """
+        Insert a self‑reflection record. A reflection is stored as an opaque
+        JSON payload along with a generated UUID. Consumers can record
+        arbitrary metadata about a run for later analysis.
+        """
+        import uuid
+        reflection_id = str(uuid.uuid4())
+        with self.connect() as connection:
+            connection.execute(
+                "INSERT INTO reflections (id, payload) VALUES (?, ?)",
+                (reflection_id, payload),
             )

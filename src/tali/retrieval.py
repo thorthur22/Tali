@@ -7,7 +7,15 @@ from typing import Iterable
 
 from tali.config import RetrievalConfig
 from tali.db import Database
-from tali.models import Commitment, EpisodeSummary, Fact, Preference, ProvenanceType, RetrievalBundle
+from tali.models import (
+    Commitment,
+    EpisodeSummary,
+    Fact,
+    Preference,
+    ProvenanceType,
+    RetrievalBundle,
+    ReflectionSummary,
+)
 from tali.vector_index import VectorIndex, VectorItem
 
 
@@ -44,6 +52,7 @@ class Retriever:
         vector_hits = self._vector_hits(user_input)
         facts = self._facts(user_input, vector_hits)
         episodes = self._episodes(user_input, vector_hits)
+        reflections = self._reflections(user_input, vector_hits)
         preferences = self._preferences()
         skills = self._skills(user_input)
         return RetrievalContext(
@@ -52,10 +61,39 @@ class Retriever:
                 facts=facts,
                 preferences=preferences,
                 episodes=episodes,
+                reflections=reflections,
                 skills=skills,
             ),
             token_budget=self.config.token_budget,
         )
+
+    def _reflections(self, user_input: str, vector_hits: list[VectorItem]) -> Iterable[ReflectionSummary]:
+        vector_ref_ids = [hit.item_id for hit in vector_hits if hit.item_type == "reflection"]
+        rows = self.db.fetch_reflections_by_ids(vector_ref_ids)
+        if not rows:
+            rows = self.db.search_reflections(user_input, self.config.max_episodes)
+        if not rows:
+            rows = self.db.fetch_recent_reflections(self.config.max_episodes)
+        vector_rank = {item_id: idx for idx, item_id in enumerate(vector_ref_ids)}
+        rows = sorted(
+            rows,
+            key=lambda row: (
+                vector_rank.get(str(row["id"]), len(vector_rank) + 1),
+                -_timestamp_score(row["timestamp"]),
+            ),
+        )
+        return [
+            ReflectionSummary(
+                id=str(row["id"]),
+                timestamp=str(row["timestamp"]),
+                run_id=str(row["run_id"]),
+                success=bool(row["success"]),
+                what_worked=str(row["what_worked"] or ""),
+                what_failed=str(row["what_failed"] or ""),
+                next_time=str(row["next_time"] or ""),
+            )
+            for row in rows
+        ]
 
     def _commitments(self) -> Iterable[Commitment]:
         rows = self.db.list_commitments()
@@ -185,6 +223,7 @@ class Retriever:
             return
         facts_ids = [item.item_id for item in mapping_items if item.item_type == "fact"]
         episode_ids = [item.item_id for item in mapping_items if item.item_type == "episode"]
+        reflection_ids = [item.item_id for item in mapping_items if item.item_type == "reflection"]
         missing = False
         if facts_ids:
             found = {row["id"] for row in self.db.fetch_facts_by_ids(facts_ids)}
@@ -194,12 +233,26 @@ class Retriever:
             found = {row["id"] for row in self.db.fetch_episodes_by_ids(episode_ids)}
             if len(found) < len(episode_ids):
                 missing = True
+        if reflection_ids:
+            found = {row["id"] for row in self.db.fetch_reflections_by_ids(reflection_ids)}
+            if len(found) < len(reflection_ids):
+                missing = True
         if missing or self.vector_index.needs_rebuild:
             items: list[tuple[str, str, str]] = []
             for row in self.db.list_facts():
                 items.append(("fact", row["id"], row["statement"]))
             for row in self.db.list_episodes():
                 items.append(("episode", row["id"], f"{row['user_input']}\n{row['agent_output']}"))
+            for row in self.db.list_reflections(limit=self.config.max_episodes * 10):
+                text = "\n".join(
+                    [
+                        f"success={bool(row['success'])}",
+                        str(row.get("what_worked") or ""),
+                        str(row.get("what_failed") or ""),
+                        str(row.get("next_time") or ""),
+                    ]
+                ).strip()
+                items.append(("reflection", str(row["id"]), text))
             self.vector_index.rebuild_from_items(items)
 
 

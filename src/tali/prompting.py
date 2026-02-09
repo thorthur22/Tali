@@ -25,6 +25,16 @@ def format_retrieval_context(bundle: RetrievalBundle) -> str:
             parts.append(f"- {episode.timestamp}: {episode.user_input} -> {episode.agent_output}")
     else:
         parts.append("- None")
+
+    parts.append("\n[Recent Reflections]")
+    if getattr(bundle, "reflections", None):
+        for ref in bundle.reflections:
+            status = "success" if ref.success else "failed"
+            parts.append(
+                f"- {ref.timestamp} ({status}): worked={ref.what_worked} | failed={ref.what_failed} | next={ref.next_time}"
+            )
+    else:
+        parts.append("- None")
     parts.append("\n[Preferences]")
     if bundle.preferences:
         for pref in bundle.preferences:

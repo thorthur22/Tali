@@ -929,6 +929,18 @@ def chat(
     swarm_info = build_swarm_context(a2a_client, config.agent_name)
     if swarm_info:
         agent_context += "\n\nTeam resources:\n" + swarm_info
+    # Append a summary of long‑term memory into the agent context. This
+    # provides the planner with the most salient facts at a glance. If
+    # summarization fails, we simply proceed without it.
+    try:
+        from tali.memory_manager import MemoryManager  # type: ignore
+
+        mem_mgr = MemoryManager(db, vector_index)
+        summary = mem_mgr.summarize_memory(limit=5)
+        if summary:
+            agent_context += "\n\nLong-term memory:\n" + summary
+    except Exception:
+        pass
     task_runner_config = (
         config.task_runner if isinstance(config.task_runner, TaskRunnerConfig) else None
     )
@@ -1266,6 +1278,21 @@ def chat(
             hook_messages = hook_manager.run("on_turn_end", {"episode_id": episode.id, "run_id": result.run_id})
             for msg in hook_messages:
                 console.print(f"[dim]{escape(msg)}[/dim]")
+            # Record a reflection for this run, noting that a run has completed. This
+            # allows the agent to store metadata about its own performance for
+            # later self‑improvement. Failures to record reflections are ignored.
+            try:
+                from tali.self_reflection import SelfReflection  # type: ignore
+                reflector = SelfReflection(db)
+                if result.run_id:
+                    reflector.reflect(
+                        run_id=str(result.run_id),
+                        success=True,
+                        notes="Automatic reflection after run completion",
+                        improvement="",
+                    )
+            except Exception:
+                pass
         resolution = resolve_staged_items(db, user_input) if _should_attempt_staged_resolution(user_input) else None
         if resolution and resolution.applied_fact_id:
             facts = db.fetch_facts_by_ids([resolution.applied_fact_id])
@@ -1911,6 +1938,17 @@ def swarm(prompt: str = typer.Argument(..., help="Swarm task prompt.")) -> None:
     swarm_info = build_swarm_context(a2a_client, config.agent_name)
     if swarm_info:
         agent_context += "\n\nTeam resources:\n" + swarm_info
+    # Include a summary of long‑term memory in the agent context. This helps
+    # the planner leverage key facts when coordinating multi‑agent work.
+    try:
+        from tali.memory_manager import MemoryManager  # type: ignore
+
+        mem_mgr = MemoryManager(db, vector_index)
+        summary = mem_mgr.summarize_memory(limit=5)
+        if summary:
+            agent_context += "\n\nLong-term memory:\n" + summary
+    except Exception:
+        pass
     task_runner_config = (
         config.task_runner if isinstance(config.task_runner, TaskRunnerConfig) else None
     )

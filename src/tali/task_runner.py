@@ -19,6 +19,7 @@ from tali.memory_ingest import stage_tool_result_fact
 from tali.retrieval import Retriever
 from tali.prompting import format_retrieval_context
 from tali.preferences import extract_preferences
+from tali.self_reflection import build_reflection_prompt, parse_reflection_response
 from tali.tasking import (
     ActionPlan,
     TaskSpec,
@@ -1819,9 +1820,106 @@ class TaskRunner:
                 run_id, status="active",
                 last_error=f"review_incomplete:{current_count + 1}",
             )
+            # Record a lightweight failure reflection after repeated incompletes.
+            if current_count + 1 >= 2:
+                self._run_self_reflection(run_id, user_prompt, tasks_rows, memory_context, outcome="incomplete")
             return None, 1, 1
+        # Run self-reflection before marking done so the reflection can reference the final task state.
+        self._run_self_reflection(run_id, user_prompt, tasks_rows, memory_context, outcome="complete")
         self.db.update_run_status(run_id, status="done", current_task_id=None, last_error=None)
         return review.user_message, 1, 1
+
+    def _run_self_reflection(
+        self,
+        run_id: str,
+        user_prompt: str,
+        tasks_rows: list[Any],
+        memory_context: str,
+        outcome: str,
+    ) -> None:
+        """Generate and store a self-reflection entry, plus stage durable learnings."""
+        try:
+            task_summaries: list[dict[str, Any]] = []
+            for row in tasks_rows:
+                task_summaries.append(
+                    {
+                        "ordinal": row.get("ordinal"),
+                        "title": row.get("title"),
+                        "status": row.get("status"),
+                        "description": row.get("description"),
+                        "outputs_json": row.get("outputs_json"),
+                    }
+                )
+            prompt = build_reflection_prompt(
+                user_prompt=user_prompt,
+                task_summaries=task_summaries,
+                memory_context=memory_context,
+                outcome=outcome,
+            )
+            response = self.planner_llm.generate(prompt)
+            parsed = parse_reflection_response(response.content)
+            if not parsed:
+                return
+            ts = datetime.utcnow().isoformat()
+            reflection_id = self.db.insert_reflection(
+                run_id=run_id,
+                timestamp=ts,
+                success=parsed.success,
+                what_worked=parsed.what_worked,
+                what_failed=parsed.what_failed,
+                next_time=parsed.next_time,
+                metrics_json=json.dumps(parsed.metrics) if parsed.metrics else None,
+            )
+            # Vectorize reflection so it can be retrieved later.
+            vi = getattr(self.retriever, "vector_index", None)
+            if vi is not None:
+                try:
+                    vi.add(
+                        item_type="reflection",
+                        item_id=str(reflection_id),
+                        text=f"worked: {parsed.what_worked}\nfailed: {parsed.what_failed}\nnext: {parsed.next_time}",
+                    )
+                except Exception:
+                    pass
+
+            # Stage durable memory candidates for later user validation.
+            for statement in parsed.memory_candidates[:10]:
+                payload = {
+                    "statement": statement,
+                    "confidence": 0.55,
+                    "awaiting_confirmation": True,
+                }
+                self.db.insert_staged_item(
+                    item_id=str(uuid.uuid4()),
+                    kind="fact",
+                    payload=json.dumps(payload),
+                    status="pending",
+                    created_at=ts,
+                    source_ref=f"reflection:{reflection_id}",
+                    provenance_type=ProvenanceType.INFERRED.value,
+                    next_check_at=ts,
+                )
+
+            # Stage preference candidates.
+            for key, value in list(parsed.preference_candidates.items())[:10]:
+                pref_payload = {
+                    "key": key,
+                    "value": value,
+                    "confidence": 0.75,
+                    "awaiting_confirmation": True,
+                }
+                self.db.insert_staged_item(
+                    item_id=str(uuid.uuid4()),
+                    kind="preference",
+                    payload=json.dumps(pref_payload),
+                    status="pending",
+                    created_at=ts,
+                    source_ref=f"reflection:{reflection_id}",
+                    provenance_type=ProvenanceType.INFERRED.value,
+                    next_check_at=ts,
+                )
+        except Exception:
+            return
 
     def _append_missing_tasks(self, run_id: str, missing_items: list[str]) -> None:
         if not missing_items:

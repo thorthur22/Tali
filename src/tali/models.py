@@ -51,9 +51,21 @@ class EpisodeSummary:
 
 
 @dataclass(frozen=True)
+class ReflectionSummary:
+    id: str
+    timestamp: str
+    run_id: str
+    success: bool
+    what_worked: str
+    what_failed: str
+    next_time: str
+
+
+@dataclass(frozen=True)
 class RetrievalBundle:
     commitments: Iterable[Commitment]
     facts: Iterable[Fact]
     preferences: Iterable[Preference]
     episodes: Iterable[EpisodeSummary]
+    reflections: Iterable[ReflectionSummary]
     skills: Iterable[str]
