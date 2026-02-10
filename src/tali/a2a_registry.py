@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import threading
 from dataclasses import dataclass
@@ -25,18 +26,27 @@ class Registry:
         self._lock = threading.Lock()
 
     def load(self) -> dict[str, Any]:
-        if not self.path.exists():
-            return {"agents": []}
         try:
+            if not self.path.exists():
+                return {"agents": []}
             return json.loads(self.path.read_text())
         except json.JSONDecodeError:
             return {"agents": []}
+        except OSError as exc:
+            if _is_fd_limit_error(exc):
+                return {"agents": []}
+            raise
 
     def save(self, payload: dict[str, Any]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = self.path.with_suffix(".tmp")
-        temp_path.write_text(json.dumps(payload, indent=2))
-        temp_path.replace(self.path)
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = self.path.with_suffix(".tmp")
+            temp_path.write_text(json.dumps(payload, indent=2))
+            temp_path.replace(self.path)
+        except OSError as exc:
+            if _is_fd_limit_error(exc):
+                return
+            raise
 
     def upsert(self, record: AgentRecord) -> None:
         with self._lock:
@@ -100,3 +110,7 @@ class Registry:
             payload["agents"] = remaining
             self.save(payload)
             return True
+
+
+def _is_fd_limit_error(exc: OSError) -> bool:
+    return exc.errno in {errno.EMFILE, errno.ENFILE}

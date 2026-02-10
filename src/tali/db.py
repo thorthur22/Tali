@@ -254,12 +254,22 @@ CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
 """
 
 
+class _ManagedSQLiteConnection(sqlite3.Connection):
+    """SQLite connection that always closes at context-manager exit."""
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> bool:
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 @dataclass
 class Database:
     path: Path
 
     def connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path)
+        connection = sqlite3.connect(self.path, factory=_ManagedSQLiteConnection)
         connection.row_factory = sqlite3.Row
         return connection
 

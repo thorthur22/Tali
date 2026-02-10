@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -56,6 +57,12 @@ class A2ATests(unittest.TestCase):
         )
         expired = self.bus.expire_messages()
         self.assertGreaterEqual(expired, 1)
+
+    def test_bus_connect_context_manager_closes_connection(self) -> None:
+        with self.bus.connect() as connection:
+            connection.execute("SELECT 1")
+        with self.assertRaises(sqlite3.ProgrammingError):
+            connection.execute("SELECT 1")
 
     def test_task_response_updates_delegation(self) -> None:
         profile = AgentProfile(

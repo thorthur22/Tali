@@ -515,9 +515,10 @@ def _pid_command(pid: int) -> str:
 
 def _find_agent_service_pids(paths: Paths) -> list[int]:
     expected = f"agent chat {paths.agent_name}"
+    env_name = f"TALI_AGENT_NAME={paths.agent_name}"
     try:
         result = subprocess.run(
-            ["ps", "-axo", "pid=,command="],
+            ["ps", "eww", "-axo", "pid=,command="],
             capture_output=True,
             text=True,
             timeout=3,
@@ -534,7 +535,9 @@ def _find_agent_service_pids(paths: Paths) -> list[int]:
         if len(parts) != 2:
             continue
         pid_raw, cmd = parts
-        if expected not in cmd or "--service-mode" not in cmd:
+        tagged_service = "TALI_AGENT_SERVICE=1" in cmd and env_name in cmd
+        legacy_service = expected in cmd and "--service-mode" in cmd
+        if not tagged_service and not legacy_service:
             continue
         try:
             pid = int(pid_raw)
@@ -564,8 +567,21 @@ def _clear_agent_service_pid(paths: Paths) -> None:
         pid_path.unlink()
 
 
+def _read_log_tail(path: Path, max_lines: int = 30, max_chars: int = 2400) -> str:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    tail = "\n".join(lines[-max_lines:])
+    if len(tail) > max_chars:
+        tail = tail[-max_chars:]
+    return tail
+
+
 def _start_agent_service_process(paths: Paths, agent_name: str) -> str:
-    _ensure_agent_worktree(paths)
     running = _find_agent_service_pids(paths)
     if running:
         keep = running[0]
@@ -584,15 +600,14 @@ def _start_agent_service_process(paths: Paths, agent_name: str) -> str:
     env = os.environ.copy()
     env["TALI_HEADLESS"] = "1"
     env["TALI_AGENT_SPAWNED"] = "1"
-    if paths.code_dir.exists():
-        agent_src = str(paths.code_dir / "src")
-        current_pp = env.get("PYTHONPATH", "")
-        env["PYTHONPATH"] = f"{agent_src}:{current_pp}" if current_pp else agent_src
+    env["TALI_AGENT_SERVICE"] = "1"
+    env["TALI_AGENT_NAME"] = agent_name
+    runtime_cwd = resolve_main_repo_root(Path(__file__).resolve()) or Path.cwd()
     cmd = [sys.executable, "-m", "tali.cli", "agent", "chat", agent_name, "--service-mode"]
     with log_path.open("a", encoding="utf-8") as stream:
         process = subprocess.Popen(
             cmd,
-            cwd=str(paths.code_dir) if paths.code_dir.exists() else str(Path.cwd()),
+            cwd=str(runtime_cwd),
             stdout=stream,
             stderr=stream,
             stdin=subprocess.DEVNULL,
@@ -603,10 +618,16 @@ def _start_agent_service_process(paths: Paths, agent_name: str) -> str:
     time.sleep(0.4)
     if process.poll() is not None:
         _clear_agent_service_pid(paths)
-        return (
-            f"Failed to start agent '{agent_name}' (exit={process.returncode}). "
-            f"Check log: {log_path}"
-        )
+        hint = _read_log_tail(log_path)
+        msg = f"Failed to start agent '{agent_name}' (exit={process.returncode}). Check log: {log_path}"
+        if hint:
+            msg += f"\nRecent log tail:\n{hint}"
+            if "Too many open files" in hint:
+                msg += (
+                    "\nHint: your process hit the OS file-descriptor limit. "
+                    "Stop extra agent services and increase `ulimit -n`."
+                )
+        return msg
     _write_agent_service_pid(paths, process.pid)
     return f"Started agent '{agent_name}' (pid={process.pid}). Log: {log_path}"
 
@@ -1107,7 +1128,13 @@ def chat(
     if isinstance(message, typer.models.ArgumentInfo):
         message = None
     paths, existing_config = _resolve_paths(agent_name)
-    code_dir = _ensure_agent_worktree(paths)
+    code_dir: Path | None = None
+    if not service_mode:
+        code_dir = _ensure_agent_worktree(paths)
+    if service_mode:
+        # Ensure service processes are discoverable even if `ps` omits argv.
+        os.environ["TALI_AGENT_SERVICE"] = "1"
+        os.environ["TALI_AGENT_NAME"] = paths.agent_name
     if message is None and code_dir and not service_mode and _should_spawn_agent_terminal():
         spawned = _spawn_agent_terminal(paths.agent_name, code_dir)
         if spawned:
@@ -1682,10 +1709,15 @@ def chat(
         _run_task_runner_turn()
 
     def _shutdown_runtime() -> None:
-        scheduler.stop()
-        idle_scheduler.stop()
-        poller.stop()
-        registry.heartbeat(config.agent_id, status="inactive")
+        for stop_fn in (scheduler.stop, idle_scheduler.stop, poller.stop):
+            try:
+                stop_fn()
+            except Exception:
+                pass
+        try:
+            registry.heartbeat(config.agent_id, status="inactive")
+        except Exception:
+            pass
 
     if message:
         run_turn(message)
@@ -1704,7 +1736,12 @@ def chat(
         signal.signal(signal.SIGINT, _handle_signal)
         try:
             while not stop_event.is_set():
-                active_run = db.fetch_active_run()
+                try:
+                    active_run = db.fetch_active_run()
+                except Exception as exc:
+                    console.print(f"[dim red]Service loop error: {escape(str(exc))}[/dim red]")
+                    time.sleep(1.0)
+                    continue
                 if active_run and active_run["status"] == "active":
                     try:
                         run_turn("continue")
