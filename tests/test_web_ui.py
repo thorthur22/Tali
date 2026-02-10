@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
 
-sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from tali.config import AppConfig, EmbeddingSettings, LLMSettings, TaskRunnerConfig, ToolSettings, load_paths, save_config
 from tali.db import Database
@@ -140,6 +140,17 @@ class WebUITests(unittest.TestCase):
         )
         pids = _find_agent_service_pids("alpha")
         self.assertEqual(pids, [211])
+
+    @patch("tali.web_ui._is_pid_running", return_value=True)
+    @patch("tali.web_ui.subprocess.run")
+    def test_find_agent_service_pids_matches_marker_flag(self, mock_run: object, _mock_running: object) -> None:
+        mock_run.return_value.returncode = 0
+        mock_run.return_value.stdout = (
+            "311 python -c runner --tali-service-agent=alpha\\n"
+            "312 python -c runner --tali-service-agent=beta\\n"
+        )
+        pids = _find_agent_service_pids("alpha")
+        self.assertEqual(pids, [311])
 
     @patch("tali.web_ui._repo_root", return_value=None)
     def test_create_agent_persists_provider_and_models(self, _mock_repo_root: object) -> None:

@@ -317,6 +317,7 @@ def _pid_command(pid: int) -> str:
 def _find_agent_service_pids(name: str) -> list[int]:
     expected = f"agent chat {name}"
     env_name = f"TALI_AGENT_NAME={name}"
+    arg_marker = f"--tali-service-agent={name}"
     try:
         result = subprocess.run(
             ["ps", "eww", "-axo", "pid=,command="],
@@ -337,8 +338,9 @@ def _find_agent_service_pids(name: str) -> list[int]:
             continue
         pid_raw, cmd = parts
         tagged_service = "TALI_AGENT_SERVICE=1" in cmd and env_name in cmd
+        marker_service = arg_marker in cmd
         legacy_service = expected in cmd and "--service-mode" in cmd
-        if not tagged_service and not legacy_service:
+        if not tagged_service and not marker_service and not legacy_service:
             continue
         try:
             pid = int(pid_raw)
@@ -352,7 +354,14 @@ def _find_agent_service_pids(name: str) -> list[int]:
 def _is_agent_service_pid(root: Path, name: str, pid: int | None) -> bool:
     if not pid or not _is_pid_running(pid):
         return False
-    return pid in _find_agent_service_pids(name)
+    if pid in _find_agent_service_pids(name):
+        return True
+    cmd = _pid_command(pid)
+    if not cmd:
+        return False
+    arg_marker = f"--tali-service-agent={name}"
+    legacy_service = f"agent chat {name}" in cmd and "--service-mode" in cmd
+    return arg_marker in cmd or legacy_service
 
 
 def _is_run_stale(run: Any) -> bool:
@@ -782,41 +791,48 @@ def _run_agent_chat_turn(agent_name: str, message: str) -> str:
 
 
 def _start_agent_service(root: Path, agent_name: str) -> str:
-    output = _run_cli_args(["agent", "start", agent_name], agent_context=agent_name, timeout=60)
-    if output != "(no output)":
-        return output
-    # Fallback path: run the startup routine directly so web UI isn't blocked by
-    # subprocess wrapper edge-cases where stdout/stderr are both empty.
+    direct_output = ""
     try:
         from tali.cli import _start_agent_service_process
 
-        direct = _start_agent_service_process(_paths(root, agent_name), agent_name)
-        if direct:
-            return direct
+        direct_output = _start_agent_service_process(_paths(root, agent_name), agent_name)
+        if direct_output and not direct_output.startswith("Failed to start agent"):
+            return direct_output
     except Exception as exc:
-        return f"Direct start failed for '{agent_name}': {exc}"
+        direct_output = f"Direct start failed for '{agent_name}': {exc}"
+    # Fallback to CLI subprocess path if direct start reported failure.
+    output = _run_cli_args(["agent", "start", agent_name], agent_context=agent_name, timeout=60)
+    if output != "(no output)" and not output.startswith("Failed to start agent"):
+        return output
     pid = _service_pid(root, agent_name)
     live_pids = _find_agent_service_pids(agent_name)
     if live_pids and (pid is None or pid not in live_pids):
         pid = live_pids[0]
     if _is_agent_service_pid(root, agent_name, pid):
         return f"Started agent '{agent_name}' (pid={pid})."
+    if direct_output:
+        return direct_output
+    if output != "(no output)":
+        return output
     log_path = _paths(root, agent_name).logs_dir / "agent_service.log"
     return f"No CLI output while starting '{agent_name}'. Check log: {log_path}"
 
 
 def _stop_agent_service(root: Path, agent_name: str) -> str:
-    output = _run_cli_args(["agent", "stop", agent_name], agent_context=agent_name, timeout=60)
-    if output != "(no output)":
-        return output
+    direct_output = ""
     try:
         from tali.cli import _stop_agent_service_process
 
-        direct = _stop_agent_service_process(_paths(root, agent_name), agent_name)
-        if direct:
-            return direct
+        direct_output = _stop_agent_service_process(_paths(root, agent_name), agent_name)
+        if direct_output:
+            return direct_output
     except Exception as exc:
-        return f"Direct stop failed for '{agent_name}': {exc}"
+        direct_output = f"Direct stop failed for '{agent_name}': {exc}"
+    output = _run_cli_args(["agent", "stop", agent_name], agent_context=agent_name, timeout=60)
+    if output != "(no output)":
+        return output
+    if direct_output:
+        return direct_output
     pid = _service_pid(root, agent_name)
     if _is_agent_service_pid(root, agent_name, pid):
         return f"No CLI output while stopping '{agent_name}', but service appears to still be running (pid={pid})."

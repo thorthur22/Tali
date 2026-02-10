@@ -516,6 +516,7 @@ def _pid_command(pid: int) -> str:
 def _find_agent_service_pids(paths: Paths) -> list[int]:
     expected = f"agent chat {paths.agent_name}"
     env_name = f"TALI_AGENT_NAME={paths.agent_name}"
+    arg_marker = f"--tali-service-agent={paths.agent_name}"
     try:
         result = subprocess.run(
             ["ps", "eww", "-axo", "pid=,command="],
@@ -536,8 +537,9 @@ def _find_agent_service_pids(paths: Paths) -> list[int]:
             continue
         pid_raw, cmd = parts
         tagged_service = "TALI_AGENT_SERVICE=1" in cmd and env_name in cmd
+        marker_service = arg_marker in cmd
         legacy_service = expected in cmd and "--service-mode" in cmd
-        if not tagged_service and not legacy_service:
+        if not tagged_service and not marker_service and not legacy_service:
             continue
         try:
             pid = int(pid_raw)
@@ -551,7 +553,14 @@ def _find_agent_service_pids(paths: Paths) -> list[int]:
 def _is_agent_service_pid(paths: Paths, pid: int | None) -> bool:
     if not pid or not _is_pid_running(pid):
         return False
-    return pid in _find_agent_service_pids(paths)
+    if pid in _find_agent_service_pids(paths):
+        return True
+    cmd = _pid_command(pid)
+    if not cmd:
+        return False
+    arg_marker = f"--tali-service-agent={paths.agent_name}"
+    legacy_service = f"agent chat {paths.agent_name}" in cmd and "--service-mode" in cmd
+    return arg_marker in cmd or legacy_service
 
 
 def _write_agent_service_pid(paths: Paths, pid: int) -> None:
@@ -602,9 +611,16 @@ def _start_agent_service_process(paths: Paths, agent_name: str) -> str:
     env["TALI_AGENT_SPAWNED"] = "1"
     env["TALI_AGENT_SERVICE"] = "1"
     env["TALI_AGENT_NAME"] = agent_name
+    env["PYTHONUNBUFFERED"] = "1"
     runtime_cwd = resolve_main_repo_root(Path(__file__).resolve()) or Path.cwd()
-    cmd = [sys.executable, "-m", "tali.cli", "agent", "chat", agent_name, "--service-mode"]
+    runner = (
+        "from tali.cli import chat as _tali_chat; "
+        f"_tali_chat(agent_name={agent_name!r}, message=None, verbose_tools=False, show_plans=False, service_mode=True)"
+    )
+    cmd = [sys.executable, "-c", runner, f"--tali-service-agent={agent_name}"]
     with log_path.open("a", encoding="utf-8") as stream:
+        stream.write(f"\n=== service-start {datetime.utcnow().isoformat()} agent={agent_name} ===\n")
+        stream.flush()
         process = subprocess.Popen(
             cmd,
             cwd=str(runtime_cwd),
@@ -615,7 +631,7 @@ def _start_agent_service_process(paths: Paths, agent_name: str) -> str:
             env=env,
         )
     # Ensure we only report success if the child remains alive after boot.
-    time.sleep(0.4)
+    time.sleep(1.0)
     if process.poll() is not None:
         _clear_agent_service_pid(paths)
         hint = _read_log_tail(log_path)
@@ -3201,4 +3217,7 @@ def setup() -> None:
     paths.outbox_dir.mkdir(parents=True, exist_ok=True)
     (paths.shared_home / "locks").mkdir(parents=True, exist_ok=True)
     typer.echo(f"Config saved to {paths.config_path}")
-    subprocess.run(["python", "-m", "pip", "install", "-e", "."], check=True)
+
+
+if __name__ == "__main__":
+    app()
