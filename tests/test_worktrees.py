@@ -41,6 +41,47 @@ class WorktreeTests(unittest.TestCase):
         self._run_git(["commit", "-m", "update"], self.repo_dir)
         sync_status = sync_agent_worktree(code_dir, "main")
         self.assertTrue(sync_status.ok or sync_status.conflicted)
+        self.assertEqual(
+            subprocess.run(
+                ["git", "-C", str(code_dir), "status", "--porcelain"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip(),
+            "",
+        )
+
+    def test_sync_stashes_dirty_worktree(self) -> None:
+        agents_root = Path(self.temp_dir.name) / "agents"
+        paths = Paths(root_dir=agents_root, agent_name="beta")
+        code_dir, status = ensure_agent_worktree(paths, self.repo_dir)
+        self.assertTrue(status.ok or status.conflicted)
+
+        (code_dir / "scratch.txt").write_text("local\n", encoding="utf-8")
+        self.assertNotEqual(
+            subprocess.run(
+                ["git", "-C", str(code_dir), "status", "--porcelain"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip(),
+            "",
+        )
+
+        (self.repo_dir / "README.md").write_text("hello\nworld\n", encoding="utf-8")
+        self._run_git(["add", "README.md"], self.repo_dir)
+        self._run_git(["commit", "-m", "update"], self.repo_dir)
+        sync_status = sync_agent_worktree(code_dir, "main")
+        self.assertTrue(sync_status.ok or sync_status.conflicted)
+        status = subprocess.run(
+            ["git", "-C", str(code_dir), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        self.assertNotEqual(status, "")
+        self.assertIn("scratch.txt", status)
+        self.assertTrue((code_dir / "scratch.txt").exists())
 
 
 if __name__ == "__main__":
