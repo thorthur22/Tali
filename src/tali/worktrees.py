@@ -58,20 +58,69 @@ def ensure_agent_worktree(paths: Paths, main_repo: Path) -> tuple[Path, Worktree
 def sync_agent_worktree(code_dir: Path, base_ref: str) -> WorktreeStatus:
     if not shutil.which("git"):
         return WorktreeStatus(False, False, "Git is required to sync agent worktrees.")
+    warnings: list[str] = []
     fetch = subprocess.run(
         ["git", "-C", str(code_dir), "fetch"],
         capture_output=True,
         text=True,
     )
     if fetch.returncode != 0:
-        message = (fetch.stderr or fetch.stdout or "git fetch failed").strip()
+        warnings.append((fetch.stderr or fetch.stdout or "git fetch failed").strip())
+    status = subprocess.run(
+        ["git", "-C", str(code_dir), "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+    )
+    if status.returncode != 0:
+        message = (status.stderr or status.stdout or "git status failed").strip()
         return WorktreeStatus(False, False, message)
+    stash_applied = False
+    if status.stdout.strip():
+        stash = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(code_dir),
+                "stash",
+                "push",
+                "-u",
+                "-m",
+                "tali auto-stash before sync",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if stash.returncode != 0:
+            message = (stash.stderr or stash.stdout or "git stash failed").strip()
+            return WorktreeStatus(False, False, message)
+        stash_applied = True
     merge = subprocess.run(
         ["git", "-C", str(code_dir), "merge", base_ref],
         capture_output=True,
         text=True,
     )
     if merge.returncode == 0:
+        if stash_applied:
+            pop = subprocess.run(
+                ["git", "-C", str(code_dir), "stash", "pop"],
+                capture_output=True,
+                text=True,
+            )
+            if pop.returncode != 0:
+                conflicts = subprocess.run(
+                    ["git", "-C", str(code_dir), "diff", "--name-only", "--diff-filter=U"],
+                    capture_output=True,
+                    text=True,
+                )
+                conflicted = bool(conflicts.stdout.strip())
+                message = (pop.stderr or pop.stdout or "git stash pop failed").strip()
+                message = (
+                    message
+                    + "\nLocal changes were stashed before sync; resolve and reapply if needed."
+                ).strip()
+                return WorktreeStatus(False, conflicted, message)
+        if warnings:
+            return WorktreeStatus(True, False, "\n".join(warnings).strip())
         return WorktreeStatus(True, False, None)
     conflicts = subprocess.run(
         ["git", "-C", str(code_dir), "diff", "--name-only", "--diff-filter=U"],
@@ -85,6 +134,13 @@ def sync_agent_worktree(code_dir: Path, base_ref: str) -> WorktreeStatus:
             message
             + "\nMerge conflicts detected in agent worktree. Resolve them and rerun."
         ).strip()
+    if stash_applied:
+        message = (
+            message
+            + "\nLocal changes were stashed before sync; run `git stash pop` after resolving."
+        ).strip()
+    if warnings:
+        message = "\n".join([*warnings, message]).strip()
     return WorktreeStatus(False, conflicted, message)
 
 
