@@ -1057,33 +1057,26 @@ class TaskRunner:
                             {"reason": "unknown_tool", "tool": plan.tool_name},
                         )
                         continue
-                if plan.tool_name == "fs.list" and plan.tool_args is None:
-                    plan = ActionPlan(
-                        next_action_type=plan.next_action_type,
-                        message=plan.message,
-                        tool_name=plan.tool_name,
-                        tool_args={},
-                        tool_purpose=plan.tool_purpose,
-                        outputs_json=plan.outputs_json,
-                        block_reason=plan.block_reason,
-                        delegate_to=plan.delegate_to,
-                        delegate_task=plan.delegate_task,
-                        skill_name=plan.skill_name,
-                    )
-                if not plan.tool_name or (plan.tool_args is None and plan.tool_name != "fs.list"):
-                    self._log_task_event(task_id, "fail", {"reason": "tool_call_missing_fields"})
-                    self.db.update_task_status(task_id, status="failed", outputs_json=task_row["outputs_json"], updated_at=datetime.utcnow().isoformat())
-                    return TaskExecutionResult(
-                        llm_calls=llm_calls,
-                        steps=steps,
-                        tool_records=tool_records,
-                        tool_results=tool_results,
-                        user_message="Tool call was missing required fields.",
-                        blocked=False,
-                    )
-                if plan.tool_name == "fs.list":
-                    path_value = plan.tool_args.get("path") if plan.tool_args else None
-                    if not path_value or (isinstance(path_value, str) and not path_value.strip()):
+                planned_calls: list[dict[str, Any]] = []
+                if plan.tool_calls:
+                    for tc in plan.tool_calls:
+                        tc_name = tc["tool_name"]
+                        tc_args = tc.get("tool_args") or {}
+                        if tc_name == "fs.list":
+                            path_value = tc_args.get("path")
+                            if not path_value or (
+                                isinstance(path_value, str) and not path_value.strip()
+                            ):
+                                tc_args = {}
+                        planned_calls.append(
+                            {
+                                "tool_name": tc_name,
+                                "tool_args": tc_args,
+                                "tool_purpose": tc.get("tool_purpose", ""),
+                            }
+                        )
+                else:
+                    if plan.tool_name == "fs.list" and plan.tool_args is None:
                         plan = ActionPlan(
                             next_action_type=plan.next_action_type,
                             message=plan.message,
@@ -1095,105 +1088,180 @@ class TaskRunner:
                             delegate_to=plan.delegate_to,
                             delegate_task=plan.delegate_task,
                             skill_name=plan.skill_name,
-                            tool_calls=plan.tool_calls,
                         )
-                signature = json.dumps(
-                    {"name": plan.tool_name, "args": plan.tool_args or {}},
-                    sort_keys=True,
-                )
-                args_hash = WorkingMemory.args_hash(plan.tool_args or {})
-                if working_memory.seen_success(plan.tool_name, args_hash):
-                    stuck_context = (
-                        "duplicate_success_blocked: "
-                        f"tool={plan.tool_name} args_hash={args_hash}"
-                    )
-                    working_memory.steps_since_progress += 1
-                    self._log_task_event(
-                        task_id,
-                        "note",
-                        {
-                            "reason": "duplicate_tool_blocked",
-                            "tool": plan.tool_name,
-                            "args_hash": args_hash,
-                        },
-                    )
-                    if self.status_fn:
-                        self.status_fn(
-                            f"Blocked duplicate tool call: {plan.tool_name} {args_hash}"
-                        )
-                    continue
-                repeated_tool_signatures[signature] = repeated_tool_signatures.get(signature, 0) + 1
-                if repeated_tool_signatures[signature] > 2:
-                    if stuck_replans < 2:
-                        stuck_replans += 1
-                        stuck_context = (
-                            "Repeated tool call detected. "
-                            f"signature={signature} count={repeated_tool_signatures[signature]}. "
-                            "Propose a different strategy or tool before asking the user."
-                        )
-                        self._log_task_event(
+                    if not plan.tool_name or (plan.tool_args is None and plan.tool_name != "fs.list"):
+                        self._log_task_event(task_id, "fail", {"reason": "tool_call_missing_fields"})
+                        self.db.update_task_status(
                             task_id,
-                            "note",
-                            {"reason": "stuck_replan", "signature": signature},
+                            status="failed",
+                            outputs_json=task_row["outputs_json"],
+                            updated_at=datetime.utcnow().isoformat(),
                         )
-                        continue
-                    question = (
-                        "I'm repeating the same tool call without making progress. "
-                        "Can you confirm the correct path or give more details?"
+                        return TaskExecutionResult(
+                            llm_calls=llm_calls,
+                            steps=steps,
+                            tool_records=tool_records,
+                            tool_results=tool_results,
+                            user_message="Tool call was missing required fields.",
+                            blocked=False,
+                        )
+                    tool_args = plan.tool_args or {}
+                    if plan.tool_name == "fs.list":
+                        path_value = tool_args.get("path")
+                        if not path_value or (
+                            isinstance(path_value, str) and not path_value.strip()
+                        ):
+                            tool_args = {}
+                    planned_calls.append(
+                        {
+                            "tool_name": plan.tool_name,
+                            "tool_args": tool_args,
+                            "tool_purpose": plan.tool_purpose,
+                        }
                     )
-                    updated_outputs = self._merge_outputs(
-                        task_row["outputs_json"], {"blocked_question": question}
-                    )
-                    now = datetime.utcnow().isoformat()
+                if not planned_calls:
+                    self._log_task_event(task_id, "fail", {"reason": "tool_call_missing_fields"})
                     self.db.update_task_status(
-                        task_id, status="blocked", outputs_json=updated_outputs, updated_at=now
+                        task_id,
+                        status="failed",
+                        outputs_json=task_row["outputs_json"],
+                        updated_at=datetime.utcnow().isoformat(),
                     )
-                    self._log_task_event(task_id, "block", {"reason": "repeat_tool_call"})
-                    if self.hook_manager:
-                        self.hook_manager.run(
-                            "on_task_end",
-                            {
-                                "task_id": task_id,
-                                "run_id": run_id,
-                                "status": "blocked",
-                                "inputs_json": task_row["inputs_json"],
-                                "outputs_json": updated_outputs,
-                            },
-                        )
                     return TaskExecutionResult(
                         llm_calls=llm_calls,
                         steps=steps,
                         tool_records=tool_records,
                         tool_results=tool_results,
-                        user_message=question,
-                        blocked=True,
+                        user_message="Tool call was missing required fields.",
+                        blocked=False,
                     )
-                # Build tool call list (single or batched)
-                calls_to_run: list[ToolCall] = []
-                if plan.tool_calls:
-                    if self.status_fn:
-                        self.status_fn(f"Executing {len(plan.tool_calls)} batched tool calls")
-                    for tc in plan.tool_calls:
-                        tc_obj = ToolCall(
-                            id=f"tc_{uuid.uuid4().hex}",
-                            name=tc["tool_name"],
-                            args=tc.get("tool_args") or {},
-                            purpose=tc.get("tool_purpose", ""),
+                unknown = [
+                    call["tool_name"]
+                    for call in planned_calls
+                    if self.tool_runner.registry.get(call["tool_name"]) is None
+                ]
+                if unknown:
+                    if invalid_tool_replans < 2:
+                        invalid_tool_replans += 1
+                        stuck_context = (
+                            "Unknown tool(s) requested: "
+                            f"{', '.join(sorted(set(unknown)))}. "
+                            "Choose valid tools from Available tools."
                         )
-                        calls_to_run.append(tc_obj)
                         self._log_task_event(
                             task_id,
-                            "tool_call",
-                            {"name": tc_obj.name, "args": tc_obj.args, "purpose": tc_obj.purpose},
+                            "note",
+                            {"reason": "unknown_tool", "tool": sorted(set(unknown))},
                         )
-                else:
+                        continue
+                filtered_calls: list[dict[str, Any]] = []
+                blocked_dupes: list[dict[str, str]] = []
+                for call in planned_calls:
+                    args_hash = WorkingMemory.args_hash(call["tool_args"] or {})
+                    if working_memory.seen_success(call["tool_name"], args_hash):
+                        blocked_dupes.append(
+                            {"tool": call["tool_name"], "args_hash": args_hash}
+                        )
+                        continue
+                    filtered_calls.append(call)
+                if blocked_dupes and not filtered_calls:
+                    stuck_context = (
+                        "duplicate_success_blocked: "
+                        + ", ".join(
+                            f"{item['tool']}:{item['args_hash']}" for item in blocked_dupes
+                        )
+                    )
+                    working_memory.steps_since_progress += 1
+                    self._log_task_event(
+                        task_id,
+                        "note",
+                        {"reason": "duplicate_tool_blocked", "blocked": blocked_dupes},
+                    )
                     if self.status_fn:
-                        self.status_fn(f"Executing tool call: {plan.tool_name}")
+                        self.status_fn(
+                            "Blocked duplicate tool call(s): "
+                            + ", ".join(
+                                f"{item['tool']} {item['args_hash']}" for item in blocked_dupes
+                            )
+                        )
+                    continue
+                if blocked_dupes:
+                    self._log_task_event(
+                        task_id,
+                        "note",
+                        {"reason": "duplicate_tool_skipped", "blocked": blocked_dupes},
+                    )
+                for call in filtered_calls:
+                    signature = json.dumps(
+                        {"name": call["tool_name"], "args": call["tool_args"] or {}},
+                        sort_keys=True,
+                    )
+                    repeated_tool_signatures[signature] = (
+                        repeated_tool_signatures.get(signature, 0) + 1
+                    )
+                    if repeated_tool_signatures[signature] > 2:
+                        if stuck_replans < 2:
+                            stuck_replans += 1
+                            stuck_context = (
+                                "Repeated tool call detected. "
+                                f"signature={signature} count={repeated_tool_signatures[signature]}. "
+                                "Propose a different strategy or tool before asking the user."
+                            )
+                            self._log_task_event(
+                                task_id,
+                                "note",
+                                {"reason": "stuck_replan", "signature": signature},
+                            )
+                            break
+                        question = (
+                            "I'm repeating the same tool call without making progress. "
+                            "Can you confirm the correct path or give more details?"
+                        )
+                        updated_outputs = self._merge_outputs(
+                            task_row["outputs_json"], {"blocked_question": question}
+                        )
+                        now = datetime.utcnow().isoformat()
+                        self.db.update_task_status(
+                            task_id,
+                            status="blocked",
+                            outputs_json=updated_outputs,
+                            updated_at=now,
+                        )
+                        self._log_task_event(task_id, "block", {"reason": "repeat_tool_call"})
+                        if self.hook_manager:
+                            self.hook_manager.run(
+                                "on_task_end",
+                                {
+                                    "task_id": task_id,
+                                    "run_id": run_id,
+                                    "status": "blocked",
+                                    "inputs_json": task_row["inputs_json"],
+                                    "outputs_json": updated_outputs,
+                                },
+                            )
+                        return TaskExecutionResult(
+                            llm_calls=llm_calls,
+                            steps=steps,
+                            tool_records=tool_records,
+                            tool_results=tool_results,
+                            user_message=question,
+                            blocked=True,
+                        )
+                if stuck_context:
+                    continue
+                # Build tool call list (single or batched)
+                calls_to_run: list[ToolCall] = []
+                if self.status_fn:
+                    if len(filtered_calls) > 1:
+                        self.status_fn(f"Executing {len(filtered_calls)} batched tool calls")
+                    else:
+                        self.status_fn(f"Executing tool call: {filtered_calls[0]['tool_name']}")
+                for call in filtered_calls:
                     tc_obj = ToolCall(
                         id=f"tc_{uuid.uuid4().hex}",
-                        name=plan.tool_name,
-                        args=plan.tool_args,
-                        purpose=plan.tool_purpose,
+                        name=call["tool_name"],
+                        args=call.get("tool_args") or {},
+                        purpose=call.get("tool_purpose", ""),
                     )
                     calls_to_run.append(tc_obj)
                     self._log_task_event(
@@ -1201,6 +1269,11 @@ class TaskRunner:
                         "tool_call",
                         {"name": tc_obj.name, "args": tc_obj.args, "purpose": tc_obj.purpose},
                     )
+                primary_args_hash = (
+                    WorkingMemory.args_hash(calls_to_run[0].args or {})
+                    if calls_to_run
+                    else ""
+                )
                 results, records = self.tool_runner.run(calls_to_run, prompt_fn=prompt_fn)
                 tool_records.extend(records)
                 tool_results.extend(results)
@@ -1264,7 +1337,7 @@ class TaskRunner:
                         "tool_call",
                         {
                             "tool": primary_name,
-                            "args_hash": args_hash,
+                            "args_hash": primary_args_hash,
                             "durable_facts": combined_durable,
                         },
                     )

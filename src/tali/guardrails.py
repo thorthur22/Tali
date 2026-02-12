@@ -26,11 +26,10 @@ class Guardrails:
         citations = self._extract_citations(safe_output)
         invalid = self._invalid_citations(citations, bundle)
         memory_signal = self._contains_memory_signal(safe_output) or bool(citations)
-        if memory_signal:
-            if not citations:
-                flags.append("missing_memory_citation")
-            elif invalid:
-                flags.append("invalid_memory_citation")
+        if memory_signal and not citations:
+            flags.append("missing_memory_citation")
+        elif invalid:
+            flags.append("invalid_memory_citation")
         return GuardrailResult(safe_output=safe_output, flags=flags)
 
     def _contains_memory_signal(self, output: str) -> bool:

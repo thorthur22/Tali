@@ -10,7 +10,7 @@ from tali.db import Database
 from tali.knowledge_sources import KnowledgeSourceRegistry
 from tali.models import ProvenanceType
 from tali.patches import PatchProposal, parse_patch_proposal, review_patch, store_patch_proposal
-from tali.questions import queue_question
+from tali.questions import QUESTION_COOLDOWN, queue_question
 
 
 MAX_IDLE_LLM_CALLS = 4
@@ -150,13 +150,35 @@ class IdleJobRunner:
         if row["kind"] not in {"fact", "commitment"}:
             return None
         payload = json.loads(row["payload"])
+        item_id = str(row["id"])
+        attempts = int(row["attempts"] or 0)
         if row["kind"] == "fact":
             statement = payload.get("statement", "")
             question = f"Quick check: is it true that \"{statement}\"?"
         else:
             description = payload.get("description", "")
             question = f"Should I treat this as an active commitment: \"{description}\"?"
-        queue_question(self.db, question=question, reason=json.dumps(payload), priority=3)
+        reason_payload = {
+            "type": "staged_item_confirmation",
+            "staged_item_id": item_id,
+            "kind": row["kind"],
+            "statement": payload.get("statement"),
+            "description": payload.get("description"),
+            "source_ref": row["source_ref"],
+        }
+        question_id = queue_question(
+            self.db, question=question, reason=json.dumps(reason_payload), priority=3
+        )
+        payload["queued_question_id"] = question_id
+        payload["queued_question_at"] = datetime.utcnow().isoformat()
+        self.db.update_staged_item_payload(item_id, json.dumps(payload))
+        self.db.update_staged_item(
+            item_id=item_id,
+            status="verifying",
+            next_check_at=(datetime.utcnow() + QUESTION_COOLDOWN).isoformat(),
+            attempts=attempts + 1,
+            last_error="queued_question",
+        )
         return IdleJobResult(messages=["Idle: queued a clarifying question."], llm_calls=0)
 
     def _job_patch_proposal(self) -> IdleJobResult | None:
