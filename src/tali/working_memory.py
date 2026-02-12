@@ -10,6 +10,13 @@ from typing import Any, Iterable
 from tali.tools.protocol import ToolResult
 
 
+_TRUNCATION_SUFFIX = "...[truncated]"
+_MAX_CONSTRAINTS_CHARS = 800
+_MAX_ENV_FACTS_CHARS = 1200
+_MAX_PROGRESS_CHARS = 240
+_MAX_OBSERVATION_CHARS = 240
+
+
 @dataclass(frozen=True)
 class ToolCallRecord:
     tool_name: str
@@ -58,7 +65,12 @@ class WorkingMemory:
 
     @staticmethod
     def args_hash(args: dict[str, Any]) -> str:
-        encoded = json.dumps(args or {}, sort_keys=True).encode("utf-8")
+        try:
+            encoded = json.dumps(
+                args or {}, sort_keys=True, default=str, ensure_ascii=True
+            ).encode("utf-8")
+        except (TypeError, ValueError):
+            encoded = repr(args).encode("utf-8")
         return hashlib.sha1(encoded).hexdigest()
 
     def summary_for_prompt(self) -> str:
@@ -67,16 +79,24 @@ class WorkingMemory:
             for record in list(self.recent_tool_calls)[-5:]
         ]
         progress_tail = self.progress[-5:]
-        env_facts = json.dumps(self.environment_facts, sort_keys=True)
+        env_facts = _json_compact(self.environment_facts, _MAX_ENV_FACTS_CHARS)
+        constraints = _json_compact(self.constraints, _MAX_CONSTRAINTS_CHARS)
+        progress_lines = [
+            f"- {_json_compact(item, _MAX_PROGRESS_CHARS)}" for item in progress_tail
+        ]
+        observation_lines = [
+            f"- {_truncate_text(item, _MAX_OBSERVATION_CHARS)}"
+            for item in self.last_observations
+        ]
         parts = [
             "Working memory:",
             f"user_goal: {self.user_goal or '-'}",
-            f"constraints: {json.dumps(self.constraints, sort_keys=True)}",
+            f"constraints: {constraints}",
             f"environment_facts: {env_facts}",
             "progress (last 5):",
-            "\n".join(f"- {item}" for item in progress_tail) or "- None",
+            "\n".join(progress_lines) or "- None",
             "last_observations:",
-            "\n".join(f"- {item}" for item in self.last_observations) or "- None",
+            "\n".join(observation_lines) or "- None",
             "recent_tool_calls:",
             "\n".join(recent) or "- None",
         ]
@@ -286,3 +306,21 @@ def _leading_verb(summary: str) -> str:
         return ""
     parts = summary.split(" ", 1)
     return f"{parts[0]} " if parts else ""
+
+
+def _truncate_text(text: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    if max_chars <= len(_TRUNCATION_SUFFIX):
+        return _TRUNCATION_SUFFIX[:max_chars]
+    return text[: max_chars - len(_TRUNCATION_SUFFIX)] + _TRUNCATION_SUFFIX
+
+
+def _json_compact(value: Any, max_chars: int) -> str:
+    try:
+        rendered = json.dumps(value, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        rendered = repr(value)
+    return _truncate_text(rendered, max_chars)
