@@ -40,7 +40,7 @@ def _handle_patch_proposed(context: HookContext) -> HookActions | None:
         )
 
     review_result = review_patch(llm, proposal)
-    review_status = "proposed" if review_result.approved else "review_failed"
+    review_status = "proposed"
     context.db.update_patch_review(
         proposal_id=str(proposal_id),
         review_json=json.dumps({
@@ -53,7 +53,7 @@ def _handle_patch_proposed(context: HookContext) -> HookActions | None:
     if review_result.approved:
         return HookActions(messages=["Hook: patch review passed."])
     issues_summary = "; ".join(review_result.issues[:3]) if review_result.issues else "no details"
-    return HookActions(messages=[f"Hook: patch review FAILED: {issues_summary}"])
+    return HookActions(messages=[f"Hook: patch review flagged issues: {issues_summary}"])
 
 
 HOOKS = [

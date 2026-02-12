@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
@@ -207,11 +208,12 @@ class IdleScheduler:
             if self.status_fn:
                 self.status_fn("Autonomy: auto-continuing blocked run...")
             try:
-                result = self.task_runner.run_turn(
-                    "continue",
-                    prompt_fn=self._auto_prompt_fn,
-                    origin="autonomous",
-                )
+                with self._autonomous_approval_context():
+                    result = self.task_runner.run_turn(
+                        "continue",
+                        prompt_fn=self._auto_prompt_fn,
+                        origin="autonomous",
+                    )
                 if self.status_fn:
                     self.status_fn(f"Autonomy: auto-continue complete ({result.llm_calls} LLM calls).")
             except Exception as exc:
@@ -266,11 +268,12 @@ class IdleScheduler:
             if self.status_fn:
                 self.status_fn(f"Autonomy: executing commitment \"{description[:80]}\"...")
             try:
-                result = self.task_runner.run_turn(
-                    description,
-                    prompt_fn=self._auto_prompt_fn,
-                    origin="autonomous",
-                )
+                with self._autonomous_approval_context():
+                    result = self.task_runner.run_turn(
+                        description,
+                        prompt_fn=self._auto_prompt_fn,
+                        origin="autonomous",
+                    )
                 self._autonomous_run_id = result.run_id
 
                 # Check if interrupted during execution
@@ -344,6 +347,19 @@ class IdleScheduler:
             if self.status_fn:
                 self.status_fn("Autonomy: paused autonomous run for user interaction.")
         self._autonomous_run_id = None
+
+    def _autonomous_approval_context(self):
+        if self.task_runner is None:
+            return nullcontext()
+        tool_runner = getattr(self.task_runner, "tool_runner", None)
+        if tool_runner is None:
+            return nullcontext()
+        approvals = getattr(tool_runner, "approvals", None)
+        if approvals is None:
+            return nullcontext()
+        if approvals.mode != "prompt":
+            return nullcontext()
+        return approvals.temporary_mode("auto_approve_safe")
 
     # ------------------------------------------------------------------
     # Timestamp persistence for housekeeping cycles

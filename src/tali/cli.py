@@ -55,7 +55,12 @@ from tali.guardrails import GuardrailResult, Guardrails
 from tali.memory_ingest import stage_episode_fact
 from tali.llm import OllamaClient, OpenAIClient
 from tali.retrieval import Retriever
-from tali.self_care import SleepScheduler, resolve_contradiction_answer, resolve_staged_items
+from tali.self_care import (
+    SleepScheduler,
+    resolve_contradiction_answer,
+    resolve_staged_confirmation,
+    resolve_staged_items,
+)
 from tali.snapshots import create_snapshot, diff_snapshot, list_snapshots, rollback_snapshot
 from tali.vector_index import VectorIndex
 from tali.approvals import ApprovalManager
@@ -1211,7 +1216,7 @@ def chat(
     tool_settings = config.tools if isinstance(config.tools, ToolSettings) else ToolSettings()
     if os.environ.get("TALI_HEADLESS") == "1" and tool_settings.approval_mode == "prompt":
         tool_settings = replace(tool_settings, approval_mode="auto_approve_safe")
-    if tool_settings.approval_mode not in {"prompt", "auto_approve_safe", "deny"}:
+    if tool_settings.approval_mode not in {"prompt", "auto_approve_safe", "auto_approve_all", "deny"}:
         tool_settings = replace(tool_settings, approval_mode="prompt")
     if tool_settings.fs_root is None or not str(tool_settings.fs_root).strip():
         tool_settings = replace(tool_settings, fs_root=str(Path.home()))
@@ -1555,19 +1560,37 @@ def chat(
                 answer_payload = resolve_answered_question(
                     db, user_input, dict(pending_question_row), source_ref=episode.id
                 )
+                _reason_raw = pending_question_row["reason"] if pending_question_row["reason"] else ""
+                _reason_data = None
+                if _reason_raw:
+                    try:
+                        _reason_data = json.loads(_reason_raw)
+                    except (json.JSONDecodeError, TypeError):
+                        _reason_data = None
                 if answer_payload:
                     # Check if this was a contradiction question
-                    _reason_raw = pending_question_row["reason"] if pending_question_row["reason"] else ""
                     _contradiction_resolved = False
-                    if _reason_raw:
-                        try:
-                            _reason_data = json.loads(_reason_raw)
-                            if isinstance(_reason_data, dict) and _reason_data.get("type") == "contradiction":
-                                _contradiction_resolved = resolve_contradiction_answer(
-                                    db, user_input, _reason_data, source_ref=episode.id
-                                )
-                        except (json.JSONDecodeError, TypeError):
-                            pass
+                    if isinstance(_reason_data, dict) and _reason_data.get("type") == "contradiction":
+                        _contradiction_resolved = resolve_contradiction_answer(
+                            db, user_input, _reason_data, source_ref=episode.id
+                        )
+                    if (
+                        not _contradiction_resolved
+                        and isinstance(_reason_data, dict)
+                        and _reason_data.get("type") == "staged_item_confirmation"
+                    ):
+                        staged_item_id = str(_reason_data.get("staged_item_id") or "")
+                        if staged_item_id:
+                            resolution = resolve_staged_confirmation(db, staged_item_id, user_input)
+                            if resolution and resolution.applied_fact_id:
+                                facts = db.fetch_facts_by_ids([resolution.applied_fact_id])
+                                if facts:
+                                    vector_index.add(
+                                        item_type="fact",
+                                        item_id=resolution.applied_fact_id,
+                                        text=facts[0]["statement"],
+                                    )
+                            _contradiction_resolved = True
                     if not _contradiction_resolved:
                         db.insert_staged_item(
                             item_id=str(uuid4()),
@@ -2285,7 +2308,7 @@ def swarm(prompt: str = typer.Argument(..., help="Swarm task prompt.")) -> None:
     tool_settings = config.tools if isinstance(config.tools, ToolSettings) else ToolSettings()
     if os.environ.get("TALI_HEADLESS") == "1" and tool_settings.approval_mode == "prompt":
         tool_settings = replace(tool_settings, approval_mode="auto_approve_safe")
-    if tool_settings.approval_mode not in {"prompt", "auto_approve_safe", "deny"}:
+    if tool_settings.approval_mode not in {"prompt", "auto_approve_safe", "auto_approve_all", "deny"}:
         tool_settings = replace(tool_settings, approval_mode="prompt")
     registry = build_default_registry(paths, tool_settings)
     policy = ToolPolicy(tool_settings, registry, paths)
