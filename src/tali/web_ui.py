@@ -568,7 +568,7 @@ def _save_agent_config_from_form(root: Path, agent_name: str, data: dict[str, st
     embedding_base_url = data.get("embedding_base_url", "").strip()
     fs_root = data.get("fs_root", "").strip()
     approval_mode = data.get("approval_mode", "").strip() or tools.approval_mode
-    if approval_mode not in {"prompt", "auto_approve_safe", "deny"}:
+    if approval_mode not in {"prompt", "auto_approve_safe", "auto_approve_all", "deny"}:
         approval_mode = tools.approval_mode
 
     planner = replace(
@@ -893,7 +893,7 @@ def _create_agent(
     embed = embedding_model.strip() or embed_default_model
     fs_root_value = fs_root.strip() or str(Path.home())
     mode = approval_mode.strip() or "auto_approve_safe"
-    if mode not in {"prompt", "auto_approve_safe", "deny"}:
+    if mode not in {"prompt", "auto_approve_safe", "auto_approve_all", "deny"}:
         mode = "auto_approve_safe"
     cfg = AppConfig(
         agent_id=str(uuid4()),
@@ -1356,6 +1356,7 @@ def _render_agents(root: Path, notice: str, detail: str) -> str:
       <label>Approval Mode
         <select name='approval_mode'>
           <option value='auto_approve_safe' selected>auto_approve_safe</option>
+          <option value='auto_approve_all'>auto_approve_all</option>
           <option value='prompt'>prompt</option>
           <option value='deny'>deny</option>
         </select>
@@ -1933,7 +1934,7 @@ def _render_agent_config(root: Path, agent_name: str, notice: str, detail: str) 
     execute_commitments = " checked" if autonomy.execute_commitments else ""
     python_enabled = " checked" if tools.python_enabled else ""
     approval_options = []
-    for mode in ("prompt", "auto_approve_safe", "deny"):
+    for mode in ("prompt", "auto_approve_safe", "auto_approve_all", "deny"):
         marker = " selected" if mode == tools.approval_mode else ""
         approval_options.append(f"<option value='{mode}'{marker}>{mode}</option>")
     llm_model_options = _model_options()
