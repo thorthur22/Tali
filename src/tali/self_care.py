@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import threading
 import time
 import uuid
@@ -16,6 +15,7 @@ from tali.consolidation import SleepPolicy, _is_contradiction, apply_sleep_chang
 from tali.db import Database
 from tali.llm import OllamaClient, OpenAIClient
 from tali.models import ProvenanceType
+from tali.locks import FileLock
 from tali.snapshots import create_snapshot, rollback_snapshot
 if TYPE_CHECKING:
     from tali.vector_index import VectorIndex
@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 
 LOCK_FILENAME = "sleep.lock"
 SLEEP_LLM_TIMEOUT_S = 300.0
+SLEEP_LOCK_STALE_S = 6 * 60 * 60
 
 
 @dataclass(frozen=True)
@@ -33,24 +34,13 @@ class ResolutionOutcome:
 
 class SleepLock:
     def __init__(self, data_dir: Path) -> None:
-        self.lock_path = data_dir / LOCK_FILENAME
-        self._fd: int | None = None
+        self._lock = FileLock(data_dir / LOCK_FILENAME, stale_after_s=SLEEP_LOCK_STALE_S)
 
     def acquire(self) -> bool:
-        try:
-            self._fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(self._fd, str(os.getpid()).encode())
-            return True
-        except FileExistsError:
-            return False
+        return self._lock.acquire()
 
     def release(self) -> None:
-        if self._fd is None:
-            return
-        os.close(self._fd)
-        self._fd = None
-        if self.lock_path.exists():
-            self.lock_path.unlink()
+        self._lock.release()
 
 
 class SleepScheduler:
@@ -203,7 +193,7 @@ def resolve_staged_items(db: Database, user_input: str) -> ResolutionOutcome | N
             return _backoff(db, item_id, attempts, "promotion_gate_failed")
         if provenance_type == ProvenanceType.USER_REPORTED.value:
             if payload.get("awaiting_confirmation"):
-                response = _parse_confirmation(user_input)
+                response = parse_confirmation(user_input)
                 if response is True:
                     applied = _promote_fact(db, statement, provenance_type, source_ref, confidence)
                     if applied:
@@ -237,7 +227,7 @@ def resolve_staged_items(db: Database, user_input: str) -> ResolutionOutcome | N
     if kind == "commitment":
         description = str(payload.get("description") or "").strip()
         if payload.get("awaiting_clarification"):
-            response = _parse_confirmation(user_input)
+            response = parse_confirmation(user_input)
             if response is not None:
                 db.update_staged_item(
                     item_id,
@@ -334,7 +324,7 @@ def _is_relevant(user_input: str, statement: str) -> bool:
     return any(token in lowered_input for token in lowered_statement.split()[:5])
 
 
-def _parse_confirmation(user_input: str) -> bool | None:
+def parse_confirmation(user_input: str) -> bool | None:
     normalized = user_input.strip().lower()
     if normalized.startswith(("yes", "yep", "y ", "y,", "y.")) or normalized in {
         "yes",
@@ -352,6 +342,38 @@ def _parse_confirmation(user_input: str) -> bool | None:
         "negative",
     }:
         return False
+    return None
+
+
+def resolve_staged_confirmation(db: Database, item_id: str, user_input: str) -> ResolutionOutcome | None:
+    row = db.fetch_staged_item(item_id)
+    if not row:
+        return None
+    kind = row["kind"]
+    if kind not in {"fact", "commitment"}:
+        return None
+    attempts = int(row["attempts"] or 0)
+    payload = json.loads(row["payload"])
+    response = parse_confirmation(user_input)
+    if response is None:
+        return _backoff(db, item_id, attempts, "awaiting_confirmation")
+    if kind == "fact":
+        statement = str(payload.get("statement") or "").strip()
+        provenance_type = str(payload.get("provenance_type") or row["provenance_type"]).strip()
+        source_ref = str(payload.get("source_ref") or row["source_ref"]).strip()
+        confidence = float(payload.get("confidence", 0.6) or 0.6)
+        if response is True:
+            applied = _promote_fact(db, statement, provenance_type, source_ref, confidence)
+            if applied:
+                db.update_staged_item(item_id, status="resolved", next_check_at=None, attempts=attempts, last_error=None)
+                return ResolutionOutcome(clarification_question=None, applied_fact_id=applied)
+            return _backoff(db, item_id, attempts, "promotion_gate_failed")
+        db.update_staged_item(item_id, status="rejected", next_check_at=None, attempts=attempts, last_error=None)
+        return None
+    if response is True:
+        db.update_staged_item(item_id, status="resolved", next_check_at=None, attempts=attempts, last_error=None)
+        return None
+    db.update_staged_item(item_id, status="rejected", next_check_at=None, attempts=attempts, last_error=None)
     return None
 
 
@@ -394,7 +416,7 @@ def resolve_contradiction_answer(
         keep_new = False
     else:
         # Fall back to yes/no parsing (yes = the new statement is correct)
-        confirmation = _parse_confirmation(user_input)
+        confirmation = parse_confirmation(user_input)
         if confirmation is True:
             keep_new = True
         elif confirmation is False:

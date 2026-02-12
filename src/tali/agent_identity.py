@@ -5,7 +5,7 @@ import re
 import shutil
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -20,6 +20,7 @@ from tali.config import (
 
 
 AGENT_NAME_PATTERN = re.compile(r"^[a-z0-9-_]{2,32}$")
+LAST_AGENT_FILE = "last_agent.json"
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,37 @@ def validate_agent_name(name: str) -> bool:
     return bool(AGENT_NAME_PATTERN.match(name))
 
 
+def read_last_agent(root: Path) -> str | None:
+    path = root / "shared" / LAST_AGENT_FILE
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text())
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    name = str(payload.get("agent_name") or "").strip()
+    if not name or not validate_agent_name(name):
+        return None
+    return name
+
+
+def write_last_agent(root: Path, agent_name: str) -> None:
+    if not validate_agent_name(agent_name):
+        return
+    shared_dir = root / "shared"
+    shared_dir.mkdir(parents=True, exist_ok=True)
+    path = shared_dir / LAST_AGENT_FILE
+    payload = {"agent_name": agent_name, "updated_at": datetime.now(timezone.utc).isoformat()}
+    try:
+        temp_path = path.with_suffix(".tmp")
+        temp_path.write_text(json.dumps(payload, indent=2))
+        temp_path.replace(path)
+    except OSError:
+        return
+
+
 def resolve_agent(
     prompt_fn: Callable[[str], str],
     root_dir: Path | None = None,
@@ -41,6 +73,7 @@ def resolve_agent(
     root.mkdir(parents=True, exist_ok=True)
     shared_dir = root / "shared"
     shared_dir.mkdir(parents=True, exist_ok=True)
+    last_agent = read_last_agent(root)
     agent_dirs = _discover_agent_dirs(root)
     legacy_items = _detect_legacy_items(root)
 
@@ -51,6 +84,7 @@ def resolve_agent(
         _migrate_legacy(root, agent_home)
         _migrate_agent_db(agent_home)
         config = _ensure_agent_config(agent_home, agent_name) if allow_create_config else _load_agent_config(agent_home)
+        write_last_agent(root, agent_name)
         return root, agent_name, config
 
     if agent_dirs:
@@ -59,6 +93,14 @@ def resolve_agent(
             _migrate_agent_db(agent_home)
             config_path = agent_home / "config.json"
             config = load_config(config_path) if config_path.exists() else None
+            write_last_agent(root, agent_home.name)
+            return root, agent_home.name, config
+        if last_agent and (root / last_agent / "config.json").exists():
+            agent_home = root / last_agent
+            _migrate_agent_db(agent_home)
+            config_path = agent_home / "config.json"
+            config = load_config(config_path) if config_path.exists() else None
+            write_last_agent(root, agent_home.name)
             return root, agent_home.name, config
         agent_name = prompt_fn("Choose an agent name")
         while not validate_agent_name(agent_name) or not (root / agent_name).exists():
@@ -66,6 +108,7 @@ def resolve_agent(
         config_path = root / agent_name / "config.json"
         _migrate_agent_db(root / agent_name)
         config = load_config(config_path) if config_path.exists() else None
+        write_last_agent(root, agent_name)
         return root, agent_name, config
 
     agent_name = _prompt_unique_name(prompt_fn, root)
@@ -73,6 +116,7 @@ def resolve_agent(
     agent_home.mkdir(parents=True, exist_ok=True)
     _migrate_agent_db(agent_home)
     config = _ensure_agent_config(agent_home, agent_name) if allow_create_config else _load_agent_config(agent_home)
+    write_last_agent(root, agent_name)
     return root, agent_name, config
 
 

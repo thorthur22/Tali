@@ -715,78 +715,7 @@ class TaskRunnerTests(unittest.TestCase):
         )
         self.assertEqual(len(tool_runner.tool_calls), 1)
 
-    def test_batched_tool_calls_execute(self) -> None:
-        decomposition = {
-            "tasks": [
-                {
-                    "title": "Inspect",
-                    "description": "List and read files.",
-                    "requires_tools": True,
-                    "verification": "Listed and read.",
-                    "dependencies": [],
-                }
-            ]
-        }
-        tool_call = {
-            "next_action_type": "tool_call",
-            "tool_calls": [
-                {"tool_name": "fs.list", "tool_args": {"path": "C:\\X"}},
-                {"tool_name": "fs.read", "tool_args": {"path": "C:\\X\\file.txt"}},
-            ],
-        }
-        action_done = {"next_action_type": "mark_done", "outputs_json": {"ok": True}}
-        review = {
-            "overall_status": "complete",
-            "checks": [{"task_ordinal": 0, "status": "ok", "note": ""}],
-            "missing_items": [],
-            "assumptions": [],
-            "user_message": "All set.",
-        }
-        llm = FakeLLM(
-            [
-                json.dumps(decomposition),
-                json.dumps(tool_call),
-                json.dumps(action_done),
-                json.dumps(review),
-                "All set.",  # responder polish
-            ]
-        )
-
-        def _results_for_calls(calls):
-            results = []
-            for call in calls:
-                results.append(
-                    ToolResult(
-                        id=call.id,
-                        name=call.name,
-                        status="ok",
-                        started_at="",
-                        ended_at="",
-                        result_ref=f"tool_call:{call.id}",
-                        result_summary="ok",
-                        result_raw="",
-                    )
-                )
-            return results, []
-
-        tool_runner = FakeToolRunner(results_by_call=_results_for_calls)
-        runner = TaskRunner(
-            db=self.db,
-            llm=llm,
-            retriever=self.retriever,
-            guardrails=self.guardrails,
-            tool_runner=tool_runner,
-            tool_descriptions="none",
-        )
-        runner.run_turn(
-            "First implement the algorithm to list and read files, then verify",
-            prompt_fn=lambda _: "",
-        )
-        self.assertEqual(len(tool_runner.tool_calls), 2)
-        self.assertEqual(tool_runner.tool_calls[0].name, "fs.list")
-        self.assertEqual(tool_runner.tool_calls[1].name, "fs.read")
-
-    def test_batched_duplicate_tool_call_blocked(self) -> None:
+    def test_mark_done_requires_tool_use(self) -> None:
         decomposition = {
             "tasks": [
                 {
@@ -798,13 +727,12 @@ class TaskRunnerTests(unittest.TestCase):
                 }
             ]
         }
+        action_done = {"next_action_type": "mark_done", "outputs_json": {"ok": True}}
         tool_call = {
             "next_action_type": "tool_call",
-            "tool_calls": [
-                {"tool_name": "fs.list", "tool_args": {"path": "C:\\X"}},
-            ],
+            "tool_name": "fs.list",
+            "tool_args": {},
         }
-        action_done = {"next_action_type": "mark_done", "outputs_json": {"ok": True}}
         review = {
             "overall_status": "complete",
             "checks": [{"task_ordinal": 0, "status": "ok", "note": ""}],
@@ -815,7 +743,7 @@ class TaskRunnerTests(unittest.TestCase):
         llm = FakeLLM(
             [
                 json.dumps(decomposition),
-                json.dumps(tool_call),
+                json.dumps(action_done),
                 json.dumps(tool_call),
                 json.dumps(action_done),
                 json.dumps(review),
@@ -829,8 +757,8 @@ class TaskRunnerTests(unittest.TestCase):
             started_at="",
             ended_at="",
             result_ref="tool_call:tc_1",
-            result_summary="Listed C:\\X",
-            result_raw="Desktop\nfile.txt",
+            result_summary="Listed .",
+            result_raw="file.txt",
         )
         tool_runner = FakeToolRunner(results_by_call=[[result]])
         runner = TaskRunner(
@@ -842,10 +770,12 @@ class TaskRunnerTests(unittest.TestCase):
             tool_descriptions="none",
         )
         runner.run_turn(
-            "First implement the algorithm to list files, then verify",
+            "List files then summarize",
             prompt_fn=lambda _: "",
         )
         self.assertEqual(len(tool_runner.tool_calls), 1)
+        self.assertEqual(tool_runner.tool_calls[0].name, "fs.list")
+        self.assertIsNone(self.db.fetch_active_run())
 
     def test_stuck_progress_forces_replan(self) -> None:
         decomposition = {

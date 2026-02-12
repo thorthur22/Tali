@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import os
 import threading
 import time
-from dataclasses import dataclass
+
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
@@ -11,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from tali.config import AutonomyConfig
 from tali.db import Database
 from tali.idle_jobs import IdleJobRunner
+from tali.locks import FileLock
 from tali.knowledge_sources import KnowledgeSourceRegistry
 
 if TYPE_CHECKING:
@@ -20,29 +20,19 @@ if TYPE_CHECKING:
 IDLE_TRIGGER_SECONDS = 300
 IDLE_MIN_INTERVAL_SECONDS = 1800
 IDLE_LOCK_FILENAME = "idle.lock"
+IDLE_LOCK_STALE_S = 6 * 60 * 60
 IDLE_LAST_RUN_FILENAME = "idle.last_run"
 
 
-@dataclass
 class IdleLock:
-    lock_path: Path
-    _fd: int | None = None
+    def __init__(self, lock_path: Path) -> None:
+        self._lock = FileLock(lock_path, stale_after_s=IDLE_LOCK_STALE_S)
 
     def acquire(self) -> bool:
-        try:
-            self._fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(self._fd, str(os.getpid()).encode())
-            return True
-        except FileExistsError:
-            return False
+        return self._lock.acquire()
 
     def release(self) -> None:
-        if self._fd is None:
-            return
-        os.close(self._fd)
-        self._fd = None
-        if self.lock_path.exists():
-            self.lock_path.unlink()
+        self._lock.release()
 
 
 class IdleScheduler:
@@ -218,11 +208,12 @@ class IdleScheduler:
             if self.status_fn:
                 self.status_fn("Autonomy: auto-continuing blocked run...")
             try:
-                result = self.task_runner.run_turn(
-                    "continue",
-                    prompt_fn=self._auto_prompt_fn,
-                    origin="autonomous",
-                )
+                with self._autonomous_approval_context():
+                    result = self.task_runner.run_turn(
+                        "continue",
+                        prompt_fn=self._auto_prompt_fn,
+                        origin="autonomous",
+                    )
                 if self.status_fn:
                     self.status_fn(f"Autonomy: auto-continue complete ({result.llm_calls} LLM calls).")
             except Exception as exc:
@@ -277,11 +268,12 @@ class IdleScheduler:
             if self.status_fn:
                 self.status_fn(f"Autonomy: executing commitment \"{description[:80]}\"...")
             try:
-                result = self.task_runner.run_turn(
-                    description,
-                    prompt_fn=self._auto_prompt_fn,
-                    origin="autonomous",
-                )
+                with self._autonomous_approval_context():
+                    result = self.task_runner.run_turn(
+                        description,
+                        prompt_fn=self._auto_prompt_fn,
+                        origin="autonomous",
+                    )
                 self._autonomous_run_id = result.run_id
 
                 # Check if interrupted during execution
@@ -355,6 +347,19 @@ class IdleScheduler:
             if self.status_fn:
                 self.status_fn("Autonomy: paused autonomous run for user interaction.")
         self._autonomous_run_id = None
+
+    def _autonomous_approval_context(self):
+        if self.task_runner is None:
+            return nullcontext()
+        tool_runner = getattr(self.task_runner, "tool_runner", None)
+        if tool_runner is None:
+            return nullcontext()
+        approvals = getattr(tool_runner, "approvals", None)
+        if approvals is None:
+            return nullcontext()
+        if approvals.mode != "prompt":
+            return nullcontext()
+        return approvals.temporary_mode("auto_approve_safe")
 
     # ------------------------------------------------------------------
     # Timestamp persistence for housekeeping cycles

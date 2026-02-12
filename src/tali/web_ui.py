@@ -568,7 +568,7 @@ def _save_agent_config_from_form(root: Path, agent_name: str, data: dict[str, st
     embedding_base_url = data.get("embedding_base_url", "").strip()
     fs_root = data.get("fs_root", "").strip()
     approval_mode = data.get("approval_mode", "").strip() or tools.approval_mode
-    if approval_mode not in {"prompt", "auto_approve_safe", "deny"}:
+    if approval_mode not in {"prompt", "auto_approve_safe", "auto_approve_all", "deny"}:
         approval_mode = tools.approval_mode
 
     planner = replace(
@@ -893,7 +893,7 @@ def _create_agent(
     embed = embedding_model.strip() or embed_default_model
     fs_root_value = fs_root.strip() or str(Path.home())
     mode = approval_mode.strip() or "auto_approve_safe"
-    if mode not in {"prompt", "auto_approve_safe", "deny"}:
+    if mode not in {"prompt", "auto_approve_safe", "auto_approve_all", "deny"}:
         mode = "auto_approve_safe"
     cfg = AppConfig(
         agent_id=str(uuid4()),
@@ -1356,6 +1356,7 @@ def _render_agents(root: Path, notice: str, detail: str) -> str:
       <label>Approval Mode
         <select name='approval_mode'>
           <option value='auto_approve_safe' selected>auto_approve_safe</option>
+          <option value='auto_approve_all'>auto_approve_all</option>
           <option value='prompt'>prompt</option>
           <option value='deny'>deny</option>
         </select>
@@ -1789,6 +1790,27 @@ def _render_patch_detail(root: Path, agent_name: str, proposal_id: str, notice: 
 
     safe_agent = _q(agent_name)
     safe_pid = _q(proposal_id)
+
+    review_block = ""
+    if row["review_json"]:
+        try:
+            review_data = json.loads(str(row["review_json"]))
+            if isinstance(review_data, dict):
+                approved = bool(review_data.get("approved", False))
+                issues = review_data.get("issues", [])
+                issues_text = ""
+                if isinstance(issues, list) and issues:
+                    issues_text = "<ul>" + "".join(f"<li>{html.escape(str(i))}</li>" for i in issues) + "</ul>"
+                review_block = f"""
+<section class='panel' style='margin-top:12px;'>
+  <h2>LLM Review</h2>
+  <div class='row'><span>Approved</span><strong>{'Yes' if approved else 'No'}</strong></div>
+  {issues_text or "<p class='muted'>(no issues reported)</p>"}
+</section>
+"""
+        except json.JSONDecodeError:
+            review_block = ""
+
     body = f"""
 <p><a href='/agent/{safe_agent}/patches'>Back to patches</a></p>
 <h1>Patch <code>{html.escape(proposal_id)}</code></h1>
@@ -1812,6 +1834,7 @@ def _render_patch_detail(root: Path, agent_name: str, proposal_id: str, notice: 
     </div>
   </section>
 </div>
+{review_block}
 <section class='panel' style='margin-top:12px;'><h2>Diff</h2><pre>{html.escape(str(row['diff_text'] or ''))}</pre></section>
 <section class='panel' style='margin-top:12px;'><h2>Test Results</h2><pre>{html.escape(result_text or '(none)')}</pre></section>
 """
@@ -1933,7 +1956,7 @@ def _render_agent_config(root: Path, agent_name: str, notice: str, detail: str) 
     execute_commitments = " checked" if autonomy.execute_commitments else ""
     python_enabled = " checked" if tools.python_enabled else ""
     approval_options = []
-    for mode in ("prompt", "auto_approve_safe", "deny"):
+    for mode in ("prompt", "auto_approve_safe", "auto_approve_all", "deny"):
         marker = " selected" if mode == tools.approval_mode else ""
         approval_options.append(f"<option value='{mode}'{marker}>{mode}</option>")
     llm_model_options = _model_options()
