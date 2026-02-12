@@ -373,6 +373,8 @@ def parse_action_plan(text: str) -> tuple[ActionPlan | None, str | None]:
     if tool_calls_raw is not None:
         if not isinstance(tool_calls_raw, list):
             return None, "tool_calls must be array"
+        if not tool_calls_raw:
+            return None, "tool_calls must not be empty"
         tool_calls = []
         for idx, tc in enumerate(tool_calls_raw):
             if not isinstance(tc, dict):
