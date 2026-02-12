@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from tali.run_logs import append_run_log, latest_metrics_for_run, read_recent_logs
 

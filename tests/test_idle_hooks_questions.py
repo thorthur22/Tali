@@ -43,6 +43,16 @@ class IdleHooksQuestionsTests(unittest.TestCase):
         self.assertFalse(second.acquire())
         lock.release()
 
+    def test_idle_lock_clears_stale(self) -> None:
+        lock_path = Path(self.temp_dir.name) / "idle.lock"
+        lock_path.write_text(
+            json.dumps({"pid": 999999, "created_at": "2000-01-01T00:00:00Z"}),
+            encoding="utf-8",
+        )
+        lock = IdleLock(lock_path)
+        self.assertTrue(lock.acquire())
+        lock.release()
+
     def test_idle_scheduler_trigger(self) -> None:
         scheduler = IdleScheduler(
             data_dir=Path(self.temp_dir.name),
