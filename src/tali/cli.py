@@ -1211,7 +1211,7 @@ def chat(
     tool_settings = config.tools if isinstance(config.tools, ToolSettings) else ToolSettings()
     if os.environ.get("TALI_HEADLESS") == "1" and tool_settings.approval_mode == "prompt":
         tool_settings = replace(tool_settings, approval_mode="auto_approve_safe")
-    if tool_settings.approval_mode not in {"prompt", "auto_approve_safe", "deny"}:
+    if tool_settings.approval_mode not in {"prompt", "auto_approve_safe", "auto_approve_all", "deny"}:
         tool_settings = replace(tool_settings, approval_mode="prompt")
     if tool_settings.fs_root is None or not str(tool_settings.fs_root).strip():
         tool_settings = replace(tool_settings, fs_root=str(Path.home()))
@@ -2285,7 +2285,7 @@ def swarm(prompt: str = typer.Argument(..., help="Swarm task prompt.")) -> None:
     tool_settings = config.tools if isinstance(config.tools, ToolSettings) else ToolSettings()
     if os.environ.get("TALI_HEADLESS") == "1" and tool_settings.approval_mode == "prompt":
         tool_settings = replace(tool_settings, approval_mode="auto_approve_safe")
-    if tool_settings.approval_mode not in {"prompt", "auto_approve_safe", "deny"}:
+    if tool_settings.approval_mode not in {"prompt", "auto_approve_safe", "auto_approve_all", "deny"}:
         tool_settings = replace(tool_settings, approval_mode="prompt")
     registry = build_default_registry(paths, tool_settings)
     policy = ToolPolicy(tool_settings, registry, paths)

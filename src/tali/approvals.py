@@ -35,6 +35,8 @@ class ApprovalManager:
         reason: str | None,
         details: str | None = None,
     ) -> ApprovalOutcome:
+        if self.mode == "auto_approve_all":
+            return ApprovalOutcome(approved=True, approval_mode="auto")
         if self.mode == "deny":
             return ApprovalOutcome(approved=False, approval_mode="denied", reason="session denied")
         if signature and signature in self.approved_signatures:
@@ -57,6 +59,7 @@ class ApprovalManager:
             choices.extend(
                 [
                     {"name": "Approve all safe for session", "value": "y"},
+                    {"name": "Approve all tools for session (unsafe)", "value": "u"},
                     {"name": "Deny once", "value": "n"},
                     {"name": "Deny all for session", "value": "d"},
                 ]
@@ -72,7 +75,7 @@ class ApprovalManager:
                     reason_line,
                     details_line or "",
                     "Options: [a]pprove once, approve [t]ool for session, approve [s]ignature for session,",
-                    "         approve all safe for session [y], [n]o once, [d]eny all for session",
+                    "         approve all safe for session [y], approve all tools [u], [n]o once, [d]eny all for session",
                     "Choice: ",
                 ]
             )
@@ -86,6 +89,8 @@ class ApprovalManager:
             normalized = "s"
         elif normalized.startswith("approve all safe") or normalized == "approve all":
             normalized = "y"
+        elif normalized.startswith("approve all tools") or normalized.startswith("approve all unsafe"):
+            normalized = "u"
         elif normalized.startswith("deny all"):
             normalized = "d"
         elif normalized.startswith("deny once") or normalized in {"no", "n"}:
@@ -101,6 +106,9 @@ class ApprovalManager:
             return ApprovalOutcome(approved=True, approval_mode="prompt")
         if normalized in {"y", "all", "auto"}:
             self.mode = "auto_approve_safe"
+            return ApprovalOutcome(approved=True, approval_mode="prompt")
+        if normalized in {"u", "unsafe", "all tools"}:
+            self.mode = "auto_approve_all"
             return ApprovalOutcome(approved=True, approval_mode="prompt")
         if normalized in {"d", "deny"}:
             self.mode = "deny"
