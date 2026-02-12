@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, Iterator
 
 try:
     import questionary
@@ -22,6 +23,15 @@ class ApprovalManager:
     approved_tools: set[str] = field(default_factory=set)
     approved_signatures: set[str] = field(default_factory=set)
 
+    @contextmanager
+    def temporary_mode(self, mode: str) -> Iterator[None]:
+        original = self.mode
+        self.mode = mode
+        try:
+            yield
+        finally:
+            self.mode = original
+
     def _prompt(self, prompt_fn: Callable[[str], str], message: str) -> str:
         response = prompt_fn(message).strip().lower()
         return response
@@ -39,6 +49,8 @@ class ApprovalManager:
             return ApprovalOutcome(approved=True, approval_mode="auto")
         if self.mode == "deny":
             return ApprovalOutcome(approved=False, approval_mode="denied", reason="session denied")
+        if self.mode == "auto_approve_all":
+            return ApprovalOutcome(approved=True, approval_mode="auto")
         if signature and signature in self.approved_signatures:
             return ApprovalOutcome(approved=True, approval_mode="auto")
         if tool_name in self.approved_tools:
@@ -59,7 +71,7 @@ class ApprovalManager:
             choices.extend(
                 [
                     {"name": "Approve all safe for session", "value": "y"},
-                    {"name": "Approve all tools for session (unsafe)", "value": "u"},
+                    {"name": "Approve all tools for session", "value": "g"},
                     {"name": "Deny once", "value": "n"},
                     {"name": "Deny all for session", "value": "d"},
                 ]
@@ -75,7 +87,8 @@ class ApprovalManager:
                     reason_line,
                     details_line or "",
                     "Options: [a]pprove once, approve [t]ool for session, approve [s]ignature for session,",
-                    "         approve all safe for session [y], approve all tools [u], [n]o once, [d]eny all for session",
+                    "         approve all safe for session [y], approve all tools for session [g],",
+                    "         [n]o once, [d]eny all for session",
                     "Choice: ",
                 ]
             )
@@ -87,6 +100,8 @@ class ApprovalManager:
             "approve command signature"
         ):
             normalized = "s"
+        elif normalized.startswith("approve all tools") or normalized.startswith("approve all risky"):
+            normalized = "a-all"
         elif normalized.startswith("approve all safe") or normalized == "approve all":
             normalized = "y"
         elif normalized.startswith("approve all tools") or normalized.startswith("approve all unsafe"):
@@ -107,7 +122,7 @@ class ApprovalManager:
         if normalized in {"y", "all", "auto"}:
             self.mode = "auto_approve_safe"
             return ApprovalOutcome(approved=True, approval_mode="prompt")
-        if normalized in {"u", "unsafe", "all tools"}:
+        if normalized in {"a-all", "approve all tools", "approve all risky", "g"}:
             self.mode = "auto_approve_all"
             return ApprovalOutcome(approved=True, approval_mode="prompt")
         if normalized in {"d", "deny"}:
