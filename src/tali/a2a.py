@@ -15,6 +15,7 @@ from tali.a2a_bus import A2ABus
 from tali.a2a_protocol import parse_message, parse_status, parse_task_request, parse_task_response
 from tali.a2a_registry import AgentRecord, Registry
 from tali.db import Database
+from tali.locks import FileLock
 if TYPE_CHECKING:
     from tali.task_runner import TaskRunner
 
@@ -142,6 +143,7 @@ class A2APoller:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock_path = client.profile.agent_home / "locks" / "a2a.lock"
+        self._lock = FileLock(self._lock_path)
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -156,7 +158,7 @@ class A2APoller:
 
     def _loop(self) -> None:
         self._lock_path.parent.mkdir(parents=True, exist_ok=True)
-        if not _acquire_lock(self._lock_path):
+        if not self._lock.acquire():
             return
         try:
             last_heartbeat = 0.0
@@ -189,7 +191,7 @@ class A2APoller:
                     self.client.bus.mark_status(row["id"], "delivered")
                 time.sleep(POLL_INTERVAL_S)
         finally:
-            _release_lock(self._lock_path)
+            self._lock.release()
 
     def _handle_message(self, row: Any) -> None:
         payload_text = row["payload"]
@@ -340,18 +342,6 @@ class A2APoller:
             status=status,
             provenance_type="RECEIVED_AGENT",
         )
-
-
-def _acquire_lock(path: Path) -> bool:
-    if path.exists():
-        return False
-    path.write_text(str(uuid.uuid4()))
-    return True
-
-
-def _release_lock(path: Path) -> None:
-    if path.exists():
-        path.unlink()
 
 
 def _merge_outputs(existing: str | None, update: dict[str, Any]) -> str:

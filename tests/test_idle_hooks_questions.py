@@ -6,7 +6,7 @@ import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
 
-sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from tali.db import Database
 from tali.hooks.core import Hook, HookActions, HookManager
@@ -37,6 +37,16 @@ class IdleHooksQuestionsTests(unittest.TestCase):
         self.assertTrue(lock.acquire())
         second = IdleLock(lock_path)
         self.assertFalse(second.acquire())
+        lock.release()
+
+    def test_idle_lock_clears_stale(self) -> None:
+        lock_path = Path(self.temp_dir.name) / "idle.lock"
+        lock_path.write_text(
+            json.dumps({"pid": 999999, "created_at": "2000-01-01T00:00:00Z"}),
+            encoding="utf-8",
+        )
+        lock = IdleLock(lock_path)
+        self.assertTrue(lock.acquire())
         lock.release()
 
     def test_idle_scheduler_trigger(self) -> None:

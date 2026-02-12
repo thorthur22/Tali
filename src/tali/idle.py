@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import os
 import threading
 import time
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
@@ -11,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from tali.config import AutonomyConfig
 from tali.db import Database
 from tali.idle_jobs import IdleJobRunner
+from tali.locks import FileLock
 from tali.knowledge_sources import KnowledgeSourceRegistry
 
 if TYPE_CHECKING:
@@ -20,29 +19,19 @@ if TYPE_CHECKING:
 IDLE_TRIGGER_SECONDS = 300
 IDLE_MIN_INTERVAL_SECONDS = 1800
 IDLE_LOCK_FILENAME = "idle.lock"
+IDLE_LOCK_STALE_S = 6 * 60 * 60
 IDLE_LAST_RUN_FILENAME = "idle.last_run"
 
 
-@dataclass
 class IdleLock:
-    lock_path: Path
-    _fd: int | None = None
+    def __init__(self, lock_path: Path) -> None:
+        self._lock = FileLock(lock_path, stale_after_s=IDLE_LOCK_STALE_S)
 
     def acquire(self) -> bool:
-        try:
-            self._fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(self._fd, str(os.getpid()).encode())
-            return True
-        except FileExistsError:
-            return False
+        return self._lock.acquire()
 
     def release(self) -> None:
-        if self._fd is None:
-            return
-        os.close(self._fd)
-        self._fd = None
-        if self.lock_path.exists():
-            self.lock_path.unlink()
+        self._lock.release()
 
 
 class IdleScheduler:

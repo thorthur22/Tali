@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import threading
 import time
 import uuid
@@ -16,6 +15,7 @@ from tali.consolidation import SleepPolicy, _is_contradiction, apply_sleep_chang
 from tali.db import Database
 from tali.llm import OllamaClient, OpenAIClient
 from tali.models import ProvenanceType
+from tali.locks import FileLock
 from tali.snapshots import create_snapshot, rollback_snapshot
 if TYPE_CHECKING:
     from tali.vector_index import VectorIndex
@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 
 LOCK_FILENAME = "sleep.lock"
 SLEEP_LLM_TIMEOUT_S = 300.0
+SLEEP_LOCK_STALE_S = 6 * 60 * 60
 
 
 @dataclass(frozen=True)
@@ -33,24 +34,13 @@ class ResolutionOutcome:
 
 class SleepLock:
     def __init__(self, data_dir: Path) -> None:
-        self.lock_path = data_dir / LOCK_FILENAME
-        self._fd: int | None = None
+        self._lock = FileLock(data_dir / LOCK_FILENAME, stale_after_s=SLEEP_LOCK_STALE_S)
 
     def acquire(self) -> bool:
-        try:
-            self._fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(self._fd, str(os.getpid()).encode())
-            return True
-        except FileExistsError:
-            return False
+        return self._lock.acquire()
 
     def release(self) -> None:
-        if self._fd is None:
-            return
-        os.close(self._fd)
-        self._fd = None
-        if self.lock_path.exists():
-            self.lock_path.unlink()
+        self._lock.release()
 
 
 class SleepScheduler:
