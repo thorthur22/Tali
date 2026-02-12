@@ -5,7 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from tali.agent_identity import validate_agent_name, resolve_agent
+from tali.agent_identity import resolve_agent, validate_agent_name, write_last_agent
 
 
 class AgentIdentityTests(unittest.TestCase):
@@ -29,6 +29,26 @@ class AgentIdentityTests(unittest.TestCase):
 
             _, agent_name, _ = resolve_agent(prompt_fn=prompt_fn, root_dir=root, allow_create_config=False)
             self.assertEqual(agent_name, "beta")
+
+    def test_last_agent_selected_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "shared").mkdir(parents=True, exist_ok=True)
+            (root / "alpha").mkdir(parents=True, exist_ok=True)
+            (root / "beta").mkdir(parents=True, exist_ok=True)
+            (root / "alpha" / "config.json").write_text("{}")
+            (root / "beta" / "config.json").write_text("{}")
+            write_last_agent(root, "beta")
+
+            called = {"count": 0}
+
+            def prompt_fn(msg: str) -> str:
+                called["count"] += 1
+                return "alpha"
+
+            _, agent_name, _ = resolve_agent(prompt_fn=prompt_fn, root_dir=root, allow_create_config=False)
+            self.assertEqual(agent_name, "beta")
+            self.assertEqual(called["count"], 0)
 
 
 if __name__ == "__main__":

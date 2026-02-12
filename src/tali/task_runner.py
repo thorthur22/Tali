@@ -1043,6 +1043,44 @@ class TaskRunner:
                         delegate_task=None,
                         skill_name=None,
                     )
+            if (
+                action in {"mark_done", "store_output"}
+                and requires_tools
+                and not self._has_successful_tool_result(tool_results)
+            ):
+                if action_replans < 2:
+                    action_replans += 1
+                    stuck_context = (
+                        "Task requires tools but no successful tool results exist yet. "
+                        "Choose tool_call or ask_user before storing outputs or marking done."
+                    )
+                    if self.status_fn:
+                        self.status_fn(
+                            "Replanning: completion chosen before any successful tool result."
+                        )
+                    self._log_task_event(
+                        task_id,
+                        "note",
+                        {"reason": "complete_before_tool_use", "action": action},
+                    )
+                    continue
+                if self.tool_runner.registry.get("fs.list") is not None:
+                    if self.status_fn:
+                        self.status_fn(
+                            "Forcing bootstrap tool call: fs.list {} (complete-before-tools loop)"
+                        )
+                    plan = ActionPlan(
+                        next_action_type="tool_call",
+                        message=None,
+                        tool_name="fs.list",
+                        tool_args={},
+                        tool_purpose="Bootstrap workspace context to unblock execution.",
+                        outputs_json=None,
+                        block_reason=None,
+                        delegate_to=None,
+                        delegate_task=None,
+                        skill_name=None,
+                    )
             if action == "tool_call":
                 if plan.tool_name and self.tool_runner.registry.get(plan.tool_name) is None:
                     if invalid_tool_replans < 2:

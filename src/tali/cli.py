@@ -45,7 +45,7 @@ from tali.config import (
     save_shared_settings,
     infer_model_strengths,
 )
-from tali.agent_identity import resolve_agent, validate_agent_name
+from tali.agent_identity import resolve_agent, validate_agent_name, write_last_agent
 from tali.a2a import A2AClient, A2APoller, AgentProfile
 from tali.a2a_registry import AgentRecord, Registry
 from tali.db import Database
@@ -232,6 +232,7 @@ def _resolve_paths(agent_name: str | None = None) -> tuple[Paths, AppConfig | No
         paths = load_paths(root, agent_name)
         config_path = agent_home / "config.json"
         config = load_config(config_path) if config_path.exists() else None
+        write_last_agent(root, agent_name)
         return paths, config
     env_agent_name = os.environ.get("TALI_AGENT_NAME", "").strip()
     if env_agent_name:
@@ -241,6 +242,7 @@ def _resolve_paths(agent_name: str | None = None) -> tuple[Paths, AppConfig | No
             paths = load_paths(root, env_agent_name)
             config_path = agent_home / "config.json"
             config = load_config(config_path) if config_path.exists() else None
+            write_last_agent(root, env_agent_name)
             return paths, config
     root, resolved_name, config = resolve_agent(
         prompt_fn=typer.prompt, allow_create_config=False

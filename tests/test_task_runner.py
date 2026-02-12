@@ -715,6 +715,68 @@ class TaskRunnerTests(unittest.TestCase):
         )
         self.assertEqual(len(tool_runner.tool_calls), 1)
 
+    def test_mark_done_requires_tool_use(self) -> None:
+        decomposition = {
+            "tasks": [
+                {
+                    "title": "Inspect",
+                    "description": "List files.",
+                    "requires_tools": True,
+                    "verification": "Listed.",
+                    "dependencies": [],
+                }
+            ]
+        }
+        action_done = {"next_action_type": "mark_done", "outputs_json": {"ok": True}}
+        tool_call = {
+            "next_action_type": "tool_call",
+            "tool_name": "fs.list",
+            "tool_args": {},
+        }
+        review = {
+            "overall_status": "complete",
+            "checks": [{"task_ordinal": 0, "status": "ok", "note": ""}],
+            "missing_items": [],
+            "assumptions": [],
+            "user_message": "All set.",
+        }
+        llm = FakeLLM(
+            [
+                json.dumps(decomposition),
+                json.dumps(action_done),
+                json.dumps(tool_call),
+                json.dumps(action_done),
+                json.dumps(review),
+                "All set.",  # responder polish
+            ]
+        )
+        result = ToolResult(
+            id="tc_1",
+            name="fs.list",
+            status="ok",
+            started_at="",
+            ended_at="",
+            result_ref="tool_call:tc_1",
+            result_summary="Listed .",
+            result_raw="file.txt",
+        )
+        tool_runner = FakeToolRunner(results_by_call=[[result]])
+        runner = TaskRunner(
+            db=self.db,
+            llm=llm,
+            retriever=self.retriever,
+            guardrails=self.guardrails,
+            tool_runner=tool_runner,
+            tool_descriptions="none",
+        )
+        runner.run_turn(
+            "List files then summarize",
+            prompt_fn=lambda _: "",
+        )
+        self.assertEqual(len(tool_runner.tool_calls), 1)
+        self.assertEqual(tool_runner.tool_calls[0].name, "fs.list")
+        self.assertIsNone(self.db.fetch_active_run())
+
     def test_stuck_progress_forces_replan(self) -> None:
         decomposition = {
             "tasks": [
