@@ -1,16 +1,33 @@
 import sys
 import tempfile
 import unittest
+import subprocess
+import os
 from pathlib import Path
 from unittest.mock import patch
 
-sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from tali import cli
 from tali.config import TaskRunnerConfig, load_paths
 
 
 class CliSpawnTests(unittest.TestCase):
+    def test_python_module_invocation_runs_cli(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(root / "src")
+        result = subprocess.run(
+            [sys.executable, "-m", "tali.cli", "--help"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+            cwd=str(root),
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("Usage:", result.stdout)
+
     def test_should_not_spawn_when_marked_spawned(self) -> None:
         with patch.dict(cli.os.environ, {"TALI_AGENT_SPAWNED": "1"}, clear=False):
             self.assertFalse(cli._should_spawn_agent_terminal())
@@ -125,6 +142,19 @@ class CliSpawnTests(unittest.TestCase):
             paths = load_paths(Path(tmp), "agent-a")
             pids = cli._find_agent_service_pids(paths)
         self.assertEqual(pids, [111])
+
+    @patch("tali.cli._is_pid_running", return_value=True)
+    @patch("tali.cli.subprocess.run")
+    def test_find_agent_service_pids_matches_marker_flag(self, mock_run: object, _mock_running: object) -> None:
+        mock_run.return_value.returncode = 0
+        mock_run.return_value.stdout = (
+            "211 python -c runner --tali-service-agent=agent-a\\n"
+            "212 python -c runner --tali-service-agent=agent-b\\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = load_paths(Path(tmp), "agent-a")
+            pids = cli._find_agent_service_pids(paths)
+        self.assertEqual(pids, [211])
 
 
 if __name__ == "__main__":
