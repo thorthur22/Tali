@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, Iterator
 
 try:
     import questionary
@@ -21,6 +22,15 @@ class ApprovalManager:
     mode: str = "prompt"
     approved_tools: set[str] = field(default_factory=set)
     approved_signatures: set[str] = field(default_factory=set)
+
+    @contextmanager
+    def temporary_mode(self, mode: str) -> Iterator[None]:
+        original = self.mode
+        self.mode = mode
+        try:
+            yield
+        finally:
+            self.mode = original
 
     def _prompt(self, prompt_fn: Callable[[str], str], message: str) -> str:
         response = prompt_fn(message).strip().lower()
