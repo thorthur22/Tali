@@ -1790,6 +1790,27 @@ def _render_patch_detail(root: Path, agent_name: str, proposal_id: str, notice: 
 
     safe_agent = _q(agent_name)
     safe_pid = _q(proposal_id)
+
+    review_block = ""
+    if row["review_json"]:
+        try:
+            review_data = json.loads(str(row["review_json"]))
+            if isinstance(review_data, dict):
+                approved = bool(review_data.get("approved", False))
+                issues = review_data.get("issues", [])
+                issues_text = ""
+                if isinstance(issues, list) and issues:
+                    issues_text = "<ul>" + "".join(f"<li>{html.escape(str(i))}</li>" for i in issues) + "</ul>"
+                review_block = f"""
+<section class='panel' style='margin-top:12px;'>
+  <h2>LLM Review</h2>
+  <div class='row'><span>Approved</span><strong>{'Yes' if approved else 'No'}</strong></div>
+  {issues_text or "<p class='muted'>(no issues reported)</p>"}
+</section>
+"""
+        except json.JSONDecodeError:
+            review_block = ""
+
     body = f"""
 <p><a href='/agent/{safe_agent}/patches'>Back to patches</a></p>
 <h1>Patch <code>{html.escape(proposal_id)}</code></h1>
@@ -1813,6 +1834,7 @@ def _render_patch_detail(root: Path, agent_name: str, proposal_id: str, notice: 
     </div>
   </section>
 </div>
+{review_block}
 <section class='panel' style='margin-top:12px;'><h2>Diff</h2><pre>{html.escape(str(row['diff_text'] or ''))}</pre></section>
 <section class='panel' style='margin-top:12px;'><h2>Test Results</h2><pre>{html.escape(result_text or '(none)')}</pre></section>
 """

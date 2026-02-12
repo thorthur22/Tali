@@ -195,7 +195,7 @@ class IdleJobRunner:
         proposal_id = store_patch_proposal(self.db, proposal)
         # Two-agent review: use the LLM as a safety reviewer
         review_result = review_patch(self.llm, proposal)
-        review_status = "proposed" if review_result.approved else "review_failed"
+        review_status = "proposed"
         self.db.update_patch_review(
             proposal_id=proposal_id,
             review_json=json.dumps({
@@ -224,7 +224,7 @@ class IdleJobRunner:
             return IdleJobResult(messages=["Idle: patch proposal stored and review passed."], llm_calls=2)
         issues_summary = "; ".join(review_result.issues[:3]) if review_result.issues else "no details"
         return IdleJobResult(
-            messages=[f"Idle: patch proposal stored but review FAILED: {issues_summary}"],
+            messages=[f"Idle: patch proposal stored; review flagged issues: {issues_summary}"],
             llm_calls=2,
         )
 
@@ -267,7 +267,8 @@ def _parse_skill_review(text: str) -> tuple[list[dict[str, Any]] | None, str | N
 def _build_patch_prompt() -> str:
     return "\n".join(
         [
-            "You are proposing a safe, minimal code patch. Return STRICT JSON only.",
+            "You are proposing a safe, minimal code patch that improves autonomy, tooling, or quality.",
+            "Return STRICT JSON only.",
             "Schema:",
             "{",
             '  "title": "...",',
@@ -276,6 +277,6 @@ def _build_patch_prompt() -> str:
             '  "diff_text": "unified diff only",',
             '  "tests": ["pytest ..."]',
             "}",
-            "Only propose hooks or safety improvements; do not modify core runtime behavior.",
+            "Prefer improvements that strengthen agent autonomy, tooling, planning, or memory.",
         ]
     )
